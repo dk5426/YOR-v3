@@ -1,0 +1,31 @@
+# YOR app listener — auto-start at boot on Thor (Jetson).
+#
+# Install (run on Thor):
+#   sudo cp robot/systemd/yor-app-listener.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now yor-app-listener
+#
+# Logs:
+#   journalctl -u yor-app-listener -f
+#
+# If conda lives somewhere else (anaconda3), fix ExecStart accordingly.
+
+[Unit]
+Description=YOR app listener (iPad discovery + mode orchestrator)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hello-stretch
+WorkingDirectory=/home/hello-stretch/neer_slam
+Environment=HOME=/home/hello-stretch
+# --no-capture-output: stream stdout/stderr to journald instead of buffering
+ExecStart=/home/hello-stretch/miniconda3/bin/conda run --no-capture-output -n slam-zed python -m robot.app_listener
+Restart=on-failure
+RestartSec=3
+# Give the graceful shutdown path (mode stop → map save) time to finish
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
