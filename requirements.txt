@@ -1,0 +1,26 @@
+# YOR-v3 — whole-body IK, simulation and teleop.
+# Pinned to the versions this was developed and tested against (conda env "dev").
+
+# ── Solver / model ──────────────────────────────────────────────────────────
+mujoco==3.10.0
+mink==1.2.0
+numpy==2.2.6
+loop_rate_limiters==1.2.0
+
+# QP backend. pyqpmad is the fastest on this problem (~0.12 ms/solve);
+# qpsolvers provides the fallback chain (daqp, quadprog, proxqp, qpalm, osqp).
+pyqpmad==1.4.1
+qpsolvers==4.12.0
+
+# ── Teleop / hardware I/O ───────────────────────────────────────────────────
+pyzmq==26.2.0        # oculus teleop backend
+pyserial==3.5        # PicoLift serial link
+scipy==1.16.3        # pose maths in base.py
+
+# Optional: only the gamepad teleop backend and joystick.py need this.
+# pygame
+
+# ── Not on PyPI — install separately ────────────────────────────────────────
+# commlink      internal package; every RPC node and client needs it
+# nerolib       git submodule, built C++/pybind11; arm control over CAN
+# sparkcan_py   git submodule; swerve motor control over CAN

@@ -1,0 +1,109 @@
+<mujoco model="yorv3_wholebody_scene">
+  <!--
+    Scene wrapper for YORv3 whole-body IK (kinematic mode).
+
+    The robot model (robot_wholebody.xml) gives base_link three explicit
+    planar joints — base_x, base_y, base_yaw — rather than a freejoint, so
+    z / roll / pitch do not exist at all and the chassis cannot drift off
+    the ground plane. mink optimises all three base DOFs directly.
+
+    The floor plane below is not decoration: the solver's ground-avoidance
+    constraint is built against it, so the hands cannot be driven into it.
+
+    Kinematic mode: write the IK result straight to data.qpos + mj_forward.
+    No physics / no mj_step needed.
+  -->
+
+  <include file="robot_wholebody.xml"/>
+
+  <!-- ======================== SCENE SETUP ======================== -->
+  <statistic center="0 0 1.0" extent="2.0" meansize="0.05"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.15 0.15 0.15" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="150" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient"
+      rgb1="0.18 0.28 0.45" rgb2="0.04 0.04 0.08"
+      width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+      rgb1="0.12 0.18 0.25" rgb2="0.06 0.08 0.12" markrgb="0.5 0.5 0.5"
+      width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true"
+      texrepeat="8 8" reflectance="0.08"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 4.0" directional="false" diffuse="0.9 0.9 0.9" specular="0.3 0.3 0.3"/>
+    <light pos="3 0 3"   directional="true"  diffuse="0.4 0.4 0.4" specular="0 0 0"/>
+    <light pos="-3 0 3"  directional="true"  diffuse="0.3 0.3 0.3" specular="0 0 0"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"
+      contype="1" conaffinity="1" friction="1 0.01 0.01"/>
+
+    <!--
+      ===== IK TARGET BODIES (draggable in viewer) =====
+      These are the handles you drag to move the end-effectors.
+      Left = GREEN sphere   Right = MAGENTA sphere
+      On startup the demo snaps them to the current EE positions.
+
+      HOW TO DRAG: right-click + drag to translate,
+                   Ctrl + right-click + drag to rotate.
+    -->
+    <body name="left_ik_target" mocap="true" pos="0.37 -0.25 0.36">
+      <!-- Big semi-transparent sphere (easy to click) -->
+      <geom type="sphere" size="0.04"
+            rgba="0.1 1.0 0.2 0.35" contype="0" conaffinity="0"/>
+      <!-- Thick X axis (red) -->
+      <geom type="capsule" fromto="0 0 0 0.12 0 0" size="0.008"
+            rgba="1.0 0.15 0.15 1" contype="0" conaffinity="0"/>
+      <!-- Thick Y axis (green) -->
+      <geom type="capsule" fromto="0 0 0 0 0.12 0" size="0.008"
+            rgba="0.15 1.0 0.15 1" contype="0" conaffinity="0"/>
+      <!-- Thick Z axis (blue) -->
+      <geom type="capsule" fromto="0 0 0 0 0 0.12" size="0.008"
+            rgba="0.15 0.15 1.0 1" contype="0" conaffinity="0"/>
+    </body>
+
+    <body name="right_ik_target" mocap="true" pos="-0.37 -0.25 0.36">
+      <!-- Big semi-transparent sphere (easy to click) -->
+      <geom type="sphere" size="0.04"
+            rgba="1.0 0.2 1.0 0.35" contype="0" conaffinity="0"/>
+      <!-- Thick X axis (red) -->
+      <geom type="capsule" fromto="0 0 0 0.12 0 0" size="0.008"
+            rgba="1.0 0.15 0.15 1" contype="0" conaffinity="0"/>
+      <!-- Thick Y axis (green) -->
+      <geom type="capsule" fromto="0 0 0 0 0.12 0" size="0.008"
+            rgba="0.15 1.0 0.15 1" contype="0" conaffinity="0"/>
+      <!-- Thick Z axis (blue) -->
+      <geom type="capsule" fromto="0 0 0 0 0 0.12" size="0.008"
+            rgba="0.15 0.15 1.0 1" contype="0" conaffinity="0"/>
+    </body>
+
+  </worldbody>
+
+
+  <!--
+    ======================== HOME KEYFRAME ========================
+    Base now has 3 planar joints: base_x, base_y, base_yaw
+    Total nq = 66
+  -->
+  <keyframe>
+    <!--
+      No freejoint anymore. Just the 3 base joints at 0.
+    -->
+    <key name="home"
+      qpos="0 0 0
+            0 0 0 0
+            0.2
+            0.0 1.32 -1.71 1.31 0.0 0.0 0.0
+            0 0 0 0  0 0 0 0  0 0 0 0  0 0 0 0  0 0 0 0
+            0.0 1.32  1.71 1.31 0.0 0.0 0.0
+            0 0 0 0  0 0 0 0  0 0 0 0  0 0 0 0  0 0 0 0
+            0 0 0 0"/>
+  </keyframe>
+
+
+</mujoco>
