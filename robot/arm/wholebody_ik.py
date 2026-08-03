@@ -114,10 +114,35 @@ class WholeBodyIKConfig:
     ee_orientation_cost: float = 0.5
     ee_lm_damping: float       = 1.0
 
-    # Posture regularisation (how much to penalise moving away from home)
+    # Posture regularisation (how much to penalise moving away from home).
+    # NOTE: these dataclass defaults are NOT what runs on the robot —
+    # WholeBodyController, yor_mujoco.py and tools/wholebody_ik_demo.py each
+    # construct their own config. Change the call site, not these.
     base_posture_cost: float   = 1e-4   # low → base moves freely for reachability
     lift_posture_cost: float   = 1e-2   # moderate → stay near current height
     arm_posture_cost: float    = 1e-3   # light → smooth arm configs
+
+    # Per-joint posture cost, overriding `arm_posture_cost` for named joints.
+    # Keys are model joint names ("left_arm_joint1" … "right_arm_joint7").
+    # Higher cost → the solver penalises moving that joint more and reaches with
+    # the others instead; lower → that joint takes up the slack. Only the ratio
+    # to `arm_posture_cost` matters, so scale against it:
+    #   10× stiffer  → {"left_arm_joint1": 1e-2}
+    #   10× softer   → {"left_arm_joint7": 1e-4}
+    #
+    # Measured response, one EE target 0.10 m out from home, joint1 varied
+    # against arm_posture_cost=1e-3 (|dq| for that joint / summed over the arm):
+    #     1e-3  (1×)      0.171 rad / 0.947      the uniform baseline
+    #     1e-2  (10×)     0.111 rad / 0.991
+    #     1e-1  (100×)    0.000 rad / 1.076      effectively pinned
+    #     1e0   (1000×)   0.000 rad / 1.103      no further effect
+    # So ~0.1× to ~100× is the useful band; beyond that it saturates. Note the
+    # arm total *rises* as one joint stiffens — the others absorb the motion.
+    #
+    # A cost of 0 is not "free": mink needs a positive cost, so use a small
+    # value (1e-8, the vector's floor) to mean effectively free.
+    # Unknown joint names raise at construction rather than being ignored.
+    arm_posture_cost_overrides: dict[str, float] = field(default_factory=dict)
 
     # DampingTask costs for ground constraint (lock z, roll, pitch)
     ground_lock_cost: float    = 200.0  # high → robot stays upright and on ground
@@ -535,9 +560,70 @@ class WholeBodyIK:
             cost[dof_id] = self.config.base_posture_cost
         # Lift
         cost[self.model.joint(self._LIFT_JOINT).dofadr] = self.config.lift_posture_cost
-        # Arms
+        # Arms — uniform, then per-joint overrides on top.
         for jn in self._LEFT_JOINTS + self._RIGHT_JOINTS:
             cost[self.model.joint(jn).dofadr] = self.config.arm_posture_cost
+        for jn, c in self.config.arm_posture_cost_overrides.items():
+            cost[self._arm_joint_dofadr(jn)] = float(c)
+        return cost
+
+    def _arm_joint_dofadr(self, joint_name: str) -> int:
+        """DOF address of an arm joint, with a useful error for a bad name.
+
+        model.joint() raises a bare KeyError on a typo, which during tuning
+        reads as "the override did nothing" — so name the valid set here.
+        """
+        if joint_name not in self.arm_joint_names:
+            raise ValueError(
+                f"Unknown arm joint {joint_name!r}. Valid names: "
+                f"{', '.join(self.arm_joint_names)}"
+            )
+        return int(self.model.joint(joint_name).dofadr)
+
+    @property
+    def arm_joint_names(self) -> list[str]:
+        """The 14 arm joint names, in solver order (left 1-7 then right 1-7)."""
+        return list(self._LEFT_JOINTS) + list(self._RIGHT_JOINTS)
+
+    def set_arm_posture_costs(
+        self,
+        overrides: dict[str, float],
+        *,
+        replace: bool = False,
+    ) -> np.ndarray:
+        """Retune per-joint arm posture costs on a live solver.
+
+        Higher cost on a joint → the solver moves it less and reaches with the
+        other DOFs instead. Lower → that joint absorbs more of the motion.
+
+        Parameters
+        ----------
+        overrides : {joint_name: cost}
+            Merged into any existing overrides, or used as the whole set when
+            ``replace=True``. Pass ``{}`` with ``replace=True`` to go back to a
+            uniform ``arm_posture_cost``.
+        replace : bool
+            Discard the current overrides instead of merging.
+
+        Returns the new nv-length cost vector.
+
+        Safe to call while the control loop is running: mink reads the cost
+        vector at solve time, so the change takes effect on the next solve.
+        Costs are a *soft* preference — to stop a joint moving outright, limit
+        its velocity instead (see ``_build_velocity_limits``).
+        """
+        merged = {} if replace else dict(self.config.arm_posture_cost_overrides)
+        merged.update(overrides)
+        for jn, c in merged.items():
+            self._arm_joint_dofadr(jn)          # validate before mutating
+            if float(c) <= 0.0:
+                raise ValueError(
+                    f"Posture cost for {jn!r} must be > 0 (mink divides by it); "
+                    f"use a small value like 1e-8 to mean 'effectively free'."
+                )
+        self.config.arm_posture_cost_overrides = merged
+        cost = self._build_posture_cost()
+        self.posture_task.set_cost(cost)
         return cost
 
     def _collision_geoms(self, body_names: list[str]) -> list[int]:

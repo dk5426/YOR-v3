@@ -712,7 +712,6 @@ class StaticGridWithLiveOverlayThread:
         self._last_meta: Optional[Dict] = None
         self._last_T_world_robot = None
         self._last_cost_map: Optional[np.ndarray] = None
-        self._dynamic_counts = np.zeros_like(self.base_grid, dtype=np.int16)
         self.overlay_keep_fraction = float(np.clip(overlay_keep_fraction, 0.0, 1.0))
 
         # --- Live base-grid refresh from provider ---
@@ -726,10 +725,16 @@ class StaticGridWithLiveOverlayThread:
         # CPU transform pipeline.  Supplied by MapManager.get_latest_frame_pts.
         self._pts_provider: Optional[Callable] = pts_provider
 
-        # --- Stage 3: PCD ring buffer (short-term memory) ---
+        # --- Dynamic-obstacle memory (short-term ring of recent occupancy) ---
+        # A cell counts as a dynamic obstacle for `ttl` overlay ticks after it was
+        # last observed, then clears. Expressed in seconds so the behaviour does
+        # not silently change with the overlay rate.
         from collections import deque as _deque
-        self._pcd_ring_size = int(max(1, grid_params.ttl * 2)) if hasattr(grid_params, 'ttl') else 8
-        self._pcd_ring: _deque = _deque(maxlen=self._pcd_ring_size)
+        ttl_ticks = int(max(1, getattr(grid_params, "ttl", 8)))
+        overlay_hz = float(hz) if (hz and hz > 0) else 10.0
+        self._dynamic_memory_s = ttl_ticks / overlay_hz
+        # One slot per tick in the window; anything older has already expired.
+        self._pcd_ring: _deque = _deque(maxlen=ttl_ticks)
         # Each entry: (occ_mask, timestamp)  where occ_mask is (H,W) bool
 
     def start(self):
@@ -782,8 +787,7 @@ class StaticGridWithLiveOverlayThread:
             self.x0 = float(self.base_meta.get("x0", 0.0))
             self.z_top = float(self.base_meta.get("z_top", 0.0))
 
-            # Reallocate dynamic counts and clear ring buffer for new shape
-            self._dynamic_counts = np.zeros((self.H, self.W), dtype=np.int16)
+            # Drop the dynamic-obstacle memory: its masks are the old shape.
             self._pcd_ring.clear()
         except Exception as e:
             print(f"[StaticGridOverlay] base_grid_provider failed: {e}")
@@ -855,23 +859,26 @@ class StaticGridWithLiveOverlayThread:
             if occ_mask is not None:
                 self._pcd_ring.append((occ_mask, now))
 
-        # Stage 3: Merge all ring buffer entries with temporal weighting
-        # Dynamic counts integrate contributions from all recent frames.
-        # Recent frames contribute full TTL; older ones decay linearly.
-        ttl = int(self.params.ttl)
-        max_age_s = float(self._pcd_ring_size) / 10.0  # assume ~10 Hz overlay rate
-        merged_counts = np.zeros((self.H, self.W), dtype=np.int16)
+        # Expire observations older than the memory window. The deque is in
+        # chronological order, so the stale entries are always a prefix.
+        #
+        # This replaces a weighted merge that could never expire anything: it
+        # scaled a per-frame weight by a linear decay, floored that weight at 1,
+        # and then thresholded the result at >= 1. The floor and the threshold
+        # were the same number, so the decay had no effect and any cell seen in
+        # the last `maxlen` frames stayed a hard obstacle — a person crossing in
+        # front of the robot left a solid trail that A* refused to route through.
+        cutoff = now - self._dynamic_memory_s
+        while self._pcd_ring and self._pcd_ring[0][1] < cutoff:
+            self._pcd_ring.popleft()
 
-        for occ_mask, ts in self._pcd_ring:
-            # Handle grid shape changes (from base_grid_provider resizing)
+        # A cell is a dynamic obstacle iff any surviving frame saw it.
+        dyn_occ = np.zeros((self.H, self.W), dtype=bool)
+        for occ_mask, _ts in self._pcd_ring:
+            # Skip frames from before a base_grid_provider resize.
             if occ_mask.shape != (self.H, self.W):
                 continue
-            age = now - ts
-            # Linear decay: full TTL at age=0, 1 at age=max_age_s
-            weight = max(1, int(ttl * max(0.0, 1.0 - age / max(0.01, max_age_s))))
-            merged_counts[occ_mask] = np.maximum(merged_counts[occ_mask], weight)
-
-        dyn_occ = merged_counts >= 1
+            dyn_occ |= occ_mask
         if np.any(dyn_occ):
             dyn_infl_mask = _binary_dilate(dyn_occ.astype(np.uint8), self.kernel)
             dyn_infl = dyn_infl_mask.astype(bool)

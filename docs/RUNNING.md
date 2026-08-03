@@ -286,6 +286,80 @@ The odometry geometry in `robot/nav/odometry/swerve_odom.py` (`LENGTH`,
 `WIDTH`, `METERS_PER_ROTATION`) is *calibrated*, deliberately different from the
 nominal CAD values in `robot/base_motor.py`. Do not reconcile them by hand.
 
+### Feeding the SLAM pose into whole-body IK (optional)
+
+By default the solver's base pose is dead-reckoned from the velocity it
+commanded, so it drifts. `WholeBodyHardwareConfig.enable_slam_base_pose` wires
+the Odin pose in as a **drift correction** — dead-reckoning stays primary and
+the absolute pose is bled in under a rate limit, so a loop-closure jump never
+reaches the IK as a step.
+
+It ships **off**, because one value has to be calibrated first: `slam_yaw_sign`
+(+1 or −1), the handedness of the SLAM planar frame relative to the IK one.
+Everything else — rotation and translation between the frames — is solved
+automatically from the first pose pair, so the correction always starts at zero.
+
+Calibration, about 30 seconds:
+
+```python
+cfg = WholeBodyHardwareConfig(enable_slam_base_pose=True, slam_yaw_sign=+1.0)
+```
+
+1. Start `odin_pub_node` and `yor.py`. Watch for `[wholebody] SLAM base
+   correction aligned` — no message means no pose is arriving.
+2. Drive the base forward ~1 m with the joystick.
+3. Poll `get_state()["slam_base_correction_m"]`.
+   - **Stays small** (a few cm, not trending): sign is right.
+   - **Grows steadily** with distance: flip `slam_yaw_sign` to −1.0 and repeat.
+
+A wrong sign is worse than leaving the feature off — the error then grows as you
+drive instead of staying bounded, which is why the default is disabled.
+
+`get_state()` also reports `slam_base_pose_age` (seconds since the last pose,
+`None` when the feature is off). If it exceeds `slam_pose_max_age_s` the
+correction pauses and the loop coasts on dead-reckoning.
+
+Two things that make this less obvious than it looks:
+
+- The listener runs its **own** subscriber thread rather than reusing
+  `BaseController`'s pose. Whole-body dispatch pins that controller to
+  `"BASE_VEL"` mode, and in that mode its loop `continue`s before it ever calls
+  `get_pose` — so `yor.pose` is stale exactly while whole-body control runs.
+- The control loop never touches the network. commlink's subscriber is
+  pull-mode (one round trip per read), which a 100 Hz loop cannot afford, so the
+  loop only ever reads a cached value.
+
+### Tuning individual arm joints in the solver
+
+`WholeBodyIKConfig.arm_posture_cost` applies one weight to all 14 arm joints.
+`arm_posture_cost_overrides` sets them per joint — higher cost means the solver
+moves that joint less and reaches with the others instead:
+
+```python
+WholeBodyIKConfig(
+    arm_posture_cost=1e-3,
+    arm_posture_cost_overrides={
+        "left_arm_joint1": 1e-2,   # 10x stiffer — spare a strained shoulder
+        "left_arm_joint7": 1e-4,   # 10x softer  — let the wrist absorb it
+    },
+)
+```
+
+Or retune live, without restarting: `controller.ik.set_arm_posture_costs({...})`.
+Merges by default; pass `replace=True` to drop existing overrides.
+
+Only the ratio to `arm_posture_cost` matters. Measured on one 0.10 m EE target,
+varying `left_arm_joint1` against `arm_posture_cost=1e-3`: 10× stiffer cuts that
+joint's travel from 0.171 to 0.111 rad, 100× effectively pins it, and beyond
+that it saturates — so ~0.1× to ~100× is the useful band. The arm's *total*
+motion rises as one joint stiffens, because the others take up the slack.
+
+An unknown joint name raises rather than being silently ignored, and a cost of 0
+is rejected (mink requires a positive cost — use `1e-8` for "effectively free").
+To stop a joint moving outright, limit its velocity in `_build_velocity_limits`
+instead: that's a hard QP constraint, so unlike a cost it cannot be traded away
+against the end-effector task.
+
 ### Arbitration between whole-body and direct control
 
 Direct commands win, briefly. Any call to `set_base_velocity` / `move_to` /
@@ -302,7 +376,7 @@ loop), then `resume_wholebody()`.
 
 | Limitation | Consequence |
 |---|---|
-| The *solver's* base odometry is dead-reckoned from the commanded velocity | The solver's idea of where the chassis is drifts. Fine for clutch-based teleop (targets are relative to the current EE pose); absolute world-frame targets degrade the longer the base drives. Note this is independent of the SLAM stack: `wholebody_control.BaseOdometry` does not consume `slam/pose`, so navigation being up does not fix it. |
+| The *solver's* base odometry is dead-reckoned from the commanded velocity | The solver's idea of where the chassis is drifts. Fine for clutch-based teleop (targets are relative to the current EE pose); absolute world-frame targets degrade the longer the base drives. Fixable — see "Feeding the SLAM pose into whole-body IK" above — but off until `slam_yaw_sign` is calibrated, so it drifts by default. |
 | The Odin's `slam/pcd` cloud is unordered | `pcd_source: slam` reshapes it to `(1,N,4)`, so mapping's 3×3 flying-pixel rejection spans unrelated points and is effectively inert. Acceptable because the Odin filters on-device, but do not read that filter as active. |
 | `BaseAxisMap` signs are unverified | Checked against the conventions in `base.py`, not against the physical robot. Do step 1 of the checklist. |
 | The lift is bang-bang | It servos to a deadband (1 cm by default), so it cannot hold an arbitrary height as precisely as the sim. |

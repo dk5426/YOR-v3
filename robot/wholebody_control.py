@@ -23,13 +23,18 @@ Control flow, once per cycle (default 100 Hz):
 
 Three things are worth knowing before running this on the robot:
 
-* **Base odometry is dead-reckoned from the commanded velocity.** The swerve
-  base has no fused pose source wired into this loop, so the IK's notion of
-  where the chassis is drifts from reality over time. That is tolerable
-  because teleop targets are generated relative to the *current* EE pose, but
-  it means absolute world-frame targets get less accurate the longer the base
-  drives. `BaseOdometry` is a single seam — swap in the EKF-fused SLAM pose
-  (robot/slam_node_.py) when one is trusted.
+* **Base odometry is dead-reckoned from the commanded velocity**, optionally
+  corrected by SLAM. By default nothing absolute feeds this loop, so the IK's
+  notion of where the chassis is drifts from reality over time. That is
+  tolerable because teleop targets are generated relative to the *current* EE
+  pose, but absolute world-frame targets get less accurate the longer the base
+  drives.
+
+  Setting `enable_slam_base_pose` attaches the Odin pose (`slam/pose`, from
+  robot/odin_pub_node.py) as a **drift correction**: dead-reckoning remains the
+  primary, always-available signal and the SLAM pose is bled in under a rate
+  limit, so loop-closure jumps never reach the IK as a step. It ships off
+  because `slam_yaw_sign` has to be calibrated first — see docs/RUNNING.md.
 
 * **Base axis mapping is a convention, not a measurement.** `BaseAxisMap`
   below encodes how the solver's body-frame velocity maps onto
@@ -137,6 +142,39 @@ class WholeBodyHardwareConfig:
     # so the two controllers never fight over the same actuator.
     manual_override_timeout_s: float = 0.5
 
+    # ── SLAM base pose (drift correction) ───────────────────────────────────
+    # OFF by default, and it must stay off until `slam_yaw_sign` is calibrated
+    # — feeding a mis-signed absolute pose into the IK is worse than the
+    # dead-reckoning it replaces, because the error then grows as you drive
+    # instead of staying bounded. See docs/RUNNING.md for the 30-second check.
+    enable_slam_base_pose: bool = False
+    # Where odin_pub_node publishes. Whole-body runs on the Pi, SLAM on Thor;
+    # this mirrors THOR_IP in robot/base.py.
+    slam_pose_host: str = "192.168.1.11"
+    slam_pose_port: int = 6000
+    # Poll rate of the background listener. The control loop never blocks on
+    # the network — it reads whatever this thread last cached.
+    slam_pose_hz: float = 20.0
+    # Ignore a cached pose older than this and coast on dead-reckoning.
+    slam_pose_max_age_s: float = 0.5
+    # Handedness of the SLAM planar frame relative to the IK one. This is the
+    # ONLY value that needs calibrating: +1 or -1. Drive the base forward a
+    # metre with correction enabled and watch `slam_base_correction_m` in
+    # get_state() — it should stay small. If it grows steadily, flip the sign.
+    slam_yaw_sign: float = +1.0
+    # Rate limits on the correction. The SLAM pose steps discontinuously on
+    # loop closure; applied directly at 100 Hz the solver would see the end
+    # effectors teleport and command a large arm velocity on the next tick.
+    # Bleeding the offset in at these rates keeps the IK configuration
+    # continuous — 10 cm of accumulated drift is removed in ~1 s, while a 1 m
+    # loop-closure jump is absorbed over ~10 s.
+    slam_correction_max_lin_rate: float = 0.10   # m/s
+    slam_correction_max_yaw_rate: float = 0.20   # rad/s
+    # Warn once if the standing offset exceeds this — it means dead-reckoning
+    # and SLAM have diverged far more than drift explains (wrong yaw_sign,
+    # wheel slip, or the robot was picked up).
+    slam_offset_warn_m: float = 0.50
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Base odometry
@@ -167,6 +205,217 @@ class BaseOdometry:
         self._pose += np.asarray(world_velocity, dtype=float) * dt
         self._pose[2] = math.atan2(math.sin(self._pose[2]), math.cos(self._pose[2]))
         return self.pose
+
+    def offset_to(self, target: np.ndarray) -> tuple[float, float]:
+        """(linear, angular) distance from the dead-reckoned pose to `target`."""
+        target = np.asarray(target, dtype=float)
+        lin = float(math.hypot(target[0] - self._pose[0], target[1] - self._pose[1]))
+        ang = abs(_wrap_pi(float(target[2]) - float(self._pose[2])))
+        return lin, ang
+
+    def apply_correction(
+        self,
+        target: np.ndarray,
+        dt: float,
+        max_lin_rate: float,
+        max_yaw_rate: float,
+    ) -> tuple[float, float]:
+        """Nudge the dead-reckoned pose toward an absolute `target`.
+
+        The step is rate-limited, so an absolute source that jumps (SLAM loop
+        closure) never produces a discontinuity in the IK configuration — the
+        offset is bled off over many cycles instead. Returns the (linear,
+        angular) offset that remained *before* this step, for diagnostics.
+
+        The linear error is clamped as a vector rather than per-axis so the
+        correction always points at the target instead of skewing toward
+        whichever axis saturated first.
+        """
+        target = np.asarray(target, dtype=float)
+        err_x = float(target[0] - self._pose[0])
+        err_y = float(target[1] - self._pose[1])
+        err_t = _wrap_pi(float(target[2]) - float(self._pose[2]))
+        lin_before = float(math.hypot(err_x, err_y))
+        ang_before = abs(err_t)
+
+        max_lin_step = max(0.0, max_lin_rate) * dt
+        if lin_before > max_lin_step and lin_before > 1e-12:
+            scale = max_lin_step / lin_before
+            err_x *= scale
+            err_y *= scale
+
+        max_yaw_step = max(0.0, max_yaw_rate) * dt
+        err_t = float(np.clip(err_t, -max_yaw_step, max_yaw_step))
+
+        self._pose[0] += err_x
+        self._pose[1] += err_y
+        self._pose[2] = _wrap_pi(self._pose[2] + err_t)
+        return lin_before, ang_before
+
+
+def _wrap_pi(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLAM base pose
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class SlamBaseFrame:
+    """Planar transform from the SLAM world frame into the IK world frame.
+
+    The SLAM pose is Y-up with the robot moving in the X–Z plane (planar
+    coordinates ``(t_x, t_z)``, yaw about Y). The IK base is planar
+    ``base_x``/``base_y``/``base_yaw`` in a model frame where the robot faces
+    −Y. The two therefore differ by a rotation, a translation, and — depending
+    on how the induced planar frames come out — a reflection.
+
+    Rather than ask anyone to derive that, ``align()`` solves the rotation and
+    translation from one matched pair of poses, so the only thing left to
+    choose is ``yaw_sign``: +1 or −1. Because alignment is exact at the moment
+    it is taken, the correction starts at zero and only ever has to remove
+    *relative* drift accumulated afterwards, which is precisely the error that
+    dead-reckoning suffers from.
+    """
+
+    yaw_sign: float = +1.0
+    _rot: float = 0.0        # rotation from SLAM planar axes to IK planar axes
+    _tx: float = 0.0
+    _ty: float = 0.0
+    _aligned: bool = False
+
+    @property
+    def aligned(self) -> bool:
+        return self._aligned
+
+    def reset(self) -> None:
+        self._rot = self._tx = self._ty = 0.0
+        self._aligned = False
+
+    def _reflect(self, sx: float, sy: float) -> tuple[float, float]:
+        # yaw_sign < 0 means the planar frames have opposite handedness, which
+        # is a reflection about the first axis — not just a rotation.
+        return (sx, sy) if self.yaw_sign >= 0 else (sx, -sy)
+
+    def align(self, slam_pose: np.ndarray, ik_pose: np.ndarray) -> None:
+        """Solve the transform so that `slam_pose` maps exactly onto `ik_pose`."""
+        sx, sy, syaw = (float(v) for v in slam_pose)
+        px, py, pyaw = (float(v) for v in ik_pose)
+        self._rot = _wrap_pi(pyaw - self.yaw_sign * syaw)
+        rx, ry = self._reflect(sx, sy)
+        c, s = math.cos(self._rot), math.sin(self._rot)
+        self._tx = px - (c * rx - s * ry)
+        self._ty = py - (s * rx + c * ry)
+        self._aligned = True
+
+    def to_ik(self, slam_pose: np.ndarray) -> np.ndarray:
+        """Map a SLAM planar pose into IK planar coordinates."""
+        sx, sy, syaw = (float(v) for v in slam_pose)
+        rx, ry = self._reflect(sx, sy)
+        c, s = math.cos(self._rot), math.sin(self._rot)
+        return np.array([
+            c * rx - s * ry + self._tx,
+            s * rx + c * ry + self._ty,
+            _wrap_pi(self.yaw_sign * syaw + self._rot),
+        ], dtype=float)
+
+
+class SlamPoseListener:
+    """Background poller for the SLAM base pose, cached for a fast control loop.
+
+    Two reasons this exists rather than reading an existing pose:
+
+    * **The control loop must not touch the network.** commlink's subscriber is
+      pull-mode — every read is a round trip to Thor. A 100 Hz loop cannot
+      afford one, so this thread polls at its own rate and the loop reads
+      whatever was cached.
+    * **BaseController's pose is not usable here.** `_send_base_command` pins
+      that controller to ``"BASE_VEL"`` mode on every dispatch, and its `_run`
+      loop hits `continue` in that mode *before* reaching its `get_pose` call.
+      So `yor.pose` goes stale exactly while whole-body control is running —
+      the one time we would want it.
+
+    Reads never raise: a missing publisher just means `latest()` returns None
+    and the caller coasts on dead-reckoning.
+    """
+
+    def __init__(self, host: str, port: int, hz: float = 20.0):
+        self._host = host
+        self._port = port
+        self._period = 1.0 / max(1.0, float(hz))
+        self._lock = threading.Lock()
+        self._pose: Optional[np.ndarray] = None
+        self._stamp: float = 0.0
+        self._stop_evt = threading.Event()
+        self._warned = False
+        self._thread = threading.Thread(
+            target=self._run, name="wb-slam-pose", daemon=True
+        )
+        self._thread.start()
+
+    def latest(self) -> tuple[Optional[np.ndarray], float]:
+        """(planar pose or None, age in seconds)."""
+        with self._lock:
+            if self._pose is None:
+                return None, float("inf")
+            return self._pose.copy(), time.monotonic() - self._stamp
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        self._thread.join(timeout=1.0)
+
+    # -- internals ---------------------------------------------------------
+    @staticmethod
+    def _planar_from_msg(msg) -> Optional[np.ndarray]:
+        """slam/pose 20-float message → planar (x, y, yaw) in the SLAM frame.
+
+        Uses the base pose (indices 0:7), matching `get_pose` in robot/base.py:
+        planar position is (t_x, t_z) of the Y-up translation and yaw is taken
+        about the Y axis as atan2(-R[2,0], R[0,0]).
+        """
+        if msg is None or len(msg) < 7:
+            return None
+        # Confidence, when the publisher provides it, gates unusable tracking.
+        if len(msg) > 19 and float(msg[19]) < 10.0:
+            return None
+        qx, qy, qz, qw = (float(msg[i]) for i in range(4))
+        tx, tz = float(msg[4]), float(msg[6])
+        # Only the two entries of R that the yaw needs, expanded by hand so this
+        # module does not pull in scipy.
+        r00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+        r20 = 2.0 * (qx * qz - qw * qy)
+        return np.array([tx, tz, math.atan2(-r20, r00)], dtype=float)
+
+    def _run(self) -> None:
+        sub = None
+        try:
+            # Imported lazily so simulation and the headless tests never need
+            # commlink just to construct a WholeBodyController.
+            from commlink import Subscriber
+            from robot.topics import POSE_TOPIC
+
+            sub = Subscriber(host=self._host, port=self._port, topics=[POSE_TOPIC])
+            while not self._stop_evt.is_set():
+                try:
+                    pose = self._planar_from_msg(sub[POSE_TOPIC])
+                    if pose is not None:
+                        with self._lock:
+                            self._pose = pose
+                            self._stamp = time.monotonic()
+                except Exception:
+                    pass    # publisher down; latest() ages out on its own
+                self._stop_evt.wait(self._period)
+        except Exception as exc:
+            if not self._warned:
+                print(f"[wholebody] SLAM pose listener unavailable: {exc}")
+                self._warned = True
+        finally:
+            try:
+                if sub is not None:
+                    sub.stop()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -231,6 +480,18 @@ class WholeBodyController:
         self._home_lift: float = 0.0
 
         self.odometry = BaseOdometry()
+        # SLAM drift correction — inert unless enable_slam_base_pose is set.
+        self.slam_frame = SlamBaseFrame(yaw_sign=self.config.slam_yaw_sign)
+        self.slam_pose: Optional[SlamPoseListener] = None
+        self._slam_offset_m = 0.0
+        self._slam_pose_age = float("inf")
+        self._slam_offset_warned = False
+        if self.config.enable_slam_base_pose:
+            self.slam_pose = SlamPoseListener(
+                self.config.slam_pose_host,
+                self.config.slam_pose_port,
+                self.config.slam_pose_hz,
+            )
         self._last_base_velocity = np.zeros(3)   # world frame, as commanded
         self._last_base_command = np.zeros(3)    # what Base was actually sent
         self._last_lift_command: Optional[str] = None
@@ -257,6 +518,8 @@ class WholeBodyController:
         self._home_lift = float(self.ik.configuration.q[self.ik._lift_qpos_adr])
 
         self.odometry.reset()
+        # The odometry origin just moved, so any earlier SLAM alignment is void.
+        self.slam_frame.reset()
         self._sync_from_hardware()
 
         T_l, T_r = self.ik.forward_kinematics()
@@ -291,6 +554,9 @@ class WholeBodyController:
         self._thread = None
         self._halt_base()
         self._halt_lift()
+        if self.slam_pose is not None:
+            self.slam_pose.stop()
+            self.slam_pose = None
 
     def emergency_stop(self) -> None:
         """Stop the loop and freeze every actuator where it stands."""
@@ -437,6 +703,14 @@ class WholeBodyController:
             "solve_error": self._solve_error,
             "left_joint_positions": q[self.ik._left_arm_qpos_adrs].tolist(),
             "right_joint_positions": q[self.ik._right_arm_qpos_adrs].tolist(),
+            # SLAM drift correction. `slam_base_pose_age` is None when the
+            # feature is off; a steadily growing `slam_base_correction_m` while
+            # driving is the signature of a wrong slam_yaw_sign.
+            "slam_base_pose_age": (
+                None if self.slam_pose is None or not np.isfinite(self._slam_pose_age)
+                else float(self._slam_pose_age)
+            ),
+            "slam_base_correction_m": float(self._slam_offset_m),
         }
 
     # ── Control loop ─────────────────────────────────────────────────────────
@@ -464,6 +738,7 @@ class WholeBodyController:
         if T_l is None or T_r is None:
             return
 
+        self._correct_base_from_slam()
         self._sync_from_hardware()
         result = self.ik.solve(T_l, T_r, lift_target=lift_tgt)
         self._last_solve_ok = bool(result.solved)
@@ -488,6 +763,48 @@ class WholeBodyController:
         self.ik.set_measured_state(
             left_q=left_q, right_q=right_q, lift=lift, base=self.odometry.pose
         )
+
+    def _correct_base_from_slam(self) -> None:
+        """Bleed dead-reckoning drift out of the base pose using the SLAM pose.
+
+        Deliberately a *correction* rather than a replacement. Dead-reckoning
+        stays the primary signal because it is smooth, always available and
+        exact with respect to what the solver commanded; SLAM only supplies the
+        absolute reference that stops it drifting. A dropout therefore costs
+        nothing but the correction itself.
+        """
+        if self.slam_pose is None:
+            return
+
+        pose, age = self.slam_pose.latest()
+        self._slam_pose_age = age
+        if pose is None or age > self.config.slam_pose_max_age_s:
+            return
+
+        if not self.slam_frame.aligned:
+            # First usable fix: pin the SLAM frame onto wherever the odometry
+            # currently thinks it is, so the correction starts at exactly zero
+            # and only removes drift accumulated from here on.
+            self.slam_frame.align(pose, self.odometry.pose)
+            print("[wholebody] SLAM base correction aligned "
+                  f"(yaw_sign={self.config.slam_yaw_sign:+.0f})")
+            return
+
+        target = self.slam_frame.to_ik(pose)
+        lin, _ang = self.odometry.apply_correction(
+            target,
+            self.dt,
+            self.config.slam_correction_max_lin_rate,
+            self.config.slam_correction_max_yaw_rate,
+        )
+        self._slam_offset_m = lin
+
+        if lin > self.config.slam_offset_warn_m and not self._slam_offset_warned:
+            print(f"[wholebody] SLAM/odometry offset {lin:.2f} m — check "
+                  f"slam_yaw_sign, or the base is slipping badly")
+            self._slam_offset_warned = True
+        elif lin < 0.5 * self.config.slam_offset_warn_m:
+            self._slam_offset_warned = False
 
     def _measured_lift(self) -> Optional[float]:
         try:

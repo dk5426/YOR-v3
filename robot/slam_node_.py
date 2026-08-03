@@ -13,7 +13,6 @@ back over the YOR RPC (`EKFSlamSource`). Pass --no-ekf for the raw path.
 """
 
 import argparse
-import concurrent.futures
 import json
 import os
 import sys
@@ -23,6 +22,7 @@ import urllib.request
 from typing import Optional, Tuple
 
 import numpy as np
+import zmq
 from commlink import Subscriber, RPCClient
 from robot.nav.mapping.mapping_torch import MapManager
 from robot.nav.pathPlanning import (
@@ -47,6 +47,45 @@ from robot.utils.utils import waitKey
 # RPC from SLAM -> Yor (follow_path via RPC)
 YOR_RPC_HOST = "192.168.1.10"
 YOR_RPC_PORT = 5557
+
+# Every RPC to yor.py goes over a ZMQ REQ socket, which by default blocks
+# forever if the peer is down. Bound it so a missing or wedged yor.py degrades
+# the SLAM node instead of freezing whichever thread made the call.
+RPC_TIMEOUT_S = 0.5
+
+
+def make_rpc_client(host: str, port: int, timeout_s: float = RPC_TIMEOUT_S) -> RPCClient:
+    """An RPCClient whose REQ socket times out instead of blocking forever.
+
+    `socket` and `context` live in the client's __dict__, so reading them is
+    local — RPCClient.__getattr__ (which would issue a remote call) is only
+    consulted for names that are *not* already instance attributes.
+    """
+    client = RPCClient(host, port)
+    ms = max(1, int(timeout_s * 1000))
+    client.socket.setsockopt(zmq.RCVTIMEO, ms)
+    client.socket.setsockopt(zmq.SNDTIMEO, ms)
+    client.socket.setsockopt(zmq.LINGER, 0)  # so close()/term() cannot hang
+    return client
+
+
+def close_rpc_client(client: Optional[RPCClient]) -> None:
+    """Tear down a client without blocking.
+
+    Note we must NOT probe with hasattr(client, "close"): RPCClient.__getattr__
+    turns any unknown attribute into a blocking remote call, so asking a wedged
+    client whether it has a close() is itself a hang.
+    """
+    if client is None:
+        return
+    try:
+        client.socket.close(linger=0)
+    except Exception:
+        pass
+    try:
+        client.context.term()
+    except Exception:
+        pass
 
 def _quat_to_matrix(q) -> np.ndarray:
     """Convert quaternion [x, y, z, w] to 3×3 rotation matrix (inline, no scipy)."""
@@ -299,11 +338,16 @@ class EKFSlamSource:
     def __init__(
         self,
         slam_sub: SlamSub,
-        yor_client: RPCClient,
+        yor_host: str,
+        yor_port: int,
         predict_hz: float = 20.0,
     ):
         self._slam = slam_sub
-        self._yor  = yor_client
+        # This client is owned exclusively by the predict thread, which rebuilds
+        # it after a timeout — hence host/port rather than a ready-made client.
+        self._yor_host = yor_host
+        self._yor_port = yor_port
+        self._yor = make_rpc_client(yor_host, yor_port)
         self._odom = SwerveOdom()
         self._ekf  = RobotEKF()       # uses calibrated defaults from robot_ekf.py
         self._lock = threading.Lock()
@@ -330,6 +374,15 @@ class EKFSlamSource:
         print("[EKFSlamSource] Started EKF predict thread at",
               self._predict_hz, "Hz")
 
+    def _reset_rpc(self):
+        """Replace the encoder RPC client after a timeout or socket fault.
+
+        Only ever called from the predict thread, which owns self._yor
+        exclusively — no locking required.
+        """
+        close_rpc_client(self._yor)
+        self._yor = make_rpc_client(self._yor_host, self._yor_port)
+
     # ------------------------------------------------------------------ #
     # Background predict loop                                             #
     # ------------------------------------------------------------------ #
@@ -343,13 +396,6 @@ class EKFSlamSource:
         MAX_VEL   = 2.0    # m/s   — robot cannot physically exceed this
         MAX_OMEGA = 3.0    # rad/s — max turn rate
 
-        # RPC timeout: the ZMQ REQ socket has no built-in timeout — if yor.py is
-        # offline it blocks forever, stalling the entire predict thread.  We wrap
-        # every call in a thread-pool future with a hard deadline instead.
-        RPC_TIMEOUT_S  = 0.5
-        _rpc_executor  = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="ekf-rpc")
-
         _predict_count = 0
         _none_count    = 0   # consecutive None returns (yor.py not initialized)
         _timeout_count = 0   # consecutive RPC timeouts (yor.py offline / hung)
@@ -357,17 +403,37 @@ class EKFSlamSource:
         while not self._stop_evt.is_set():
             t0 = time.time()
             try:
-                # Non-blocking RPC with hard timeout so the predict thread
-                # never stalls the entire SLAM node when yor.py is unreachable.
-                future = _rpc_executor.submit(self._yor.get_base_encoders)
+                # The client's REQ socket carries RCVTIMEO, so an unreachable
+                # yor.py raises zmq.Again here instead of parking this thread.
                 try:
-                    enc = future.result(timeout=RPC_TIMEOUT_S)
-                except concurrent.futures.TimeoutError:
-                    future.cancel()
+                    enc = self._yor.get_base_encoders()
+                except zmq.Again:
+                    # REQ enforces strict send/recv alternation: once a receive
+                    # has timed out the socket is stuck in the "expecting reply"
+                    # state and every later call fails with EFSM. The only
+                    # recovery is a fresh socket.
+                    #
+                    # (The previous version ran the call on a single-worker
+                    # ThreadPoolExecutor and called future.cancel() on timeout.
+                    # cancel() is a no-op once a future is running, so the worker
+                    # stayed blocked in recv forever and every subsequent submit
+                    # queued behind it — one timeout disabled the EKF for the
+                    # rest of the session, even after yor.py came back.)
+                    self._reset_rpc()
                     _timeout_count += 1
                     if _timeout_count % 20 == 1:   # every ~10 s at 20 Hz
                         print(f"[EKF-predict] WARN: get_base_encoders() timed out "
                               f"{_timeout_count}× — is yor.py running?")
+                    time.sleep(self._predict_dt)
+                    continue
+                except zmq.ZMQError as e:
+                    # Any other socket-level fault (EFSM after a partial
+                    # exchange, peer reset) is equally unrecoverable in place.
+                    self._reset_rpc()
+                    _timeout_count += 1
+                    if _timeout_count % 20 == 1:
+                        print(f"[EKF-predict] WARN: RPC socket error ({e}); "
+                              f"rebuilt client ({_timeout_count}×).")
                     time.sleep(self._predict_dt)
                     continue
                 _timeout_count = 0   # reset on success
@@ -602,6 +668,10 @@ class EKFSlamSource:
     def stop(self):
         self._stop_evt.set()
         self._slam.stop()
+        # Let the predict thread notice the stop before we pull its socket out
+        # from under it; LINGER=0 means this cannot block either way.
+        self._predict_thr.join(timeout=2.0 * self._predict_dt)
+        close_rpc_client(self._yor)
 
     def get_rgb_depth_pose(self):
         """Returns (image_rgb, depth_m, pose_qt) — pose_qt is raw VIO (not fused)."""
@@ -713,7 +783,8 @@ class Slam:
             print("[Slam] EKF fusion enabled — wrapping SlamSub with EKFSlamSource")
             self.datastream = EKFSlamSource(
                 slam_sub=_slam_raw,
-                yor_client=RPCClient(yor_host, yor_port),
+                yor_host=yor_host,
+                yor_port=yor_port,
                 predict_hz=predict_hz,
             )
             # Mapping only needs raw PCD+POSE — do NOT create a second EKFSlamSource
@@ -727,7 +798,7 @@ class Slam:
         self.yor_host = yor_host
         self.yor_port = yor_port
         self._cone_rpc_lock = threading.Lock()
-        self.yor_client = RPCClient(self.yor_host, self.yor_port)
+        self.yor_client = make_rpc_client(self.yor_host, self.yor_port)
         self.server = start_viser_server(host="0.0.0.0", port=8099)
         self.path_step_m = None if path_step_m is None else max(0.0, float(path_step_m))
 
@@ -1290,14 +1361,14 @@ class Slam:
             time.sleep(0.5)
 
     def _reset_yor_client(self):
-        """Reset the Yor RPC client (e.g. after EFSM / stuck REQ socket) while holding the RPC lock."""
-        try:
-            # if RPCClient has a close(), call it; otherwise just drop it
-            if hasattr(self.yor_client, "close"):
-                self.yor_client.close()
-        except Exception as e:
-            print(f"[slam_node_new] Failed to close yor_client: {e}")
-        self.yor_client = RPCClient(self.yor_host, self.yor_port)
+        """Reset the Yor RPC client (e.g. after EFSM / stuck REQ socket) while holding the RPC lock.
+
+        Do not probe the old client with hasattr/getattr first: RPCClient turns
+        any unknown attribute into a blocking remote call, so interrogating a
+        client we already know is wedged would hang here.
+        """
+        close_rpc_client(self.yor_client)
+        self.yor_client = make_rpc_client(self.yor_host, self.yor_port)
 
 
     def _path_sender_loop(self):
@@ -1358,7 +1429,6 @@ class Slam:
                 self._path_resend_needed = False  # consumed
 
             except Exception as e:
-                msg = str(e)
                 now = time.time()
 
                 # Don't spam console
@@ -1366,9 +1436,12 @@ class Slam:
                     print(f"[slam_node_new] follow_path RPC failed: {e}")
                     last_fail_t = now
 
-                # EFSM / stuck REQ socket -> recreate client
-                if "Operation cannot be accomplished in current state" in msg:
-                    print("[slam_node_new] RPC socket stuck (EFSM). Resetting RPCClient...")
+                # Any socket-level fault leaves the REQ socket unusable: a timed
+                # out receive (zmq.Again) breaks send/recv alternation, and every
+                # call after that raises EFSM. Rebuild on either rather than
+                # waiting for the EFSM message to show up on the next iteration.
+                if isinstance(e, zmq.ZMQError):
+                    print(f"[slam_node_new] RPC socket unusable ({e}); rebuilding client…")
                     with self._cone_rpc_lock:
                         self._reset_yor_client()
 
