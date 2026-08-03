@@ -238,6 +238,54 @@ Do these in order the first time. Steps 1–3 need no whole-body control at all.
    the signs in `BaseAxisMap` (`robot/wholebody_control.py`) rather than
    compensating elsewhere.
 
+### Navigation (Odin 1 SLAM)
+
+Localization and mapping run on a Manifold Odin 1 over its native C SDK — no
+ROS, no ZED. Two processes, launched together by `nav.sh`:
+
+```bash
+bash setup_odin.sh --full     # once per machine: env, deps, build pyodin
+bash nav.sh                   # tmux: odin_pub_node + slam_node_
+bash nav.sh --kill
+```
+
+| Process | Publishes / serves | Purpose |
+|---|---|---|
+| `robot/odin_pub_node.py` | `slam/*` on **:6000** | device → Y-up poses, RGB, depth, cloud |
+| `robot/slam_node_.py` | Viser on **:8099** | voxel map, 2D grid, A*, `follow_path` RPC |
+
+Topic names and message layouts live in `robot/topics.py`. `robot/base.py`
+subscribes to `slam/pose` on its own for closed-loop path following, so the
+publisher must be up before `follow_path`/`move_to` will do anything.
+
+Click a point in the Viser UI and A* plans a route, which is streamed to
+`yor.py` as `follow_path` waypoints — **the robot drives on click**, so treat
+:8099 as a live control surface.
+
+Bring-up order that matters:
+
+1. **Mount extrinsic first.** `T_cam_to_base` in `config/odin.yaml` is identity,
+   which is only correct with the Odin off the robot. Measure it once bolted on
+   — every pose the nav stack and base controller act on comes through it.
+2. **USB and firmware.** USB **3.0** port and cable, Odin firmware ≥ 0.12.0,
+   and the udev rule from `setup_odin.sh`'s header. Check with `lsusb -d 2207:`.
+3. **One consumer at a time.** The Odin is a single USB device — never run two
+   publishers or a stray driver alongside `nav.sh`.
+4. **Stop with Ctrl-C, not `kill -9`.** A hard kill can wedge the device's
+   onboard daemon, which then needs a power cycle. (The SDK segfaults harmlessly
+   in its exit destructors; `odin_pub_node` hard-exits past it with `os._exit`.)
+
+The pose feeding navigation is EKF-fused by default: swerve wheel odometry
+predicts at 20 Hz from `get_base_encoders()` over the YOR RPC, and each VIO
+frame corrects it with confidence-adaptive measurement noise. That means
+`robot/yor.py` should be running — if it is not, the predict step logs RPC
+timeouts and the filter coasts on VIO alone. Pass `--no-ekf` to
+`robot.slam_node_` to use the raw VIO pose instead.
+
+The odometry geometry in `robot/nav/odometry/swerve_odom.py` (`LENGTH`,
+`WIDTH`, `METERS_PER_ROTATION`) is *calibrated*, deliberately different from the
+nominal CAD values in `robot/base_motor.py`. Do not reconcile them by hand.
+
 ### Arbitration between whole-body and direct control
 
 Direct commands win, briefly. Any call to `set_base_velocity` / `move_to` /
@@ -254,7 +302,8 @@ loop), then `resume_wholebody()`.
 
 | Limitation | Consequence |
 |---|---|
-| Base odometry is dead-reckoned from the commanded velocity | The solver's idea of where the chassis is drifts. Fine for clutch-based teleop (targets are relative to the current EE pose); absolute world-frame targets degrade the longer the base drives. |
+| The *solver's* base odometry is dead-reckoned from the commanded velocity | The solver's idea of where the chassis is drifts. Fine for clutch-based teleop (targets are relative to the current EE pose); absolute world-frame targets degrade the longer the base drives. Note this is independent of the SLAM stack: `wholebody_control.BaseOdometry` does not consume `slam/pose`, so navigation being up does not fix it. |
+| The Odin's `slam/pcd` cloud is unordered | `pcd_source: slam` reshapes it to `(1,N,4)`, so mapping's 3×3 flying-pixel rejection spans unrelated points and is effectively inert. Acceptable because the Odin filters on-device, but do not read that filter as active. |
 | `BaseAxisMap` signs are unverified | Checked against the conventions in `base.py`, not against the physical robot. Do step 1 of the checklist. |
 | The lift is bang-bang | It servos to a deadband (1 cm by default), so it cannot hold an arbitrary height as precisely as the sim. |
 | Self-collision and ground avoidance share one toggle | `c` turns both on or off; separating them needs two `CollisionAvoidanceLimit` instances. |

@@ -133,22 +133,22 @@ class ViserMirrorThread:
         )
 
         self.map_provider = map_provider
-        self._static_map_once = bool(static_map_once)
         self._static_map_logged = False
 
         self.on_confirm_move = on_confirm_move
         self.vel_source = vel_source
         self.preview_source = preview_source
         self.robot_radius_m = max(0.0, float(robot_radius_m))
+        # Voxel size used for dynamic point_size in Viser (set externally if using voxel map)
+        self.voxel_size: float = 0.03
 
-        # confirm-flow state (kept, though not used unless you wire UI buttons)
-        self._pending_goal = None  # (xw, zw, r, c)
+        # confirm-flow state (used by _on_confirm_point / _on_confirm_path hooks)
+        self._pending_goal = None   # (xw, zw, r, c)
         self._goal_planned = False
-        self._last_pose_xz = None  # (xw, zw)
-        self._last_pose_t = None
-        self._vel_xz_lp = np.zeros(2, dtype=np.float32)
 
-        # ---- log buffer + panel ----
+        self._last_pose_xz = None      # np.array([x,z])
+        self._last_pose_t  = None      # float seconds
+        self._vel_xz_lp    = np.zeros(2, dtype=np.float32)
         self._log_lines = deque(maxlen=200)
         try:
             self._log_panel = self.server.gui.add_markdown(
@@ -176,14 +176,33 @@ class ViserMirrorThread:
         self._last_grid_t = 0.0
         self._last_map_t = 0.0
         self._last_path_sig = None
+        self._last_grid_hash = None   # change-detection for grid overlay
+        self._last_map_n = -1         # change-detection for map points
 
-        self._last_pose_xz = None      # np.array([x,z])
-        self._last_pose_t  = None      # float seconds
-        self._vel_xz_lp     = np.zeros(2, dtype=np.float32) 
         self._map_err_once = False
+        self._show_live_map = True    # can be toggled via GUI checkbox below
+
+        try:
+            with server.gui.add_folder("Map Layers"):
+                cb_live = server.gui.add_checkbox("Live map", initial_value=True)
+
+            @cb_live.on_update
+            def _on_live_toggle(_):
+                self._show_live_map = cb_live.value
+                if not self._show_live_map:
+                    try:
+                        server.scene.add_point_cloud(
+                            "map/points", points=np.zeros((0, 3), dtype=np.float32),
+                            colors=np.zeros((0, 3), dtype=np.float32), point_size=0.03,
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # older viser versions may not support add_folder
 
         if self.server is not None and viser is not None:
             self._register_click_to_goal()
+            self._register_client_connect()
 
     def _T_zup_to_yup(self, T_zup: np.ndarray) -> np.ndarray:
         """
@@ -314,10 +333,11 @@ class ViserMirrorThread:
 
     # ----------------------------- main loop -----------------------------
     def _loop(self):
+        _next_t = time.time()
         while not self._stop.is_set():
             t0 = time.time()
 
-            # 1) Grid overlay (throttled)
+            # 1) Grid overlay (throttled) — fetch grid ONCE, pass to mirror
             grid_codes, meta, _Twr = (None, {}, None)
             try:
                 grid_codes, meta, _Twr = self.grid_thread.get_grid()
@@ -326,13 +346,13 @@ class ViserMirrorThread:
 
             if grid_codes is not None and meta is not None:
                 if self._grid_dt <= 0.0 or (t0 - self._last_grid_t) >= self._grid_dt:
-                    self._mirror_grid_once()
+                    self._mirror_grid_once(grid_codes, meta)
                     self._last_grid_t = t0
 
             # 2) Path + waypoints + lookahead
             self._mirror_path_once()
 
-            # overlay from base controler
+            # overlay from base controller
             self._mirror_preview_once()
 
             # 3) Query marker (dot + label)
@@ -346,40 +366,63 @@ class ViserMirrorThread:
             # 5) Optional dynamic map points (throttled)
             self._mirror_map_points_once(t0)
 
-            # sleep to target rate
-            dt = time.time() - t0
-            if dt < self.dt:
-                time.sleep(self.dt - dt)
+            # Absolute-deadline sleep: avoids drift accumulation.
+            _next_t += self.dt
+            sleep_s = _next_t - time.time()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                _next_t = time.time()  # reset if we fell behind
 
     # ----------------------------- grid -----------------------------
-    def _mirror_grid_once(self):
-        grid_codes, meta, _ = self.grid_thread.get_grid()
+    def _mirror_grid_once(self, grid_codes, meta):
+        """Render grid overlay. Accepts pre-fetched grid to avoid double get_grid()."""
         if grid_codes is None or meta is None:
             return
+
+        # Change-detection: skip if grid hasn't changed.
+        # Using a cheap (shape, dtype, sum-of-sample) sentinel instead of hashing
+        # the full byte payload, which is O(H*W) and slow for large maps.
+        _step = max(1, grid_codes.size // 4096)
+        _sentinel = (grid_codes.shape, grid_codes.dtype, int(grid_codes.flat[::_step].sum()))
+        if _sentinel == self._last_grid_hash:
+            return
+        self._last_grid_hash = _sentinel
 
         H, W = grid_codes.shape[:2]
         cs = float(meta.get("cell_size_m", self.grid_res))
 
-        # RGBA overlay image
-        img = np.zeros((H, W, 4), dtype=np.uint8)
-        img[grid_codes == FREE] = np.array([255, 255, 255, 50], dtype=np.uint8)
-        img[grid_codes == OCCUPIED] = np.array([240, 40, 80, 150], dtype=np.uint8)
-        img[grid_codes == INFLATED] = np.array([240, 40, 80, 75], dtype=np.uint8)
-        img[grid_codes == UNKNOWN] = np.array([20, 20, 20, 50], dtype=np.uint8)
+        # RGBA overlay image — use LUT instead of 4 boolean masks
+        lut = np.zeros((256, 4), dtype=np.uint8)
+        lut[FREE]     = [255, 255, 255, 50]
+        lut[OCCUPIED] = [240, 40,  80, 150]
+        lut[INFLATED] = [240, 40,  80,  75]
+        lut[UNKNOWN]  = [ 20, 20,  20,  50]
+        img = lut[grid_codes.ravel()].reshape(H, W, 4)
 
-        center_x = self.origin_xy[0] + (W * cs) / 2.0
-        center_z = self.origin_xy[1] + (H * cs) / 2.0
+        # Use the per-frame grid origin from meta, not the fixed self.origin_xy.
+        # self.origin_xy is set once at construction; the voxel grid re-crops to
+        # the live bounding box every frame so its origin drifts as the map grows.
+        # meta["x0"] = world-x of the grid's left edge (col 0)
+        # meta["z_top"] = world-z of the grid's top edge (row 0); z decreases down rows
+        if not meta.get("ego_centric", True) and "x0" in meta and "z_top" in meta:
+            x0   = float(meta["x0"])
+            z_top = float(meta["z_top"])
+            center_x = x0 + (W * cs) / 2.0
+            center_z = z_top - (H * cs) / 2.0   # z_top is far edge; center is half-grid back
+        else:
+            # Ego-centric fallback: grid is robot-centred, use fixed origin
+            center_x = self.origin_xy[0] + (W * cs) / 2.0
+            center_z = self.origin_xy[1] + (H * cs) / 2.0
 
-        # Rotate image plane to lie on XZ (Viser image defaults on XY)
         self.server.scene.add_image(
             "grid/overlay_image",
             image=img,
             render_width=W * cs,
             render_height=H * cs,
             position=(center_x, self.floor_y + 0.1, center_z),
-            wxyz=(0.7071068, -0.7071068, 0.0, 0.0),  # -90 deg about X
+            wxyz=(0.7071068, -0.7071068, 0.0, 0.0),
         )
-        # print("[ViserBridge] Done _mirror_grid_once", flush=True)
 
     # ----------------------------- path -----------------------------
     def _mirror_path_once(self):
@@ -612,46 +655,6 @@ class ViserMirrorThread:
                 )
             except Exception as e:
                 print(f"[Viser] Failed to clear nav goal label: {e}")
-            return
-
-        mx, my, mz, mlabel = marker
-        if my is None:
-            my = self.floor_y + 0.12
-
-        mp = np.array([[mx, my, mz]], dtype=np.float32)
-        mc = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
-
-        self.server.scene.add_point_cloud(
-            name="dynamem/query_hit",
-            points=mp,
-            colors=mc,
-            point_size=0.05,
-        )
-
-        if mlabel:
-            self.server.scene.add_label(
-                name="dynamem/query_label",
-                text=str(mlabel),
-                position=np.array([mx, my + 0.10, mz], dtype=np.float32),
-                font_size_mode="scene",
-                font_scene_height=0.06,
-                depth_test=False,
-                anchor="bottom-center",
-            )
-        else:
-            # Clear label if no label provided
-            try:
-                self.server.scene.add_label(
-                    name="dynamem/query_label",
-                    text="",
-                    position=np.array([0.0, -9999.0, 0.0], dtype=np.float32),
-                    font_size_mode="scene",
-                    font_scene_height=0.06,
-                    depth_test=False,
-                    anchor="bottom-center",
-                )
-            except Exception as e:
-                print(f"[Viser] Failed to clear query label: {e}")
 
     # ----------------------------- robot -----------------------------
     def _mirror_robot_once(self):
@@ -661,6 +664,8 @@ class ViserMirrorThread:
             z = float(trans[2])
             p = np.asarray([x, self.floor_y + 0.20, z], dtype=np.float32)
 
+            # VIO tracking in YOR_new changed to X-forward (Robot body frame right-handed Y-up).
+            # T_wr column 0 = direction the robot's X-axis (forward) points in world frame.
             fwd = T_wr[[0, 2], 0]
             norm = np.linalg.norm(fwd)
             if norm > 1e-6:
@@ -792,8 +797,8 @@ class ViserMirrorThread:
         """
         Accept many formats and return:
         trans (3,), yaw (float), T_wr (4,4) or None, T_wc (4,4) or None
-        Supports your zed/pose 19-float list:
-        base(0:7) + cam(7:14) + base_pose(14:18) + ts(18)
+        Supports the slam/pose list (see robot/topics.py):
+        base(0:7) + cam(7:14) + base_pose(14:18) + ts(18) + confidence(19)
         """
         # Case A: already (trans, yaw, T_wr)
         if isinstance(out, (tuple, list)) and len(out) >= 2:
@@ -897,54 +902,106 @@ class ViserMirrorThread:
     def _mirror_map_points_once(self, t0: float):
         if self.map_provider is None:
             return
-        if self._static_map_once and self._static_map_logged:
-            return
-
+        # Throttle to map_update_hz
         if self._map_dt > 0.0 and (t0 - self._last_map_t) < self._map_dt:
             return
+        self._last_map_t = t0
 
         try:
             P, C = self.map_provider()
             if P is None or len(P) == 0:
                 return
 
-            if P.shape[0] > 200_000:
-                idx = np.random.choice(P.shape[0], 200_000, replace=False)
-                Pshow = P[idx]
-                if C is not None:
-                    Csel = C[idx]
-                    Cshow = (Csel / 255.0).astype(np.float32) if (Csel.dtype == np.uint8) else Csel.astype(np.float32)
-                else:
-                    Cshow = None
-            else:
-                Pshow = P
-                if C is not None:
-                    Cshow = (C / 255.0).astype(np.float32) if (C.dtype == np.uint8) else C.astype(np.float32)
-                else:
-                    Cshow = None
+            n = P.shape[0]
+            # Content-based change detection: hash a subsample of point
+            # positions rather than just comparing counts.  During active
+            # mapping, count always changes (new voxels) but the visual
+            # difference can be negligible — skip the expensive WebSocket
+            # upload when actual geometry hasn't changed significantly.
+            _SAMPLE_N = 128
+            _sample_step = max(1, n // _SAMPLE_N)
+            _sample = P[::_sample_step, :3].astype(np.float32)
+            _content_hash = hash(_sample.tobytes())
+            if _content_hash == getattr(self, '_last_map_hash_content', None):
+                return
+            self._last_map_hash_content = _content_hash
+
+            _MAX_PTS = 1_000_000
+            Pshow, Cshow = P, C
+            if n > _MAX_PTS:
+                stride = max(1, n // _MAX_PTS)
+                Pshow = P[::stride]
+                Cshow = C[::stride] if C is not None else None
 
             Pshow = Pshow.astype(np.float32)
+            if Cshow is not None:
+                Cshow = (Cshow / 255.0).astype(np.float32) if Cshow.dtype == np.uint8 else Cshow.astype(np.float32)
 
-            self.server.scene.add_point_cloud(
-                "map/points",
-                points=Pshow,
-                colors=Cshow,
-                point_size=0.05,
-            )
-            
-            self._static_map_logged = True
+            if self._show_live_map:
+                self.server.scene.add_point_cloud(
+                    "map/points",
+                    points=Pshow,
+                    colors=Cshow,
+                    point_size=self.voxel_size * 1.0,
+                    point_shape="circle",
+                )
+            self._last_map_n = n
         except Exception:
             pass
-        finally:
-            self._last_map_t = t0
+
 
     # ----------------------------- click-to-goal -----------------------------
-    def _register_click_to_goal(self):
-        lock = threading.Lock()
+    def set_click_to_goal_enabled(self, enabled: bool):
+        """Register/unregister the click-to-goal scene-pointer callback.
 
-        @self.server.on_scene_pointer(event_type="click")
+        IMPORTANT: while a scene-pointer callback is registered, the viser
+        client disables CameraControls on every pointerdown — mouse drag and
+        touch orbit/pan/zoom do nothing. So the callback must only be
+        registered while the operator actually wants click-to-goal
+        (iPad "Waypoints ON"); the rest of the time the camera owns the
+        pointer. Safe to call repeatedly from any thread.
+        """
+        handler = getattr(self, "_click_to_goal_handler", None)
+        if self.server is None or handler is None:
+            return
+        enabled = bool(enabled)
+        if enabled == getattr(self, "_click_to_goal_registered", False):
+            return
+        try:
+            if enabled:
+                scene = getattr(self.server, "scene", None)
+                reg = getattr(scene, "on_pointer_event", None)
+                if reg is not None:
+                    reg(event_type="click")(handler)
+                else:
+                    self.server.on_scene_pointer(event_type="click")(handler)
+            else:
+                scene = getattr(self.server, "scene", None)
+                if scene is not None and hasattr(scene, "remove_pointer_callback"):
+                    scene.remove_pointer_callback()
+                else:
+                    self.server.remove_scene_pointer_callback()
+            self._click_to_goal_registered = enabled
+            print(f"[Viser] click-to-goal {'ON — tap map to set goals' if enabled else 'OFF — camera drag/touch active'}")
+        except Exception as e:
+            print(f"[Viser] set_click_to_goal_enabled({enabled}) failed: {e}")
+
+    def _register_click_to_goal(self):
+        """Build the click handler. NOT registered here — call
+        set_click_to_goal_enabled(True) to activate (see note there)."""
+        lock = threading.Lock()
+        # Debounce: Viser fires on_scene_pointer for both pointer-down and pointer-up,
+        # sometimes twice per physical click.  Suppress any click within 150 ms of the last.
+        _last_click_t = [0.0]
+        _DEBOUNCE_S = 0.15
+
         def _on_click(ev):
             with lock:
+                now = time.time()
+                if (now - _last_click_t[0]) < _DEBOUNCE_S:
+                    return   # suppress duplicate click event
+                _last_click_t[0] = now
+
                 grid_codes, meta, _ = self.grid_thread.get_grid()
                 if grid_codes is None or meta is None:
                     print("[Viser] No grid/meta yet in click handler.")
@@ -971,20 +1028,21 @@ class ViserMirrorThread:
 
                 cell = int(grid_codes[r, c])
                 if cell >= 1:
-                    print("[Viser] Clicked an obstacle cell;")
+                    print("[Viser] Warning: clicked obstacle cell — will snap to nearest free.")
                 try:
                     self.planner.set_goal_world(xw, zw)
                     print(f"[Viser] Goal set @ world=({xw:.2f},{zw:.2f}) grid=(r={r},c={c})")
+                    # Persistent goal marker — stays visible until a new goal is set
+                    self.set_nav_goal_marker_world(
+                        xw, zw,
+                        y=self.floor_y + 0.15,
+                        label=f"Goal ({xw:.1f}, {zw:.1f})",
+                    )
                 except Exception as e:
                     print("[Viser] Failed to set goal:", e)
-                    return
 
-                # Set goal in world coords (planner will plan, follower will move)
-                try:
-                    self.planner.set_goal_world(xw, zw)
-                    print(f"[Viser] Goal set @ world=({xw:.2f},{zw:.2f}) grid=(r={r},c={c})")
-                except Exception as e:
-                    print("[Viser] Failed to set goal:", e)
+        self._click_to_goal_handler = _on_click
+        self._click_to_goal_registered = False
 
     # ----------------------------- (optional) confirm flow hooks -----------------------------
     def _on_confirm_point(self):
@@ -1007,3 +1065,50 @@ class ViserMirrorThread:
                 self.on_confirm_move()
             except Exception as e:
                 print("[Viser] on_confirm_move callback failed:", e)
+
+    def _register_client_connect(self):
+        """Auto-center the Viser viewport on the robot when a browser tab opens.
+
+        Viser's default camera sits at world origin looking toward +Z.  When the
+        EKF starts with a VIO area-memory offset (e.g. -268 m, -265 m) the robot
+        and map are invisible until the user manually pans.  This hook fires on
+        every new connection and positions the orbit camera directly above the
+        robot's current pose so the scene is immediately visible.
+        """
+        @self.server.on_client_connect
+        def _on_connect(client):
+            try:
+                # Get the robot's current world position
+                trans, _yaw, _T_wr = self.pose_source.get_pose()
+                rx = float(trans[0])
+                rz = float(trans[2])
+
+                # Sanity clamp: if the pose is wildly off (VIO area-memory offset
+                # or runaway ORB update), fall back to the grid origin so the
+                # camera doesn't park hundreds of metres away.
+                MAX_REASONABLE_M = 100.0
+                if not (np.isfinite(rx) and np.isfinite(rz)) or \
+                   abs(rx) > MAX_REASONABLE_M or abs(rz) > MAX_REASONABLE_M:
+                    ox, oz = self.origin_xy
+                    rx, rz = float(ox), float(oz)
+                    print(
+                        f"[Viser] Pose out of range on connect — "
+                        f"falling back to grid origin ({rx:.1f}, {rz:.1f})."
+                    )
+
+                ry = float(self.floor_y + 5.0)   # orbit from 5 m above floor
+
+                # Position the camera above-and-behind the robot, looking down
+                # slightly — gives a good top-down-ish overview of the map.
+                client.camera.position = (rx, ry, rz + 8.0)
+                client.camera.look_at  = (rx, float(self.floor_y), rz)
+                client.camera.up       = (0.0, 1.0, 0.0)
+            except Exception:
+                # pose not yet available (first frame) — fall back to grid origin
+                try:
+                    ox, oz = self.origin_xy
+                    client.camera.position = (ox, float(self.floor_y + 5.0), oz + 8.0)
+                    client.camera.look_at  = (ox, float(self.floor_y), oz)
+                    client.camera.up       = (0.0, 1.0, 0.0)
+                except Exception:
+                    pass  # viser API may differ; non-fatal

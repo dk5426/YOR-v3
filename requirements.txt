@@ -20,7 +20,25 @@ scipy==1.16.3        # pose maths in base.py
 # Optional: only the gamepad teleop backend and joystick.py need this.
 # pygame
 
+# ── SLAM / navigation ───────────────────────────────────────────────────────
+# Needed by robot/odin_pub_node.py and robot/slam_node_.py only; the solver,
+# simulation and teleop stack above run without any of it.
+# Install with `bash setup_odin.sh --full`, which also builds the pyodin bridge.
+#
+# pybind11             build-time only — headers for pyodin/build.sh
+# opencv-python        NV12/JPEG decode of the Odin RGB stream
+# pyyaml               config/odin.yaml
+# viser                the map/planner UI on :8099
+# pillow               imported by robot/nav/mapping/mapping_torch.py
+# msgpack, msgpack-numpy   commlink array payloads
+#
+# torch — GPU voxel mapping (robot/nav/mapping/voxel_map.py). NOT pinned here:
+# on Jetson you must install the JetPack-matched NVIDIA aarch64 wheel, and a
+# plain `pip install torch` will give you a CPU build that cannot keep up.
+
 # ── Not on PyPI — install separately ────────────────────────────────────────
 # commlink      internal package; every RPC node and client needs it
 # nerolib       git submodule, built C++/pybind11; arm control over CAN
 # sparkcan_py   git submodule; swerve motor control over CAN
+# pyodin        compiled in-tree from pyodin/ + odin_sdk/ via pyodin/build.sh;
+#               Linux + libusb only, so the SLAM stack does not run on macOS

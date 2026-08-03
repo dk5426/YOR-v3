@@ -9,10 +9,9 @@ from commlink import Subscriber
 from loop_rate_limiters import RateLimiter
 
 from .base_motor import Base
+from .topics import SLAM_PUB_PORT, POSE_TOPIC
 
 THOR_IP = "192.168.1.11"
-ZED_PUB_PORT = 6000
-POSE_TOPIC = "zed/pose"
 
 
 # -----------------------------
@@ -225,7 +224,7 @@ class BaseController:
         k_theta: float = 2.1,
         ki_theta: float = 0.01,
         kd_theta: float = 0.2,
-        pos_tol: float = 0.05,   # 10 cm — comfortably above ZED pose noise (~3–5 cm at range)
+        pos_tol: float = 0.05,   # comfortably above SLAM pose noise
         theta_tol: float = 0.03,
     ):
         self.origin = origin
@@ -234,7 +233,7 @@ class BaseController:
 
         self.yor = yor
         self.base = Base(max_vel=base_max_vel, max_accel=base_max_accel)
-        self.zed_sub = None
+        self.slam_sub = None
 
         self.pos_tol = pos_tol
         self.theta_tol = theta_tol
@@ -275,8 +274,8 @@ class BaseController:
         self._nav_lock = threading.Lock()
         self._nav = None
 
-    def zed_sub_init(self, timeout_s: float = 1.0):
-        if self.zed_sub is not None:
+    def slam_sub_init(self, timeout_s: float = 1.0):
+        if self.slam_sub is not None:
             return
 
         done = threading.Event()
@@ -286,7 +285,7 @@ class BaseController:
             try:
                 out["sub"] = Subscriber(
                     host=THOR_IP,
-                    port=ZED_PUB_PORT,
+                    port=SLAM_PUB_PORT,
                     topics=[POSE_TOPIC],
                     buffer=False,
                 )
@@ -302,8 +301,8 @@ class BaseController:
         if out["sub"] is None:
             return
 
-        self.zed_sub = out["sub"]
-        print("Zed Subscriber Initialized")
+        self.slam_sub = out["sub"]
+        print("SLAM pose subscriber initialized")
         return
 
     def reset_pids(self):
@@ -351,11 +350,11 @@ class BaseController:
                 self.rate.sleep()
                 continue
 
-            if self.zed_sub is None:
+            if self.slam_sub is None:
                 now = time.monotonic()
                 if (now - last_sub_try) > 1.0:
                     last_sub_try = now
-                    self.zed_sub_init()
+                    self.slam_sub_init()
 
                 self.yor.pose = None
                 self.base.set_target_base_velocity(np.zeros(3, dtype=float), smooth=True)
@@ -363,7 +362,7 @@ class BaseController:
                 continue
 
             try:
-                pose = get_pose(self.zed_sub)
+                pose = get_pose(self.slam_sub)
                 self.yor.pose = pose
                 translation, theta, T_base = pose
                 theta = _wrap_pi(theta + math.pi)

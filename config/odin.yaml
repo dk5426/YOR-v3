@@ -1,0 +1,40 @@
+# Odin 1 sensor configuration — read by robot/odin_pub_node.py.
+# ---------------------------------------------------------------------------
+
+# Mount extrinsic: base frame expressed in the device frame, applied as
+#   Twb = Twc @ T_cam_to_base
+# Identity means "treat the Odin device frame as the base frame", which is
+# correct only while the box is bench-tested off the robot. Once the Odin is
+# bolted on, measure this and replace the 4x4 below (row-major, Y-up) — every
+# pose the nav stack and base controller act on is derived from it.
+T_cam_to_base:
+  - [1.0, 0.0, 0.0, 0.0]
+  - [0.0, 1.0, 0.0, 0.0]
+  - [0.0, 0.0, 1.0, 0.0]
+  - [0.0, 0.0, 0.0, 1.0]
+
+# Point cloud source for the slam/pcd topic consumed by mapping_torch:
+#   slam : Odin on-device coloured cloud, transformed world->camera. DEFAULT.
+#          (Verified on hardware: raw dToF does NOT stream alongside the SLAM
+#           products, so this is the cloud available in SLAM mode.)
+#   dtof : organized 256x192 raw camera-frame cloud — only if a future firmware
+#          streams it concurrently with SLAM.
+pcd_source: slam
+
+# dToF confidence gate (Odin docs recommend 30–35). Only used by pcd_source: dtof.
+conf_threshold: 30
+
+# commlink endpoint. Must match SLAM_PUB_PORT in robot/topics.py.
+pub_port: 6000
+
+# Camera intrinsics fallback for slam/camera_info. The device returns zero
+# intrinsics on current firmware (0.12.0), and slam_node_ blocks at startup
+# without this topic. The values only feed the voxel map carver's
+# self-consistent projection model, so nominal numbers are fine.
+camera_info:
+  fx: 700.0
+  fy: 700.0
+  cx: 800.0
+  cy: 648.0
+  width: 1600
+  height: 1296

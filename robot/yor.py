@@ -36,8 +36,6 @@ from commlink import RPCServer
 from nerolib import FirmwareVersion
 
 THOR_IP = '192.168.1.11'
-ZED_PUB_PORT = 6000
-POSE_TOPIC = "zed/pose"
 
 YOR_PORT = 5557
 
@@ -74,9 +72,8 @@ class YOR():
         wholebody_config: Optional[WholeBodyHardwareConfig] = None,
     ):
         self._initialized = False
-        self._zed_initialized = False
 
-        self.zed_sub = None
+        self.slam_sub = None
         self._reset_nav = False
 
         self.pose = None        # tuple of ((x,y,z), theta_z, 4x4_pose)
@@ -154,7 +151,7 @@ class YOR():
     def follow_path(self, path=None):
         if self.wholebody is not None:
             self.wholebody.notify_manual_base_command()
-        self.base_controller.zed_sub_init()
+        self.base_controller.slam_sub_init()
 
         if path is None:
             self.base_controller._path_world = None
@@ -179,7 +176,7 @@ class YOR():
     def move_to(self, goal = None):
         if self.wholebody is not None:
             self.wholebody.notify_manual_base_command()
-        self.base_controller.zed_sub_init()
+        self.base_controller.slam_sub_init()
         self.base_controller._goal = goal
         self.base_controller.mode = "MOVE_TO"
 
@@ -187,7 +184,7 @@ class YOR():
     def move_by(self, deltas = None):
         if self.wholebody is not None:
             self.wholebody.notify_manual_base_command()
-        self.base_controller.zed_sub_init()
+        self.base_controller.slam_sub_init()
         if self.pose is None:
             print("Warning: move_by called before pose is available")
             return
@@ -229,7 +226,7 @@ class YOR():
 
     @require_initialization
     def get_pose(self) -> dict:
-        """Return ZED IMU-fused pose: x, y, theta (yaw in radians).
+        """Return the latest SLAM pose: x, y, theta (yaw in radians).
         x = translation[0], y = translation[2] (robot moves in XZ plane).
         """
         if self.pose is None:

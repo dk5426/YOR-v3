@@ -669,6 +669,10 @@ class StaticGridWithLiveOverlayThread:
     """
     Reuses a precomputed static grid/cost map and overlays a lightweight grid
     from the latest pointcloud only, so we avoid reprocessing the full map.
+
+    If `base_grid_provider` is set, the base grid is periodically refreshed
+    from the live map (at `base_refresh_hz`), enabling navigation while
+    mapping is still active.
     """
 
     def __init__(
@@ -682,6 +686,9 @@ class StaticGridWithLiveOverlayThread:
         grid_params: Grid2DParams,
         hz: float = 10.0,
         overlay_keep_fraction: float = 0.2,
+        base_grid_provider: Optional[Callable[[], Optional[Tuple[np.ndarray, Dict, np.ndarray, float, np.ndarray]]]] = None,
+        base_refresh_hz: float = 1.0,
+        pts_provider: Optional[Callable[[], Tuple[Optional[np.ndarray], Optional[np.ndarray]]]] = None,
     ):
         self.datastream = datastream
         self.base_grid = np.asarray(base_grid, dtype=np.int8)
@@ -707,6 +714,23 @@ class StaticGridWithLiveOverlayThread:
         self._last_cost_map: Optional[np.ndarray] = None
         self._dynamic_counts = np.zeros_like(self.base_grid, dtype=np.int16)
         self.overlay_keep_fraction = float(np.clip(overlay_keep_fraction, 0.0, 1.0))
+
+        # --- Live base-grid refresh from provider ---
+        self._base_grid_provider = base_grid_provider
+        self._base_refresh_interval = 1.0 / max(0.01, float(base_refresh_hz))
+        self._last_base_refresh_t = 0.0
+
+        # --- Pre-projected pts provider (avoids sensor subscriber race + CPU re-projection) ---
+        # When set, _compose_grid reads already-projected world-frame points from this
+        # callable instead of calling datastream.get_pcd_pose() and running the full
+        # CPU transform pipeline.  Supplied by MapManager.get_latest_frame_pts.
+        self._pts_provider: Optional[Callable] = pts_provider
+
+        # --- Stage 3: PCD ring buffer (short-term memory) ---
+        from collections import deque as _deque
+        self._pcd_ring_size = int(max(1, grid_params.ttl * 2)) if hasattr(grid_params, 'ttl') else 8
+        self._pcd_ring: _deque = _deque(maxlen=self._pcd_ring_size)
+        # Each entry: (occ_mask, timestamp)  where occ_mask is (H,W) bool
 
     def start(self):
         """Start the worker thread. Safe to call multiple times."""
@@ -735,13 +759,48 @@ class StaticGridWithLiveOverlayThread:
         return grid, meta, T
 
     # ---------- internal ----------
+    def _refresh_base_grid(self):
+        """Call the provider to get a fresh base grid from the live map."""
+        if self._base_grid_provider is None:
+            return
+        try:
+            result = self._base_grid_provider()
+            if result is None:
+                return
+            grid_codes, meta, cost_map, floor_y, kernel = result
+            if grid_codes is None:
+                return
+            self.base_grid = np.asarray(grid_codes, dtype=np.int8)
+            self.base_meta = dict(meta)
+            self.base_cost_map = np.asarray(cost_map, dtype=np.float32)
+            self.floor_y = float(floor_y)
+            if kernel is not None:
+                self.kernel = kernel
+
+            self.H, self.W = self.base_grid.shape[:2]
+            self.cs = float(self.base_meta.get("cell_size_m", self.params.res_m))
+            self.x0 = float(self.base_meta.get("x0", 0.0))
+            self.z_top = float(self.base_meta.get("z_top", 0.0))
+
+            # Reallocate dynamic counts and clear ring buffer for new shape
+            self._dynamic_counts = np.zeros((self.H, self.W), dtype=np.int16)
+            self._pcd_ring.clear()
+        except Exception as e:
+            print(f"[StaticGridOverlay] base_grid_provider failed: {e}")
+
     def _loop(self):
         """Worker loop: fetch latest data, overlay on static grid, store result, sleep to control rate."""
         while not self._stop_evt.is_set():
             t0 = time.time()
+
+            # Periodically refresh base grid from live map
+            if (self._base_grid_provider is not None
+                    and (t0 - self._last_base_refresh_t) >= self._base_refresh_interval):
+                self._refresh_base_grid()
+                self._last_base_refresh_t = t0
+
             try:
                 grid_codes, meta, cost_map, T_wr = self._compose_grid()
-                # Optional Rerun logging removed
 
                 with self._lock:
                     self._last_grid = grid_codes
@@ -755,7 +814,7 @@ class StaticGridWithLiveOverlayThread:
                 self._rate.sleep()
 
     def _compose_grid(self):
-        """Overlay latest pointcloud on the static grid to produce a new grid and cost map."""
+        """Overlay recent pointcloud frames on the static grid to produce a new grid and cost map."""
         grid = self.base_grid.copy()
         cost_map = self.base_cost_map.copy()
         meta = dict(self.base_meta)
@@ -766,25 +825,53 @@ class StaticGridWithLiveOverlayThread:
         except Exception:
             T_wr = None
 
+        now = time.time()
 
-        zed_pkt = None
-        try:
-            zed_pkt = self.datastream.get_pcd_pose()
-        except Exception:
-            zed_pkt = None
+        # ---- Get latest world-frame points ----
+        # Fast path: read from the shared buffer written by the integration worker.
+        # The points are already in world frame (GPU-projected) — no VIO poll, no
+        # CPU re-projection.  Falls back to the legacy sensor subscriber path if the
+        # buffer is not yet available (e.g. on startup or without voxel-map).
+        pts_world = None
+        if self._pts_provider is not None:
+            try:
+                pts_world, _pose = self._pts_provider()
+            except Exception:
+                pts_world = None
 
-        # Temporal decay (hardcoded to 1)
-        self._dynamic_counts = np.maximum(0, self._dynamic_counts - 1)
+        if pts_world is None:
+            # Legacy fallback: poll sensor subscriber + CPU-project (races with mapping loop)
+            pkt = None
+            try:
+                pkt = self.datastream.get_pcd_pose()
+            except Exception:
+                pkt = None
+            if isinstance(pkt, tuple) and len(pkt) >= 2:
+                pts_world = self._pcd_to_world_points(pkt[0], pkt[1])
 
-        if isinstance(zed_pkt, tuple) and len(zed_pkt) >= 2:
-            pts_world = self._pcd_to_world_points(zed_pkt[0], zed_pkt[1])
-            if pts_world is not None and pts_world.shape[0] > 0:
-                pts_world = self._downsample_points(pts_world)
-                occ_mask, _ = self._overlay_masks(pts_world)
-                if occ_mask is not None:
-                    self._dynamic_counts[occ_mask] = int(self.params.ttl)
+        if pts_world is not None and pts_world.shape[0] > 0:
+            pts_world = self._downsample_points(pts_world)
+            occ_mask, _ = self._overlay_masks(pts_world)
+            if occ_mask is not None:
+                self._pcd_ring.append((occ_mask, now))
 
-        dyn_occ = self._dynamic_counts >= 1
+        # Stage 3: Merge all ring buffer entries with temporal weighting
+        # Dynamic counts integrate contributions from all recent frames.
+        # Recent frames contribute full TTL; older ones decay linearly.
+        ttl = int(self.params.ttl)
+        max_age_s = float(self._pcd_ring_size) / 10.0  # assume ~10 Hz overlay rate
+        merged_counts = np.zeros((self.H, self.W), dtype=np.int16)
+
+        for occ_mask, ts in self._pcd_ring:
+            # Handle grid shape changes (from base_grid_provider resizing)
+            if occ_mask.shape != (self.H, self.W):
+                continue
+            age = now - ts
+            # Linear decay: full TTL at age=0, 1 at age=max_age_s
+            weight = max(1, int(ttl * max(0.0, 1.0 - age / max(0.01, max_age_s))))
+            merged_counts[occ_mask] = np.maximum(merged_counts[occ_mask], weight)
+
+        dyn_occ = merged_counts >= 1
         if np.any(dyn_occ):
             dyn_infl_mask = _binary_dilate(dyn_occ.astype(np.uint8), self.kernel)
             dyn_infl = dyn_infl_mask.astype(bool)
@@ -835,35 +922,72 @@ class StaticGridWithLiveOverlayThread:
         return pts_world[mask]
 
     def _overlay_masks(self, pts_world: np.ndarray):
-        """Compute boolean masks of occupied and inflated cells from the given world points."""
-        dy = pts_world[:, 1] - self.floor_y
-        is_obst = (dy >= self.params.min_obst_h_m) & (dy <= self.params.max_obst_h_m)
-        if not np.any(is_obst):
+        """Compute boolean masks of occupied and inflated cells from the given world points.
+
+        Uses height-stratified filtering: points higher above the floor require progressively
+        more density (pts/cell) to be counted as obstacles, and a larger morphological opening
+        kernel to remove lone pixels.  This suppresses high-altitude ghost remnants from
+        dynamic objects without touching low, dense real obstacles.
+        """
+        # ---- Height bands (relative to floor_y) ----
+        # Each band: (y_lo, y_hi, min_pts_per_cell, open_kernel_size)
+        # Tune these to match your voxel size (0.03 m) and environment.
+        _BANDS = [
+            (self.params.min_obst_h_m, 0.40,  2,  3),   # ankle / shin  — very permissive
+            (0.40,                      0.85,  15,  3),   # waist / torso — moderate
+            (0.85,  self.params.max_obst_h_m, 25, 5),   # chest / head  — aggressive
+        ]
+
+        combined_occ = np.zeros((self.H, self.W), dtype=np.uint8)
+
+        for y_lo, y_hi, min_pts, open_k in _BANDS:
+            # Clamp band to global obstacle height range
+            y_lo = max(y_lo, self.params.min_obst_h_m)
+            y_hi = min(y_hi, self.params.max_obst_h_m)
+            if y_lo >= y_hi:
+                continue
+
+            dy = pts_world[:, 1] - self.floor_y
+            in_band = (dy >= y_lo) & (dy < y_hi)
+            if not np.any(in_band):
+                continue
+
+            xz = pts_world[in_band][:, [0, 2]]
+            iz, ix = self._to_idx_world(xz)
+            if ix.size == 0:
+                continue
+
+            flat = iz.astype(np.int64) * self.W + ix.astype(np.int64)
+            uniq, counts = np.unique(flat, return_counts=True)
+            enough = counts >= int(max(1, min_pts))
+            if not np.any(enough):
+                continue
+
+            band_mask = np.zeros((self.H, self.W), dtype=np.uint8)
+            gi = (uniq[enough] // self.W).astype(np.int32)
+            gj = (uniq[enough] % self.W).astype(np.int32)
+            band_mask[gi, gj] = 1
+
+            # Morphological opening: remove isolated blobs smaller than open_k x open_k
+            if open_k > 1 and np.any(band_mask):
+                _k = np.ones((open_k, open_k), dtype=np.uint8)
+                if _HAS_CV2:
+                    import cv2 as _cv2
+                    band_mask = _cv2.morphologyEx(band_mask, _cv2.MORPH_OPEN, _k)
+                else:
+                    from scipy.ndimage import binary_erosion, binary_dilation
+                    band_mask = binary_erosion(band_mask, structure=_k).astype(np.uint8)
+                    band_mask = binary_dilation(band_mask, structure=_k).astype(np.uint8)
+
+            combined_occ |= band_mask
+
+        if not np.any(combined_occ):
             return None, None
 
-        xz = pts_world[is_obst][:, [0, 2]]
-        iz, ix = self._to_idx_world(xz)
-        if ix.size == 0:
-            return None, None
-
-        flat = iz.astype(np.int64) * self.W + ix.astype(np.int64)
-        uniq, counts = np.unique(flat, return_counts=True)
-        mask = counts >= int(max(1, self.params.min_pts_per_obst_cell))
-        if not np.any(mask):
-            return None, None
-
-        occ_mask = np.zeros((self.H, self.W), dtype=np.uint8)
-        valid_cells = uniq[mask]
-        gi = (valid_cells // self.W).astype(np.int32)
-        gj = (valid_cells % self.W).astype(np.int32)
-        occ_mask[gi, gj] = 1
-
-        if np.any(occ_mask):
-            infl_mask = _binary_dilate(occ_mask, self.kernel)
-        else:
-            infl_mask = np.zeros_like(occ_mask, dtype=np.uint8)
-
+        occ_mask = combined_occ
+        infl_mask = _binary_dilate(occ_mask, self.kernel)
         return occ_mask.astype(bool), infl_mask.astype(bool)
+
 
     def _to_idx_world(self, xz: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Convert Nx2 [x,z] in WORLD to grid indices (iz, ix). Returns two (M,) int arrays. Points outside the grid are filtered out."""
@@ -1186,11 +1310,22 @@ def rc_to_world_xz(r: int, c: int, H: int, W: int, cell_m: float,
 def world_xz_to_rc(wx: float, wz: float, H: int, W: int, cell_m: float,
                    T_world_robot: np.ndarray) -> Tuple[int, int]:
     """Convert world coordinates (wx, wz) to grid indices (r, c) using the robot-centered grid parameters and T_world_robot."""
+    if not (np.isfinite(wx) and np.isfinite(wz)):
+        return -1, -1
+
     # Inverse transform world→robot
-    T_robot_world = np.linalg.inv(T_world_robot)
+    try:
+        T_robot_world = np.linalg.inv(T_world_robot)
+    except np.linalg.LinAlgError:
+        return -1, -1
+    
     p_w = np.array([wx, 0.0, wz, 1.0], dtype=np.float32)
     p_r = T_robot_world @ p_w
     x_rel, z_rel = float(p_r[0]), float(p_r[2])
+    
+    if not (np.isfinite(x_rel) and np.isfinite(z_rel)):
+        return -1, -1
+        
     c = int(round(W // 2 + x_rel / cell_m))
     r = int(round(H // 2 - z_rel / cell_m))
     return r, c
@@ -1206,11 +1341,22 @@ def rc_to_world_xz_world(r: int, c: int, meta: Dict) -> Tuple[float, float]:
 
 def world_xz_to_rc_world(wx: float, wz: float, meta: Dict) -> Tuple[int, int]:
     """Convert world coordinates (wx, wz) to grid indices (r, c) using the meta parameters for a world-aligned grid."""
+    if not (np.isfinite(wx) and np.isfinite(wz)):
+        return -1, -1
+        
     cs   = float(meta["cell_size_m"])
     x0   = float(meta["x0"])
     ztop = float(meta["z_top"])
-    c = int(np.floor((wx - x0)   / cs))
-    r = int(np.floor((ztop - wz) / cs))
+    
+    cf = (wx - x0) / cs
+    rf = (ztop - wz) / cs
+    
+    if not (np.isfinite(cf) and np.isfinite(rf)):
+        return -1, -1
+        
+    c = int(np.floor(cf))
+    r = int(np.floor(rf))
+    
     H, W = meta["shape"][0], meta["shape"][1]
     c = max(0, min(W-1, c))
     r = max(0, min(H-1, r))
@@ -1320,9 +1466,28 @@ class AStarPlannerThread:
         self._last_goal_world: Optional[Tuple[float, float]] = None
         self._latest_lookahead_world: Optional[Tuple[float, float]] = None
         self._lookahead_dist_m: float = 0.2
+
+        # ---- PathPlanner cache (avoids distanceTransform rebuild every tick) ----
+        # Rebuilt only when the obstacle mask changes significantly (>1% of cells).
+        self._cached_planner: Optional[PathPlanner] = None
+        self._cached_planner_n_obs: int = -1        # obstacle cell count at last build
+        self._cached_planner_shape: tuple = (0, 0)  # grid shape at last build
+        self._cached_planner_cell: float = 0.0      # cell size at last build
+        # Threshold: rebuild if occupied cells changed by more than this fraction
+        self._planner_rebuild_threshold: float = 0.01  # 1 %
+
+        # ---- Pre-converted world path (avoids grid lock in get_latest_path_world) ----
+        self._latest_path_world: List[Tuple[float, float]] = []  # protected by _lock
+
+        # ---- Replan rate limiter ----
+        # Prevents rapid-fire path updates that cause visual jumps in Viser.
+        # A new plan is accepted at most every 100 ms (10 Hz cap) unless no path exists.
+        self._last_replan_t: float = 0.0
+        self._min_replan_dt: float = 0.10
+
         # Rates
-        self._dt_plan = 1.0/5.0   # 5 Hz was 10 hz
-        self._dt_pub  = 1.0/6.0  # 15 Hz
+        self._dt_plan = 1.0/5.0   # 5 Hz
+        self._dt_pub  = 1.0/6.0   # 6 Hz
 
     # --- public API ---
     def set_goal_world(self, x_world: float, z_world: float):
@@ -1343,26 +1508,14 @@ class AStarPlannerThread:
 
 
     def get_latest_path_world(self) -> List[Tuple[float, float]]:
-        """Return the most recent planned path as a list of (x, z) points in world coordinates."""
-        # Convert cached rc path to world xz using the latest pose/meta
+        """Return the most recent planned path as world (x, z) pairs.
+
+        Zero-cost: the path is pre-converted to world coords inside _step_plan
+        so this method just returns a cached list under a brief lock — no grid
+        lock, no coordinate conversion, no memory allocation on the hot path.
+        """
         with self._lock:
-            path_rc = list(self._latest_path_rc)
-            T = None if self._latest_T_world_robot is None else self._latest_T_world_robot.copy()
-        if not path_rc or T is None:
-            return []
-        grid, meta, _T_world_robot = self.grid_thread.get_grid()
-        if grid is None:
-            return []
-        H, W = grid.shape[:2]
-        cell = float(meta.get("cell_size_m", self._grid_size_fallback_m))
-        out = []
-        for r, c in path_rc:
-            if meta.get("ego_centric", True):
-                xw, zw = rc_to_world_xz(r, c, H, W, cell, T)
-            else:
-                xw, zw = rc_to_world_xz_world(r, c, meta)
-            out.append((xw, zw))
-        return out
+            return list(self._latest_path_world)
 
     def start(self):
         if self._running: return
@@ -1445,6 +1598,8 @@ class AStarPlannerThread:
         else:
             # World-aligned grid
             x_r, z_r = float(T_world_robot[0, 3]), float(T_world_robot[2, 3])
+            if not (np.isfinite(x_r) and np.isfinite(z_r)):
+                return
             start_rc = world_xz_to_rc_world(x_r, z_r, meta)
             goal_rc  = world_xz_to_rc_world(goal[0], goal[1], meta)
 
@@ -1458,14 +1613,40 @@ class AStarPlannerThread:
                     self._have_path = False
             return
 
-        # 6) Build a planner on this snapshot
-        planner = PathPlanner(
-            grid=grid_f,
-            grid_size=cell,
-            treat_unknown_as_obstacle=self._treat_unknown_as_obstacle,
-            near_obstacle_radius_cells=self._near_obst_radius,
-            near_obstacle_penalty=self._near_obst_penalty,
+        # 6) Get or rebuild the PathPlanner (caches distanceTransform across ticks)
+        #
+        # Only rebuild when:
+        #   a) grid shape changed (new map extent), or
+        #   b) obstacle count changed by > _planner_rebuild_threshold fraction.
+        #
+        # This avoids running cv2.distanceTransform at 5 Hz on a 200×200+ grid.
+        n_obs = int((grid_f >= 1.0).sum())   # fast numpy scalar
+        shape_changed = (grid_f.shape != self._cached_planner_shape or
+                         cell != self._cached_planner_cell)
+        if self._cached_planner_n_obs > 0:
+            frac_change = abs(n_obs - self._cached_planner_n_obs) / max(1, self._cached_planner_n_obs)
+        else:
+            frac_change = 1.0
+        need_rebuild = (
+            self._cached_planner is None
+            or shape_changed
+            or frac_change > self._planner_rebuild_threshold
         )
+        if need_rebuild:
+            self._cached_planner = PathPlanner(
+                grid=grid_f,
+                grid_size=cell,
+                treat_unknown_as_obstacle=self._treat_unknown_as_obstacle,
+                near_obstacle_radius_cells=self._near_obst_radius,
+                near_obstacle_penalty=self._near_obst_penalty,
+            )
+            self._cached_planner_n_obs   = n_obs
+            self._cached_planner_shape   = grid_f.shape
+            self._cached_planner_cell    = cell
+        else:
+            # Reuse cached planner but point it at the current grid_f snapshot
+            self._cached_planner.grid = grid_f
+        planner = self._cached_planner
 
         sr, sc = start_rc
 
@@ -1489,6 +1670,7 @@ class AStarPlannerThread:
                 if not self._hold_last_good:
                     with self._lock:
                         self._latest_path_rc = []
+                        self._latest_path_world = []
                         self._latest_T_world_robot = None
                         self._have_path = False
                 return
@@ -1507,10 +1689,12 @@ class AStarPlannerThread:
         if not prev_path_rc or last_goal is None:
             need_replan = True
         else:
-            # (B) Goal changed by more than ~2 cm
+            # (B) Goal moved more than 10 cm
+            #     Was 2 cm, which is below VIO click-ray noise — random microvariations
+            #     in the Viser raycast were triggering replans on every cycle.
             dgx = goal[0] - last_goal[0]
             dgz = goal[1] - last_goal[1]
-            if (dgx * dgx + dgz * dgz) > (0.02 ** 2):
+            if (dgx * dgx + dgz * dgz) > (0.10 ** 2):
                 need_replan = True
             else:
                 # (C) Any cell on the current path is now blocked in this grid
@@ -1526,6 +1710,14 @@ class AStarPlannerThread:
                     dev_thresh_cells = max(2.0, 0.25 / cell)  # ≈ 25 cm in grid units
                     if cell_dist > dev_thresh_cells:
                         need_replan = True
+
+        # Rate-limit replans to avoid rapid-fire path updates that cause visual jumps.
+        # Allow immediate replan only if no path exists yet or the goal changed significantly.
+        import time as _time
+        _now = _time.monotonic()
+        if need_replan and self._have_path:
+            if (_now - self._last_replan_t) < self._min_replan_dt:
+                return   # skip this tick; try again next cycle
 
         # If current plan is still good, keep following it
         if not need_replan:
@@ -1546,14 +1738,27 @@ class AStarPlannerThread:
 
         # 9) Commit or clear
         if new_path_rc:
+            # Pre-convert rc path → world coords so get_latest_path_world() is O(1)
+            is_ego = meta.get("ego_centric", True)
+            world_path: List[Tuple[float, float]] = []
+            for r, c in new_path_rc:
+                if is_ego:
+                    xw, zw = rc_to_world_xz(r, c, H, W, cell, T_world_robot)
+                else:
+                    xw, zw = rc_to_world_xz_world(r, c, meta)
+                world_path.append((xw, zw))
+
             with self._lock:
                 self._latest_path_rc = new_path_rc
+                self._latest_path_world = world_path
                 self._latest_T_world_robot = T_world_robot.copy()
                 self._have_path = True
                 self._last_goal_world = goal
+            self._last_replan_t = _now   # stamp AFTER releasing lock
         elif not self._hold_last_good:
             with self._lock:
                 self._latest_path_rc = []
+                self._latest_path_world = []
                 self._latest_T_world_robot = None
                 self._have_path = False
 

@@ -28,8 +28,8 @@ Three things are worth knowing before running this on the robot:
   where the chassis is drifts from reality over time. That is tolerable
   because teleop targets are generated relative to the *current* EE pose, but
   it means absolute world-frame targets get less accurate the longer the base
-  drives. `BaseOdometry` is a single seam — swap in wheel odometry or the ZED
-  pose when one is trusted.
+  drives. `BaseOdometry` is a single seam — swap in the EKF-fused SLAM pose
+  (robot/slam_node_.py) when one is trusted.
 
 * **Base axis mapping is a convention, not a measurement.** `BaseAxisMap`
   below encodes how the solver's body-frame velocity maps onto
@@ -147,9 +147,9 @@ class BaseOdometry:
 
     Integrates the velocity that was actually *commanded* to the base, which
     is exact with respect to the solver's intent and free of unit guesswork,
-    but open-loop with respect to the floor. Replace `update` with a wheel- or
-    ZED-derived estimate when one is trusted; nothing else in this file needs
-    to change.
+    but open-loop with respect to the floor. Replace `update` with the
+    SLAM/EKF-derived estimate when one is trusted; nothing else in this file
+    needs to change.
     """
 
     def __init__(self) -> None:

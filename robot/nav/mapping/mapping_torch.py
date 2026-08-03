@@ -1,5 +1,5 @@
 # mapping_torch.py  (Open3D-free, GPU-first point cloud mapping)
-# - Uses ZED native point cloud (XYZRGBA) when available via datastream.get_pcd_pose()
+# - Consumes the organized XYZRGBA cloud on PCD_TOPIC via datastream.get_pcd_pose()
 # - RGB/Depth fallback path kept intact
 # - Point cloud stored as torch tensors: {points: (N,3), colors: (N,3)}
 # - Same MapManager structure (save/load/visualize + live mapping thread)
@@ -7,13 +7,14 @@
 
 from PIL import Image
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 import os
+import queue                             # Change D: ring-buffer ingest queue
 from typing import List, Tuple, Optional
 
 import threading
 import time
 import torch
+import torch.nn.functional as F
 from loop_rate_limiters import RateLimiter
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -78,25 +79,39 @@ class TorchPointCloud:
 # ============================================================
 # Math helpers (torch)
 # ============================================================
+def _quat_to_matrix_np(q) -> np.ndarray:
+    """Convert quaternion [x,y,z,w] to 3×3 rotation matrix.  Pure numpy, no scipy."""
+    x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    x2, y2, z2 = x + x, y + y, z + z
+    xx, xy, xz = x * x2, x * y2, x * z2
+    yy, yz, zz = y * y2, y * z2, z * z2
+    wx, wy, wz = w * x2, w * y2, w * z2
+    return np.array([
+        [1.0 - (yy + zz),       xy - wz,         xz + wy],
+        [      xy + wz,    1.0 - (xx + zz),       yz - wx],
+        [      xz - wy,         yz + wx,     1.0 - (xx + yy)],
+    ], dtype=np.float32)
+
+
 def pose_to_matrix(quat_xyzw: np.ndarray, trans_xyz: np.ndarray, device: torch.device = DEVICE) -> torch.Tensor:
     """
-    Convert pose into 4x4 torch transform.
+    Convert pose into 4x4 torch transform.  Pure numpy + torch, no scipy.
     quat_xyzw: [x,y,z,w]
     trans_xyz: [tx,ty,tz]
     """
-    rot = R.from_quat(quat_xyzw).as_matrix().astype(np.float32)
+    rot = _quat_to_matrix_np(quat_xyzw)
     T = torch.eye(4, dtype=torch.float32, device=device)
     T[:3, :3] = torch.from_numpy(rot).to(device)
     T[:3, 3] = torch.from_numpy(trans_xyz.astype(np.float32)).to(device)
     return T
 
 def apply_transform(points: torch.Tensor, T_4x4: torch.Tensor) -> torch.Tensor:
-    """Apply 4x4 transform to Nx3 points (torch) -> Nx3."""
-    assert T_4x4.shape == (4, 4)
-    ones = torch.ones((points.shape[0], 1), dtype=points.dtype, device=points.device)
-    homog = torch.cat([points, ones], dim=1)  # (N,4)
-    out = (homog @ T_4x4.T)[:, :3]
-    return out
+    """Apply 4x4 transform to Nx3 points (torch) -> Nx3.
+
+    Uses R @ p + t directly — avoids allocating an (N,1) ones column
+    and an (N,4) homogeneous expansion (saves ~30 % memory + time on Jetson).
+    """
+    return points @ T_4x4[:3, :3].T + T_4x4[:3, 3]
 
 def make_flip_transform(device: torch.device = DEVICE) -> torch.Tensor:
     """Open3D-style flip used previously (for some RGB-D sensors)."""
@@ -207,14 +222,24 @@ def clean_outliers_torch(
 
 
 # ============================================================
-# ZED PCD -> TorchPointCloud (GPU)  [preferred path]
+# Organized cloud -> TorchPointCloud (GPU)  [preferred path]
 # ============================================================
-def _rgba_float_to_rgb_u8(rgba_float_np: np.ndarray) -> np.ndarray:
+def _rgba_float_to_rgb_u8(rgba_float) -> np.ndarray:
     """
-    Vectorized reinterpretation of ZED packed RGBA stored as a float32.
-    Returns (H,W,3) uint8 RGB.
+    Vectorized reinterpretation of packed RGBA stored as a float32.
+    Returns (H,W,3) uint8 RGB. Supports both NumPy and PyTorch Tensors.
     """
-    f = np.ascontiguousarray(rgba_float_np.astype(np.float32, copy=False))
+    if torch.is_tensor(rgba_float):
+        # GPU path: Use PyTorch bitwise operations
+        f = rgba_float.to(torch.float32)
+        u32 = f.view(torch.int32)
+        r = (u32 & 0x000000FF).to(torch.uint8)
+        g = ((u32 >> 8) & 0x000000FF).to(torch.uint8)
+        b = ((u32 >> 16) & 0x000000FF).to(torch.uint8)
+        return torch.stack([r, g, b], dim=-1)
+    
+    # CPU path: NumPy
+    f = np.ascontiguousarray(rgba_float.astype(np.float32, copy=False))
     u32 = f.view(np.uint32)
     # MEASURE.XYZRGBA packs bytes as 0xAABBGGRR in little-endian float layout.
     r = (u32 & 0x000000FF).astype(np.uint8)
@@ -224,60 +249,110 @@ def _rgba_float_to_rgb_u8(rgba_float_np: np.ndarray) -> np.ndarray:
     return rgb
 
 @torch.no_grad()
-def zed_pcd_to_pointcloud_torch(
-    zed_pcd,                         # sl.Mat or np.ndarray (H,W,4) float32, in CAMERA frame
+def pcd_to_pointcloud_torch(
+    pcd_arr,                         # np.ndarray (H,W,4) float32, in CAMERA frame
     pose_qt: np.ndarray,             # [qx,qy,qz,qw, tx,ty,tz], WORLD_T_CAM
-) -> TorchPointCloud:
+    return_extra: bool = False,       # if True, also returns (valid_mask_gpu, arr_t_gpu)
+) -> TorchPointCloud | Tuple[TorchPointCloud, torch.Tensor, torch.Tensor]:
     """
-    Build a TorchPointCloud directly from ZED native point cloud.
+    Build a TorchPointCloud from the organized cloud on PCD_TOPIC.
     - Points are taken from XYZ (meters) and transformed to WORLD using pose_qt.
     - Colors are decoded from packed RGBA float (we keep RGB, drop alpha).
-    - Invalid points (nan/inf) are removed.
+    - Invalid points (nan/inf) are removed on GPU.
     """
-    try:
-        import pyzed.sl as sl  # optional; only used when pcd is sl.Mat
-        SL_AVAILABLE = True
-    except Exception:
-        SL_AVAILABLE = False
+    arr_np = np.asarray(pcd_arr)
 
-    if SL_AVAILABLE and hasattr(zed_pcd, "get_data"):
-        arr = zed_pcd.get_data(sl.MEM.CPU)
+    assert arr_np.ndim == 3 and arr_np.shape[2] >= 3, \
+        f"Expected an organized (H,W,4) or (H,W,3) cloud, got {arr_np.shape}"
+
+    # Fix: PyTorch requires writable arrays
+    if not arr_np.flags.writeable:
+        arr_np = np.copy(arr_np)
+
+    # Move to GPU ASAP
+    arr_t = torch.from_numpy(arr_np).to(DEVICE, non_blocking=True)
+    H, W = arr_t.shape[:2]
+
+    # 1. Separate XYZ and Colors (GPU)
+    xyz_t = arr_t[..., :3].float()
+    
+    if arr_t.shape[2] >= 4:
+        # GPU Unpacking of colors
+        colors_t = _rgba_float_to_rgb_u8(arr_t[..., 3])
+        colors_t = colors_t.view(-1, 3)
     else:
-        arr = np.asarray(zed_pcd)
+        colors_t = torch.full((H * W, 3), 255, dtype=torch.uint8, device=DEVICE)
 
-    assert arr.ndim == 3 and arr.shape[2] >= 3, "Expected (H,W,4) or (H,W,3) array from ZED"
+    # 2. Filter invalid points (GPU)
+    valid_t = torch.isfinite(xyz_t).all(dim=2)
 
-    xyz = arr[..., :3].astype(np.float32, copy=False)            # (H,W,3) in camera frame
-    if arr.shape[2] >= 4:
-        try:
-            rgb = _rgba_float_to_rgb_u8(arr[..., 3])
-            colors_u8 = rgb.reshape(-1, 3)
-        except Exception:
-            colors_u8 = np.full((xyz.size // 3, 3), 255, dtype=np.uint8)
-    else:
-        colors_u8 = np.full((xyz.size // 3, 3), 255, dtype=np.uint8)
+    # ── Flying-pixel / depth-edge rejection ─────────────────────────────────
+    # At depth discontinuities (object edges vs background) a range sensor
+    # interpolates depth between two surfaces, producing points that float in
+    # free space between the foreground and the background.  These "flying
+    # pixels" survive the confidence filter because the sensor considers them
+    # valid returns.
+    #
+    # We reject them by computing the local depth range in a 3×3 window.  Any
+    # pixel whose neighbourhood spans > EDGE_THR metres (where EDGE_THR is
+    # roughly half the smallest inter-object depth gap we care about) is
+    # discarded.  The op costs ~0.3 ms on a Jetson for a 720p/4 cloud.
+    #
+    # NOTE: this is a neighbourhood test, so it is only meaningful on an
+    # ORGANIZED cloud. With pcd_source: slam the Odin sends an unordered cloud
+    # reshaped to (1,N,4), where the 3×3 window spans unrelated points — the
+    # filter is then near-inert, which is acceptable because the Odin already
+    # filters the cloud on-device.
+    #
+    # EDGE_THR tuning:
+    #   ↑ larger  →  fewer rejections, more flying pixels survive (noisier map)
+    #   ↓ smaller →  more rejections, some thin objects get clipped at edges
+    EDGE_THR = 0.25   # metres — typical foreground/background gap threshold
 
-    valid = np.isfinite(xyz).all(axis=2)
-    if not np.any(valid):
-        return TorchPointCloud(
+    depth_t = xyz_t[..., 2]   # camera Z = depth in metres, (H, W)
+    # Replace invalid pixels with NaN so they don't pollute the pool
+    depth_valid = torch.where(valid_t, depth_t, torch.tensor(float('nan'), device=DEVICE))
+    d4 = depth_valid.unsqueeze(0).unsqueeze(0)   # (1,1,H,W) for F ops
+
+    POOL_K = 3
+    PAD    = POOL_K // 2
+
+    # nan-safe max/min: treat NaN as the neutral element for each op
+    # torch max_pool2d ignores NaN (treats as -inf), so we gate on valid_t separately.
+    d_max = F.max_pool2d(
+        torch.nan_to_num(d4, nan=-1e6), kernel_size=POOL_K, stride=1, padding=PAD
+    ).squeeze()
+    d_min = F.max_pool2d(
+        -torch.nan_to_num(d4, nan=1e6), kernel_size=POOL_K, stride=1, padding=PAD
+    ).squeeze().neg()
+
+    depth_range = d_max - d_min   # (H, W) — local depth spread in 3×3 window
+    edge_free   = depth_range < EDGE_THR   # True = pixel is NOT on a depth edge
+
+    valid_t = valid_t & edge_free
+    # ─────────────────────────────────────────────────────────────────────────
+
+    valid_flat = valid_t.view(-1)
+
+    if not valid_flat.any():
+        pcd = TorchPointCloud(
             points=torch.zeros((0, 3), dtype=torch.float32, device=DEVICE),
             colors=torch.zeros((0, 3), dtype=torch.uint8, device=DEVICE),
         )
+        return (pcd, valid_t, arr_t) if return_extra else pcd
 
-    pts_cam = torch.from_numpy(xyz[valid].reshape(-1, 3)).to(DEVICE, non_blocking=True).float()
-    cols = torch.from_numpy(colors_u8[valid.reshape(-1)]).to(DEVICE, non_blocking=True)
+    pts_cam = xyz_t.view(-1, 3)[valid_flat]
+    cols = colors_t[valid_flat]
 
-    # Transform CAM -> WORLD (no flip needed for ZED point cloud)
+    # 3. Transform CAM -> WORLD (GPU)
     pose_qt = np.asarray(pose_qt, dtype=np.float32).reshape(-1)
-    if pose_qt.size < 7:
-        raise ValueError(f"pose_qt must have at least 7 elements, got {pose_qt.size}")
     quat, trans = pose_qt[:4], pose_qt[4:7]
     T_world_cam = pose_to_matrix(quat, trans, device=DEVICE)
 
     pts_world = apply_transform(pts_cam, T_world_cam)
     
-    # return voxel_downsample_(TorchPointCloud(points=pts_world, colors=cols), 0.02)
-    return TorchPointCloud(points=pts_world, colors=cols)
+    pcd = TorchPointCloud(points=pts_world, colors=cols)
+    return (pcd, valid_t, arr_t) if return_extra else pcd
 
 
 @torch.no_grad()
@@ -293,7 +368,7 @@ def rgbd_to_pointcloud_torch(
     """
     Convert an RGB-D frame + pose into a TorchPointCloud in WORLD frame.
 
-    image:      H x W x 3   (BGR from ZED)
+    image:      H x W x 3   (BGR)
     depth:      H x W       (meters)
     confidence: H x W       (currently unused)
     pose:       [qx, qy, qz, qw, tx, ty, tz]  (WORLD_T_CAM)
@@ -344,7 +419,7 @@ def rgbd_to_pointcloud_torch(
     # --- Colors from RGB image ---
     img_np = np.asarray(image)
     if img_np.ndim == 3 and img_np.shape[2] >= 3:
-        # ZED gives BGR; convert to RGB so it's consistent with zed_pcd_to_pointcloud_torch
+        # the RGB fallback path receives BGR; convert so it's consistent with pcd_to_pointcloud_torch
         rgb = img_np[..., ::-1]  # BGR -> RGB
         cols = rgb[valid]
         cols_t = torch.from_numpy(cols).to(device=device, dtype=torch.uint8)
@@ -361,128 +436,83 @@ def rgbd_to_pointcloud_torch(
     return TorchPointCloud(points=pts_world, colors=cols_t)
 
 # ============================================================
-# Map logging (TorchPointCloud)
-# ============================================================
-def log_map_from_zedpc(
-    curr_map: Optional[TorchPointCloud],
-    all_poses: List[np.ndarray],
-    zed_pcd,            # sl.Mat or np.ndarray(H,W,4) float32
-    pose: np.ndarray,
-    *,
-    frame_idx: int = 0,
-    enable_clean: bool = True,
-    clean_every_n: int = 3,       # set to 1 if you REALLY want "always"
-    clean_voxel: float = 0.03,    # downsample incoming frame BEFORE cleaning
-    clean_radius: float = 0.12,
-    clean_min_neighbors: int = 3,
-    clean_max_points: int = 4000,
-):
-    pose = np.asarray(pose, dtype=np.float32).reshape(-1)
-    if pose.size < 7:
-        raise ValueError(f"pose must have at least 7 elements, got {pose.size}")
-
-    pcd = zed_pcd_to_pointcloud_torch(zed_pcd, pose)
-
-    # (NEW) Light downsample + optional cleanup on ONLY the incoming frame
-    if clean_voxel is not None and clean_voxel > 0:
-        pcd = voxel_downsample_(pcd, float(clean_voxel))
-
-    if enable_clean and clean_every_n and clean_every_n > 0:
-        if (frame_idx % int(clean_every_n)) == 0:
-            pcd = clean_outliers_torch(
-                pcd,
-                radius=float(clean_radius),
-                min_neighbors=int(clean_min_neighbors),
-                max_points=int(clean_max_points),
-            )
-
-    # Merge
-    if curr_map is None or len(curr_map) == 0:
-        curr_map = pcd
-    else:
-        curr_map.append(pcd)
-
-    # Keep global map compact
-    curr_map = voxel_downsample_(curr_map, 0.02)
-
-    # Track pose trail
-    all_poses.append(pose)
-    return curr_map, all_poses
-
-
-# ============================================================
-# Map I/O (npz)
-# ============================================================
-def save_map_npz(map_cloud: TorchPointCloud, filename: str):
-    pts_np, cols_np = map_cloud.cpu_numpy()
-    np.savez_compressed(filename, points=pts_np, colors=cols_np)
-    print(f"[MapManager] Map saved to {filename}")
-
-def load_map_npz(filename: str) -> TorchPointCloud:
-    if not os.path.isfile(filename):
-        raise FileNotFoundError(f"Map file not found: {filename}")
-    data = np.load(filename)
-    pts = torch.from_numpy(data["points"]).to(DEVICE).float()
-    cols = torch.from_numpy(data["colors"]).to(DEVICE)
-    if cols.dtype != torch.uint8:
-        cols = torch.clamp(cols, 0, 255).to(torch.uint8)
-    return TorchPointCloud(pts, cols)
-
-
-# ============================================================
-# MapManager (same structure)
+# MapManager
 # ============================================================
 class MapManager:
     """
-    Save, load, visualize & (now) run live mapping in a separate thread.
+    Single live voxel-map pipeline.
+
+    One GlobalVoxelMap, one ingest thread (lean sensor poll), one integration
+    worker (GPU surface insert + dynamic clearing), one latest-frame buffer.
+
+    External API:
+        start_mapping(datastream) / stop_mapping()
+        get_map() / get_voxel_map()       → GlobalVoxelMap
+        get_latest_frame_pts()            → (pts_world, pose_qt) for grid overlay
+        set_camera_info(dict)             → pass camera intrinsics to carver
+        save_map(filename) / load_map(filename)
     """
 
-    def __init__(self):
+    def __init__(self, voxel_size: float = 0.03):
         # thread state
         self._thread: Optional[threading.Thread] = None
         self._running: bool = False
         self.paused: bool = False
         self.last_error: Optional[str] = None
-        self.datastream=None
+        self.datastream = None
 
-        # shared mapping state
+        # pose history (used by _log_status / state_monitor)
         self._lock = threading.Lock()
-        self.curr_map: Optional[TorchPointCloud] = None
         self.all_poses: List[np.ndarray] = []
 
-        # downsample cadence
+        # ── Single live voxel map ──────────────────────────────────────────────
+        # 1 000 000 voxels @ 3 cm resolution = ~40 MB GPU (color+centroid+log_odds)
+        # + ~12 MB pinned CPU (keys).  Covers ~30 m × 30 m at typical indoor density.
+        # Dynamic obstacle clearing compacts zombie voxels automatically so the
+        # ceiling is rarely approached during normal operation.
+        from robot.nav.mapping.voxel_map import GlobalVoxelMap
+        self._voxel_map = GlobalVoxelMap(
+            voxel_size=voxel_size,
+            max_voxels=10_000_000,
+        )
+        self._voxel_map.max_insert_depth = 5.0   # matches carver z_range_max
+        self._voxel_map.promote_age = 0           # single-map mode: no promotion
+
         self._frame_count = 0
 
-        # --- live cleanup knobs (safe defaults) ---
-        self.enable_live_clean = True
-        self.clean_every_n = 3          # set to 1 to run every frame (can be heavy)
-        self.clean_voxel = 0.03         # downsample incoming frame first
-        self.clean_radius = 0.12
-        self.clean_min_neighbors = 3
-        self.clean_max_points = 4000    # keep small (cdist is O(N^2))
+        # 2-slot ring-buffer queue: sensor ingest → integration worker.
+        # Capacity=2: worker always gets the freshest frame; stale ones are dropped.
+        self._ingest_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._integration_thread: Optional[threading.Thread] = None
+
+        # ── Latest-frame shared pts buffer ────────────────────────────────────
+        # Integration worker publishes pre-projected world-frame points here so
+        # the grid overlay thread never needs to re-poll the sensor or re-project.
+        self._pts_lock = threading.Lock()
+        self._latest_pts_world: Optional[np.ndarray] = None   # (N, 3) float32 world
+        self._latest_frame_pose: Optional[np.ndarray] = None  # (7,) [qx,qy,qz,qw,tx,ty,tz]
+        self._pts_buffer_max: int = 30_000
 
 
     # --- I/O ---
-    def save_map(self, map_cloud: TorchPointCloud, filename: str):
-        """Save to .npz (points, colors)."""
-        save_map_npz(map_cloud, filename)
+    def save_map(self, _unused=None, filename: str = "", min_log_odds: float | None = None):
+        """Save voxel map to .npz."""
+        if self._voxel_map is not None and filename:
+            self._voxel_map.save(filename, min_log_odds=min_log_odds)
 
-    def load_map(self, filename: str) -> TorchPointCloud:
-        """Load from .npz."""
-        return load_map_npz(filename)
+    def load_map(self, filename: str):
+        """Load voxel map from .npz."""
+        if self._voxel_map is not None:
+            self._voxel_map.load(filename)
 
 
     # --- Live mapping control ---
-    def start_mapping(self, datastream, *, load: bool = False, target_hz: float = 5.0, map_path: str = None):
+    def start_mapping(self, datastream, *, load: bool = False, target_hz: float = 10.0, map_path: str = None):
         """
         Start the background mapping thread.
 
-        Args:
-            datastream: object with .get_rgb_depth_pose()
-                - live=True  -> returns (image, depth, confidence, focal, resolution, pose)
-                - live=False -> returns (image, depth, pose, timestamp)
-            live: whether datastream returns the 'live' tuple above.
-            target_hz: desired processing rate (0 or None for as-fast-as-possible)
+        datastream: object with .get_pcd_pose() -> (pcd, pose_qt)
+        target_hz:  sensor ingest rate cap (0 = as fast as possible).
         """
         if self._running:
             print("[MapManager] Mapping already running.")
@@ -492,18 +522,24 @@ class MapManager:
         self.paused = False
         self.last_error = None
         self._frame_count = 0
-        self.datastream=datastream
-        self._thread = None
+        self.datastream = datastream
 
-        if load:
-            self.curr_map = self.load_map(map_path)
-        else:
-            self.curr_map = None
-            self._thread = threading.Thread(
-            target=self._mapping_loop, args=(datastream, load, target_hz), daemon=True
-            )
-            self._thread.start()
-            print(f"[MapManager] Mapping thread started (load={load}, target_hz={target_hz}).")                
+        if load and map_path:
+            self.load_map(map_path)
+            print(f"[MapManager] Loaded map from {map_path}")
+
+        # Start integration worker first, then the lean ingest loop.
+        self._integration_thread = threading.Thread(
+            target=self._integration_worker, daemon=True, name="map-integrate"
+        )
+        self._integration_thread.start()
+
+        self._thread = threading.Thread(
+            target=self._mapping_loop, args=(datastream, load, target_hz),
+            daemon=True, name="map-ingest"
+        )
+        self._thread.start()
+        print(f"[MapManager] Mapping started (target_hz={target_hz}).")               
         
 
     def stop_mapping(self, join_timeout: Optional[float] = 2.0):
@@ -513,94 +549,243 @@ class MapManager:
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=join_timeout)
+        # Change D: drain queue and wake integration worker so it exits cleanly
+        try:
+            self._ingest_queue.put_nowait(None)   # sentinel
+        except queue.Full:
+            pass
+        if self._integration_thread is not None:
+            self._integration_thread.join(timeout=join_timeout)
         self._thread = None
+        self._integration_thread = None
         print("[MapManager] Mapping thread stopped.")
 
-    def get_state(self) -> Tuple[Optional[TorchPointCloud], List[np.ndarray]]:
-        """Thread-safe snapshot of (map, poses)."""
+    def get_state(self) -> Tuple[None, List[np.ndarray]]:
+        """Return (None, pose_list). Pose list is a snapshot for logging only."""
         with self._lock:
-            curr = self.curr_map
             poses_copy = list(self.all_poses)
-        return curr, poses_copy
+        return None, poses_copy
+
+    def get_latest_frame_pts(
+        self,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Return the most recently integrated frame's world-frame points and
+        pose as a (pts_world, pose_qt) tuple, or (None, None) if not yet available.
+
+        pts_world : (N≤3000, 3) float32 — already in world frame (Y-up).
+                    Uniform stride-subsampled from the full cloud so the
+                    buffer stays small and fast to copy.
+        pose_qt   : (7,) float32 [qx, qy, qz, qw, tx, ty, tz].
+
+        IMPORTANT: caller must NOT modify the returned arrays in-place.
+        """
+        with self._pts_lock:
+            return self._latest_pts_world, self._latest_frame_pose
     
-    def get_map(self) -> Optional[TorchPointCloud]:
-        """Thread-safe snapshot of map."""
-        with self._lock:
-            curr = self.curr_map
-        return curr
+    def get_map(self):
+        """Return the live GlobalVoxelMap."""
+        return self._voxel_map
 
-    # ---------- internal loop ----------
-    # def _mapping_loop(self, datastream, load: bool, target_hz: float):
-    #     rate = RateLimiter(target_hz, name="map_manager") if (target_hz and target_hz > 0) else None
-    #     while self._running:
-    #         # Pause handling
-    #         if self.paused:
-    #             time.sleep(0.05)
-    #             continue
+    def get_voxel_map(self):
+        """Return the live GlobalVoxelMap."""
+        return self._voxel_map
 
-    #         t0 = time.time()
-    #         # Update map & log frames
-    #         try:
-    #             new_map = self.curr_map
-    #             new_poses = self.all_poses
-    #             zed_pkt = None
-    #             try:
-    #                 zed_pkt = datastream.get_pcd_pose()
-    #             except Exception:
-    #                 zed_pkt = None
-    #             # print(zed_pkt)
-    #             if isinstance(zed_pkt, tuple) and len(zed_pkt) >= 2:
-    #                 zed_pcd, pose_zed = zed_pkt[0], zed_pkt[1]
-    #                 new_map, new_poses = log_map_from_zedpc(
-    #                     self.curr_map, self.all_poses, zed_pcd, pose_zed
-    #                 )
-    #                 # image, depth, confidence, focal, resolution, pose = datastream.get_rgb_depth_pose()
-    #                 # log_image(image)
-    #                 # log_depth(depth)
+    def get_live_map(self):
+        """Return the live GlobalVoxelMap."""
+        return self._voxel_map
 
-    #             with self._lock:
-    #                 self.curr_map = new_map
-    #                 self.all_poses = new_poses
-    #         except Exception as e:
-    #             self.last_error = f"log_map failed: {e}"
+    def set_camera_info(self, cam_info: dict):
+        if self._voxel_map is not None:
+            self._voxel_map.set_camera_intrinsics(
+                cam_info["width"], cam_info["height"],
+                cam_info["fx"], cam_info["fy"],
+                cam_info["cx"], cam_info["cy"]
+            )
 
-    #         if rate is not None:
-    #             rate.sleep()
+
+
+    def _integration_worker(self):
+        """
+        Integration worker thread — single voxel-map path, no legacy fallback.
+
+        Drains _ingest_queue at full GPU speed, decoupled from ingest cadence.
+        Sentinel: None in the queue → exit cleanly.
+
+        Timing printed every 60 frames (wall-clock sections):
+          ingest  = cloud decode + GPU transfer
+          surface = _integrate_surface (voxel hash insert)
+          clear   = _clear_dynamic_objects (depth-buffer differencing)
+          buffer  = latest-frame pts CPU copy
+        """
+        from collections import deque
+        _hz_window: deque = deque(maxlen=60)   # rolling frame timestamps for Hz
+        _T_LOG = 60                             # log every N frames
+
+        # Per-frame timing accumulators (reset every _T_LOG frames)
+        _t_ingest = _t_surface = _t_clear = _t_buffer = _t_total = 0.0
+        _n_logged = 0
+
+        while True:
+            item = self._ingest_queue.get()
+            if item is None:
+                break
+
+            pcd_arr, pose_qt = item
+            _frame_t0 = time.perf_counter()
+
+            try:
+                # ── 1. Decode the cloud (CPU→GPU) ───────────────────────────
+                _arr_np = np.asarray(pcd_arr)
+                if not _arr_np.flags.writeable:
+                    _arr_np = _arr_np.copy()
+
+                pcd, _, _ = pcd_to_pointcloud_torch(_arr_np, pose_qt, return_extra=True)
+                _t1 = time.perf_counter()
+
+                if len(pcd) == 0:
+                    continue
+
+                pose_arr = np.asarray(pose_qt, dtype=np.float32).reshape(-1)
+
+                # ── 2. Voxel integration (surface insert + dynamic clearing) ─
+                result = self._voxel_map.integrate(
+                    pcd.points, pcd.colors, self._frame_count,
+                    camera_pose=pose_arr,
+                )
+                _t2 = time.perf_counter()
+
+                # ── 3. Publish latest-frame pts to shared buffer ─────────────
+                # One stride-sampled GPU→CPU copy; grid overlay reads this
+                # instead of re-polling the sensor or re-projecting on CPU.
+                pts_gpu = pcd.points
+                n = pts_gpu.shape[0]
+                if n > self._pts_buffer_max:
+                    stride = max(1, n // self._pts_buffer_max)
+                    pts_gpu = pts_gpu[::stride]
+                pts_cpu = pts_gpu.cpu().numpy()
+                with self._pts_lock:
+                    self._latest_pts_world = pts_cpu
+                    self._latest_frame_pose = pose_arr
+                _t3 = time.perf_counter()
+
+                with self._lock:
+                    self.all_poses.append(pose_arr)
+
+                # ── Hz + timing ─────────────────────────────────────────────
+                _hz_window.append(_t3)
+                _t_ingest  += _t1 - _frame_t0
+                _t_surface += _t2 - _t1
+                _t_buffer  += _t3 - _t2
+                _t_total   += _t3 - _frame_t0
+                _n_logged  += 1
+
+                if _n_logged >= _T_LOG:
+                    span = float(_hz_window[-1] - _hz_window[0]) if len(_hz_window) > 1 else 1.0
+                    hz = (len(_hz_window) - 1) / span if span > 0 else 0.0
+                    scale = 1e3 / _n_logged
+                    print(
+                        f"[MapManager] {hz:.1f} Hz | "
+                        f"ingest={_t_ingest*scale:.1f}ms  "
+                        f"surface={_t_surface*scale:.1f}ms  "
+                        f"buffer={_t_buffer*scale:.1f}ms  "
+                        f"frame={_t_total*scale:.1f}ms  "
+                        f"voxels={self._voxel_map._count:,}"
+                    )
+                    _t_ingest = _t_surface = _t_clear = _t_buffer = _t_total = 0.0
+                    _n_logged = 0
+
+            except Exception as e:
+                self.last_error = f"integration_worker failed: {e}"
+                import traceback; traceback.print_exc()
 
     def _mapping_loop(self, datastream, load: bool, target_hz: float):
+        """
+        Lean ingest loop: polls the sensor, deduplicates repeated frames, enqueues for worker.
+        """
         rate = RateLimiter(target_hz, name="map_manager") if (target_hz and target_hz > 0) else None
+        _last_pose_bytes: bytes = b""   # dedup: skip if same pose as previous call
+
+        # Loop timing instrumentation — prints every 60 iterations
+        _loop_t0 = time.perf_counter()
+        _loop_n = 0
+        _t_fetch = _t_dedup = _t_enqueue = _t_ratelim = 0.0
+        _n_dedup = 0
+        _LOG_EVERY = 60
+
         while self._running:
             if self.paused:
                 time.sleep(0.05)
                 continue
             try:
-                new_map = self.curr_map
-                new_poses = self.all_poses
+                _ta = time.perf_counter()
+                pkt = datastream.get_pcd_pose()
+                _tb = time.perf_counter()
+                _t_fetch += _tb - _ta
+                if isinstance(pkt, tuple) and len(pkt) >= 2:
+                    pcd_arr, pose_qt = pkt[0], pkt[1]
+                    # Extract tracking confidence (0–100); skip integration
+                    # during bad tracking to prevent stale PCD integration at
+                    # drifted poses (SEARCHING/INITIALIZING → confidence=0).
+                    _confidence = float(pkt[2]) if len(pkt) > 2 else 100.0
+                    if _confidence < 10:
+                        time.sleep(0.01)  # don't spin-wait during tracking loss
+                        continue
 
-                zed_pkt = datastream.get_pcd_pose()
-                if isinstance(zed_pkt, tuple) and len(zed_pkt) >= 2:
-                    zed_pcd, pose_zed = zed_pkt[0], zed_pkt[1]
+                    # Dedup: the subscriber returns the latest cached frame; if the
+                    # publisher hasn't pushed a new one yet, skip rather than integrating
+                    # the same cloud twice (wastes GPU and inflates log-odds).
+                    # NOTE: do NOT call rate.sleep() here — it would cause a double-sleep
+                    # (once here + once at the bottom for the next new frame = 2× period).
+                    _tc = time.perf_counter()
+                    pose_bytes = np.asarray(pose_qt, dtype=np.float32).tobytes()
+                    if pose_bytes == _last_pose_bytes:
+                        _n_dedup += 1
+                        time.sleep(0.003)  # 3ms spin-wait; bottom rate.sleep paces new frames
+                        continue
+                    _last_pose_bytes = pose_bytes
+                    _td = time.perf_counter()
+                    _t_dedup += _td - _tc
 
                     self._frame_count += 1
-                    new_map, new_poses = log_map_from_zedpc(
-                        self.curr_map, self.all_poses, zed_pcd, pose_zed,
-                        frame_idx=self._frame_count,
-                        enable_clean=self.enable_live_clean,
-                        clean_every_n=self.clean_every_n,
-                        clean_voxel=self.clean_voxel,
-                        clean_radius=self.clean_radius,
-                        clean_min_neighbors=self.clean_min_neighbors,
-                        clean_max_points=self.clean_max_points,
-                    )
-
-                with self._lock:
-                    self.curr_map = new_map
-                    self.all_poses = new_poses
+                    # Non-blocking put: always keep the freshest frame.
+                    try:
+                        self._ingest_queue.put_nowait((pcd_arr, pose_qt))
+                    except queue.Full:
+                        try:
+                            self._ingest_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self._ingest_queue.put_nowait((pcd_arr, pose_qt))
+                        except queue.Full:
+                            pass
+                    _t_enqueue += time.perf_counter() - _td
 
             except Exception as e:
-                self.last_error = f"log_map failed: {e}"
+                self.last_error = f"ingest failed: {e}"
 
+            _te = time.perf_counter()
             if rate is not None:
                 rate.sleep()
+            _t_ratelim += time.perf_counter() - _te
+
+            _loop_n += 1
+            if _loop_n >= _LOG_EVERY:
+                elapsed = time.perf_counter() - _loop_t0
+                scale = 1e3  # → ms
+                print(
+                    f"[MapLoop] {_loop_n/elapsed:.1f} Hz | "
+                    f"fetch={_t_fetch/elapsed*scale:.1f}ms  "
+                    f"dedup={_t_dedup/elapsed*scale:.1f}ms  "
+                    f"enqueue={_t_enqueue/elapsed*scale:.1f}ms  "
+                    f"ratelim={_t_ratelim/elapsed*scale:.1f}ms  "
+                    f"dedup_hits={_n_dedup}/{_loop_n}",
+                    flush=True,
+                )
+                _loop_t0 = time.perf_counter()
+                _loop_n = 0
+                _t_fetch = _t_dedup = _t_enqueue = _t_ratelim = 0.0
+                _n_dedup = 0
 
 

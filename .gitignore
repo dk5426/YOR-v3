@@ -8,4 +8,16 @@ build/
 dist/
 *.egg-info/
 teleop_data/
+
+# Odin: device-side relocalization maps, pulled calibration, pyodin build output
 *.bin
+odin_calib.yaml
+pyodin/build/
+
+# Saved maps (keep the folder, not the artifacts)
+maps/*
+!maps/.gitkeep
+
+# Upstream source drop the Odin SLAM stack was ported from — kept locally for
+# reference, not part of this repo.
+neer_odin_v2-main/
