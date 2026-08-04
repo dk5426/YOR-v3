@@ -83,7 +83,7 @@ class FakeBase:
         dt, self._t = now - self._t, now
         direction = {"up": 1.0, "down": -1.0, "stop": 0.0}[self.lift_state]
         self.lift_height = float(np.clip(
-            self.lift_height + direction * self.LIFT_SPEED * dt, 0.0, 0.9176))
+            self.lift_height + direction * self.LIFT_SPEED * dt, 0.0, 0.900))
 
     # -- drive --
     def set_target_base_velocity(self, target, smooth=False):
@@ -120,7 +120,7 @@ def test_init():
     check("targets seeded from FK", wbc.left_ee_target is not None)
     check("home poses latched", wbc._home_left is not None and wbc._home_right is not None)
     check("odometry starts at origin", np.allclose(wbc.odometry.pose, 0))
-    check("lift range from description", wbc.ik.lift_range == (0.0, 0.9176),
+    check("lift range from description", wbc.ik.lift_range == (0.0, 0.900),
           str(wbc.ik.lift_range))
     check("model sees measured lift", abs(
         wbc.ik.configuration.q[wbc.ik._lift_qpos_adr] - base.lift_height) < 1e-9)

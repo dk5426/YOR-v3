@@ -146,7 +146,7 @@
         </body>
       </body>
       <body name="lift_slide_1" pos="0.0 0.0125 0.374498">
-        <joint name="Slider 7" type="slide" axis="0.0 0.0 1.0" range="0.0 0.9176" />
+        <joint name="Slider 7" type="slide" axis="0.0 0.0 1.0" range="0.0 0.900" />
         <inertial pos="-5.785420825414149e-17 -0.01652674627499748 0.04253981035188906" mass="2.8976526098499997" fullinertia="0.00233 0.009702 0.008941 0.0 -0.0 -0.0" />
         <geom mesh="lift_slide_1" pos="-0.0 -0.0125 -0.174498" class="visual" material="silver_mat" />
         <geom mesh="lift_slide_1" pos="-0.0 -0.0125 -0.174498" class="collision" />
@@ -441,7 +441,7 @@
     <position name="right_finger5_joint4_actuator" joint="right_finger5_joint4" kp="0.5" ctrlrange="-0.4705 1.5709" forcerange="-0.1866 0.1866"/>
   
     <!-- Chassis actuators -->
-    <position name="lift_joint_pos" joint="Slider 7" kp="20000" ctrlrange="0.0 0.9176" forcerange="-1000 1000"/>
+    <position name="lift_joint_pos" joint="Slider 7" kp="20000" ctrlrange="0.0 0.900" forcerange="-1000 1000"/>
     <position name="front_left_steer_joint_pos" joint="front_left_steer_joint" kp="100"/>
     <position name="back_left_steer_joint_pos" joint="back_left_steer_joint" kp="100"/>
     <position name="front_right_steer_joint_pos" joint="front_right_steer_joint" kp="100"/>

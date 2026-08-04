@@ -283,6 +283,29 @@ class YOR():
         return self.base.get_lift_height()
 
     @require_initialization
+    def get_lift_status(self) -> dict:
+        """Full lift snapshot: height, position-known, homed, limits, motion.
+
+        Requests a fresh `status` from the controller, so the limit-switch
+        fields reflect the switches right now. Everything is a plain type, so
+        it crosses the RPC boundary unchanged.
+        """
+        if hasattr(self.base, "get_lift_status"):
+            return self.base.get_lift_status()
+        return {"available": False}
+
+    @require_initialization
+    def lift_position_known(self) -> Optional[bool]:
+        """Whether the lift controller has an established zero.
+
+        False means every height it reports is meaningless — run lift_home().
+        None means it has not said either way yet.
+        """
+        if hasattr(self.base, "lift_position_known"):
+            return self.base.lift_position_known()
+        return None
+
+    @require_initialization
     def get_lift_position(self) -> float:
         """Alias of get_lift_height(), for parity with the simulation node."""
         if self.wholebody is not None:
@@ -305,7 +328,7 @@ class YOR():
         tolerance_m: float = 0.002,
         timeout_s: float = 30.0,
         min_height_m: float = 0.0,
-        max_height_m: float = 0.9176,
+        max_height_m: float = 0.900,
     ) -> bool:
         if not hasattr(self.base, "lift_delta_height"):
             print("[YOR] base has no lift_delta_height()")
@@ -329,7 +352,7 @@ class YOR():
         tolerance_m: float = 0.002,
         timeout_s: float = 30.0,
         min_height_m: float = 0.0,
-        max_height_m: float = 0.9176,
+        max_height_m: float = 0.900,
     ) -> bool:
         """Blocking absolute lift move, bypassing the whole-body solver."""
         if not hasattr(self.base, "lift_to_height"):

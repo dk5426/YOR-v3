@@ -47,7 +47,7 @@ TIRE_RADIUS = 0.0381  # m
 # description/robot_wholebody.xml — the whole-body solver clamps its lift
 # commands to the model, so a smaller number here would silently truncate
 # the top of the workspace.
-LIFT_MAX_HEIGHT_M = 0.9176  # m
+LIFT_MAX_HEIGHT_M = 0.900  # m
 
 MODULE_ORDER = ("FL", "FR", "RR", "RL")
 
@@ -88,7 +88,38 @@ def rad_to_frac(rad: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
 # Pico lift (serial)
 # ----------------------------
 class PicoLift:
+    """Host driver for firmware/lift_controller/lift_controller.ino.
+
+    Wire protocol (see the sketch for the authoritative list):
+
+        sent      up | down | stop | home | "up <mm>" | "down <mm>"
+                  status | power on | power off
+        received  "Height: <n> mm"            every 50 ms *while moving*
+                  "Height: unknown (run home)"  position not established
+                  "Home complete." / "Home failed: ..." / "Home stopped."
+                  "Move complete." / "LIMIT HIT: ..." / "Motion stopped..."
+                  "Upper limit: ACTIVE|clear" / "Lower limit: ..."  (status)
+                  "Motion: IDLE|UP|DOWN"                            (status)
+
+    Two consequences of that protocol worth knowing:
+
+    * **Height is only streamed while the lift is moving.** When idle the last
+      value stands, which is correct but means `get_height()` returns None
+      until the first move or home after a boot away from a limit switch.
+    * **Position can become unknown.** The firmware says so explicitly, and we
+      must clear the cached height when it does — otherwise a controller reset
+      leaves the host confidently reporting a stale height that
+      `lift_to_height` would then act on.
+    """
+
     _HEIGHT_PATTERN = re.compile(r"Height:\s*(-?[\d.]+)\s*mm")
+    _HEIGHT_UNKNOWN_PATTERN = re.compile(r"Height:\s*unknown", re.IGNORECASE)
+    _UPPER_LIMIT_PATTERN = re.compile(r"Upper limit:\s*(ACTIVE|clear)", re.IGNORECASE)
+    _LOWER_LIMIT_PATTERN = re.compile(r"Lower limit:\s*(ACTIVE|clear)", re.IGNORECASE)
+    _MOTION_PATTERN = re.compile(r"Motion:\s*(IDLE|UP|DOWN)", re.IGNORECASE)
+    # The firmware banner. Seeing it mid-run means the board reset (USB glitch,
+    # watchdog, someone re-flashed) and every cached fact about it is void.
+    _READY_PATTERN = re.compile(r"Lift controller ready", re.IGNORECASE)
 
     def __init__(
         self,
@@ -109,8 +140,17 @@ class PicoLift:
         self._drain_thread = None
         self._drain_stop = threading.Event()
 
-        self._height_m: Optional[float] = None
         self._height_lock = threading.Lock()
+        self._height_m: Optional[float] = None
+        # None until the firmware tells us either way. False means the lift has
+        # no established zero and every height it reports is meaningless.
+        self._position_known: Optional[bool] = None
+        # Result of the last home: True complete, False failed/aborted.
+        self._homed: Optional[bool] = None
+        self._upper_limit: Optional[bool] = None
+        self._lower_limit: Optional[bool] = None
+        self._motion: Optional[str] = None      # "IDLE" | "UP" | "DOWN"
+        self._last_event: Optional[str] = None  # last notable firmware line
 
         self._ensure_open()
         self._ensure_drain()
@@ -163,12 +203,11 @@ class PicoLift:
                 if data:
                     try:
                         line = data.decode("utf-8").strip()
-                        print(f"[LIFT] {line}")
-                        match = self._HEIGHT_PATTERN.search(line)
-                        if match:
-                            height_mm = float(match.group(1))
-                            with self._height_lock:
-                                self._height_m = height_mm / 1000.0
+                        # "Height:" streams at 20 Hz during a move; logging every
+                        # one of them buries everything else in the node's output.
+                        if not self._HEIGHT_PATTERN.search(line):
+                            print(f"[LIFT] {line}")
+                        self._parse_line(line)
                     except Exception:
                         print(f"[LIFT] Raw: {data}")
 
@@ -180,6 +219,76 @@ class PicoLift:
                     pass
                 self._ser = None
                 time.sleep(0.1)
+
+    def _parse_line(self, line: str) -> None:
+        """Fold one firmware line into the cached lift state.
+
+        Ordering matters: the "unknown" form is checked before the numeric one
+        so a position loss can never be mistaken for a reading, and the reset
+        banner is checked first of all because it invalidates everything.
+        """
+        if self._READY_PATTERN.search(line):
+            with self._height_lock:
+                self._height_m = None
+                self._position_known = None
+                self._homed = None
+                self._motion = "IDLE"
+                self._last_event = "controller reset"
+            print("[PicoLift] controller reset — height invalidated, needs home")
+            return
+
+        if self._HEIGHT_UNKNOWN_PATTERN.search(line):
+            with self._height_lock:
+                self._height_m = None
+                self._position_known = False
+            return
+
+        match = self._HEIGHT_PATTERN.search(line)
+        if match:
+            with self._height_lock:
+                self._height_m = float(match.group(1)) / 1000.0
+                self._position_known = True
+            return
+
+        match = self._UPPER_LIMIT_PATTERN.search(line)
+        if match:
+            with self._height_lock:
+                self._upper_limit = match.group(1).lower() == "active"
+            return
+
+        match = self._LOWER_LIMIT_PATTERN.search(line)
+        if match:
+            with self._height_lock:
+                self._lower_limit = match.group(1).lower() == "active"
+            return
+
+        match = self._MOTION_PATTERN.search(line)
+        if match:
+            with self._height_lock:
+                self._motion = match.group(1).upper()
+            return
+
+        lowered = line.lower()
+        if lowered.startswith("home complete"):
+            with self._height_lock:
+                self._homed = True
+                self._position_known = True
+                self._last_event = line
+        elif lowered.startswith("home failed") or lowered.startswith("home stopped"):
+            # The firmware clears positionKnown in both cases, so we must too —
+            # otherwise a failed home leaves a plausible-looking stale height.
+            with self._height_lock:
+                self._homed = False
+                self._position_known = False
+                self._height_m = None
+                self._last_event = line
+        elif (lowered.startswith("move complete")
+              or lowered.startswith("motion stopped")
+              or lowered.startswith("limit hit")
+              or "blocked" in lowered):
+            with self._height_lock:
+                self._motion = "IDLE"
+                self._last_event = line
 
     def _send(self, cmd: str) -> None:
         if serial is None:
@@ -240,9 +349,63 @@ class PicoLift:
         self._last_cmd = None
         self._send("stop")
 
+    def move_mm(self, distance_mm: float, up: bool) -> bool:
+        """Ask the firmware for a finite move of `distance_mm`.
+
+        This is the "up 200" / "down 200" form. The firmware runs its own
+        jerk-limited S-curve to an exact pulse count and stops itself, which is
+        strictly better than the host bang-banging `up`/`stop` over serial: it
+        gets a real acceleration profile and there is no round-trip latency in
+        the stop. Returns False for a non-positive distance rather than sending
+        a command the firmware would reject.
+        """
+        distance_mm = float(distance_mm)
+        if not (distance_mm > 0.0) or not math.isfinite(distance_mm):
+            return False
+        self._last_cmd = None   # never dedupe a finite move against a previous one
+        self._send(f"{'up' if up else 'down'} {distance_mm:.2f}")
+        return True
+
+    def request_status(self) -> None:
+        """Ask for a status report; the reply lands in the cached state."""
+        self._last_cmd = None
+        self._send("status")
+
+    def set_power(self, on: bool) -> None:
+        """Explicit driver-relay control. The firmware also cuts power itself
+        after a stop, a limit hit or a home, so this is only for parking."""
+        self._last_cmd = None
+        self._send("power on" if on else "power off")
+
     def get_height(self) -> Optional[float]:
+        """Height in metres, or None when the firmware has no established zero."""
         with self._height_lock:
             return self._height_m
+
+    def is_position_known(self) -> Optional[bool]:
+        """True/False once the firmware has said either way, else None."""
+        with self._height_lock:
+            return self._position_known
+
+    def is_homed(self) -> Optional[bool]:
+        """True after "Home complete.", False after a failed or aborted home."""
+        with self._height_lock:
+            return self._homed
+
+    def get_limits(self) -> Tuple[Optional[bool], Optional[bool]]:
+        """(upper, lower) switch states as of the last `status` reply."""
+        with self._height_lock:
+            return self._upper_limit, self._lower_limit
+
+    def get_motion(self) -> Optional[str]:
+        """"IDLE" | "UP" | "DOWN" as last reported, or None."""
+        with self._height_lock:
+            return self._motion
+
+    def get_last_event(self) -> Optional[str]:
+        """The last notable firmware line (completion, limit, home result)."""
+        with self._height_lock:
+            return self._last_event
 
 
 # ----------------------------
@@ -432,7 +595,38 @@ class Base:
         if self._pico_lift:
             return self._pico_lift.get_height()
         return None
-    
+
+    def lift_position_known(self) -> Optional[bool]:
+        """Whether the firmware has an established zero. None if not yet known.
+
+        False means every height it reports is meaningless — run lift_home().
+        """
+        if self._pico_lift:
+            return self._pico_lift.is_position_known()
+        return None
+
+    def get_lift_status(self) -> dict:
+        """Snapshot of the lift for diagnostics / RPC.
+
+        Requests a fresh `status` from the firmware, which is what refreshes the
+        limit-switch fields. Those are only populated after a status reply, so
+        the first call after boot may return None for them.
+        """
+        if self._pico_lift is None:
+            return {"available": False}
+        self._pico_lift.request_status()
+        upper, lower = self._pico_lift.get_limits()
+        return {
+            "available": True,
+            "height_m": self._pico_lift.get_height(),
+            "position_known": self._pico_lift.is_position_known(),
+            "homed": self._pico_lift.is_homed(),
+            "upper_limit": upper,
+            "lower_limit": lower,
+            "motion": self._pico_lift.get_motion(),
+            "last_event": self._pico_lift.get_last_event(),
+        }
+
     def lift_delta_height(
         self,
         delta_m: float,
@@ -469,10 +663,22 @@ class Base:
         timeout_s: float = 30.0,
         min_height_m: float = 0.0,
         max_height_m: float = LIFT_MAX_HEIGHT_M,
+        profiled: bool = True,
     ) -> bool:
         """
         Move lift to an absolute height position (blocking).
         Returns True if target reached within tolerance, False on timeout/stall/unknown height.
+
+        With `profiled` (the default) the distance is handed to the firmware as
+        a single "up <mm>" / "down <mm>" command, so the move runs the firmware's
+        jerk-limited S-curve and stops itself on an exact pulse count. The old
+        behaviour — start a continuous move, watch the height, send `stop` — is
+        still available with `profiled=False`; it is at the mercy of serial
+        round-trip latency at the stop, and re-accelerates from zero on every
+        correction because the firmware cuts driver power after a user stop.
+
+        The supervision below is unchanged and applies either way: it is the
+        backstop for a firmware that never reports arrival.
 
         Safety features:
         - clamps target within [min_height_m, max_height_m]
@@ -491,18 +697,37 @@ class Base:
             print("[lift_to_height] Lift height unknown; cannot move to target")
             return False
 
+        # A height only means something once the firmware has a zero. Without
+        # this check a stale reading from before a controller reset would send
+        # the lift off in a plausible-looking but wrong direction.
+        if self._pico_lift.is_position_known() is False:
+            print("[lift_to_height] Lift position not established; run lift_home() first")
+            return False
+
         error = target_m - float(current_height)
         if abs(error) <= tolerance_m:
             return True
 
         moving_up = error > 0.0
-        (self.lift_up if moving_up else self.lift_down)()
+        if profiled:
+            # Aim at the target directly; the loop below still corrects for any
+            # residual, which costs a second (much shorter) profiled move.
+            if not self._pico_lift.move_mm(abs(error) * 1000.0, up=moving_up):
+                return False
+        else:
+            (self.lift_up if moving_up else self.lift_down)()
 
         rate = RateLimiter(60)
         start_time = time.monotonic()
 
         last_height = float(current_height)
         stall_start: Optional[float] = None
+        # A profiled move ends by itself, so "stopped short of target" is a
+        # normal outcome (pulse quantisation, a little sag under load) rather
+        # than a fault. Re-aim a bounded number of times before calling it a
+        # stall; each retry is a much shorter move than the first.
+        corrections = 0
+        MAX_CORRECTIONS = 3
 
         try:
             while True:
@@ -537,6 +762,20 @@ class Base:
                     if stall_start is None:
                         stall_start = now
                     elif (now - stall_start) > 1.0:
+                        # A profiled move that has simply finished short looks
+                        # identical to a stall from here. Re-aim before failing.
+                        if profiled and corrections < MAX_CORRECTIONS:
+                            corrections += 1
+                            moving_up = error > 0.0
+                            print(f"[lift_to_height] {error * 1000.0:+.1f} mm short; "
+                                  f"correction {corrections}/{MAX_CORRECTIONS}")
+                            if not self._pico_lift.move_mm(abs(error) * 1000.0, up=moving_up):
+                                self.lift_stop()
+                                return False
+                            stall_start = None
+                            last_height = height
+                            rate.sleep()
+                            continue
                         print(f"[lift_to_height] Stall detected at {height:.4f} m")
                         self.lift_stop()
                         return False

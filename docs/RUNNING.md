@@ -222,10 +222,22 @@ Do these in order the first time. Steps 1–3 need no whole-body control at all.
 
 1. **Base axes.** Run `robot/teleop/joystick.py` and confirm the robot drives
    the way the sticks point, and that the D-pad raises/lowers the lift.
-2. **Lift travel.** Check `get_lift_height()` at the bottom and top of travel
-   actually spans 0 → 0.9176 m. That number lives in two places that must
-   agree: `LIFT_MAX_HEIGHT_M` in `robot/base_motor.py` and the `Slider 7`
-   range in `description/robot_wholebody.xml`.
+2. **Lift travel.** Run `lift_home()` first — the firmware has no zero until
+   it has seen a limit switch, and `get_lift_height()` returns `None` until it
+   does. Then check the height spans 0 → 0.900 m bottom to top.
+
+   That number is duplicated in **five** places and they must all agree. They
+   drifted apart once (the model said 0.9176 m against a 0.900 m lift), which
+   made the solver command heights the firmware's software limit would never
+   reach:
+
+   | Where | What |
+   |---|---|
+   | `firmware/lift_controller/lift_controller.ino` | `MAX_HEIGHT_MM` |
+   | `robot/base_motor.py` | `LIFT_MAX_HEIGHT_M` |
+   | `robot/yor.py` | `lift_*` `max_height_m` defaults |
+   | `robot/teleop/wholebody_teleop.py` | `LIFT_RANGE` |
+   | `description/robot_wholebody.xml` | `Slider 7` range **and** `lift_joint_pos` ctrlrange |
 3. **Arm homing.** `python robot/arm/arm.py` moves one arm to its home pose.
 4. **Whole-body, base disabled.** Start `robot/yor.py`, then immediately press
    `t` in the teleop client (fix-base) or call `toggle_base_motion(False)`.
@@ -285,6 +297,39 @@ timeouts and the filter coasts on VIO alone. Pass `--no-ekf` to
 The odometry geometry in `robot/nav/odometry/swerve_odom.py` (`LENGTH`,
 `WIDTH`, `METERS_PER_ROTATION`) is *calibrated*, deliberately different from the
 nominal CAD values in `robot/base_motor.py`. Do not reconcile them by hand.
+
+### The lift
+
+Firmware lives in [firmware/lift_controller/](../firmware/lift_controller/) and
+is flashed to the Arduino driving the stepper. `robot/base_motor.py`'s
+`PicoLift` talks to it over serial at 115200.
+
+```
+up | down          continuous move until stop/limit
+up <mm> | down <mm>  finite move, firmware runs a jerk-limited S-curve
+stop | home        home drives UP to the upper switch, which defines 900 mm
+status             limit switches + motion state + height
+power on | off     driver relay
+```
+
+Three behaviours worth knowing before you debug it:
+
+- **Height only streams while moving.** When idle the last value stands, so
+  `get_lift_height()` returns `None` from boot until the first move or home
+  (unless the lift happens to boot sitting on a limit switch).
+- **Position can be lost.** The firmware reports `Height: unknown (run home)`
+  and the host clears its cached height on that, on a failed/aborted home, and
+  on the reset banner. `lift_position_known()` tells you which state you are
+  in; `lift_to_height()` refuses to move when the position is not established,
+  rather than acting on a stale reading.
+- **A stop cuts driver power**, so the next move re-powers with a ~500 ms
+  startup delay. That is why `lift_to_height()` now hands the whole distance to
+  the firmware as one `up <mm>` / `down <mm>` command instead of bang-banging
+  `up` then `stop`: the move gets a real acceleration profile and stops on an
+  exact pulse count. Pass `profiled=False` for the old behaviour.
+
+`get_lift_status()` returns height, position-known, homed, both limit switches,
+motion state and the last notable firmware line.
 
 ### Feeding the SLAM pose into whole-body IK (optional)
 

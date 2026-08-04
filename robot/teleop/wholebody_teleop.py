@@ -61,7 +61,7 @@ LOOP_RATE = 30  # Hz
 # Matches the "Slider 7" range in description/robot_wholebody.xml; the server
 # clamps to the model regardless, this just keeps the client's own bookkeeping
 # from drifting past the real travel.
-LIFT_RANGE = (0.0, 0.9176)  # metres
+LIFT_RANGE = (0.0, 0.900)  # metres
 BUTTON_DEBOUNCE_TIME = 0.2  # seconds
 
 # Default RPC ports of the two servers this client can drive.

@@ -6,7 +6,7 @@ lift, two 7-DOF AgileX Nero arms and two Wuji five-finger hands, solved as one
 
 ```
   Base  (3 DOF)   base_x, base_y, base_yaw     planar joints, not a freejoint
-  Lift  (1 DOF)   Slider 7                     0 → 0.9176 m
+  Lift  (1 DOF)   Slider 7                     0 → 0.900 m
   Left  (7 DOF)   left_arm_joint1..7
   Right (7 DOF)   right_arm_joint1..7
   ──────────────────────────────────────────────────────────────────────
@@ -39,6 +39,7 @@ robot/
   topics.py               the slam/* commlink wire contract, in one place
   nav/mapping/            GPU voxel map + point cloud integration (torch)
   nav/odometry/           swerve dead-reckoning + 3-state EKF
+firmware/lift_controller/    Arduino sketch for the lift stepper controller
 odin_sdk/ pyodin/            vendored Manifold C SDK + its pybind11 bridge
 config/odin.yaml             mount extrinsic, cloud source, intrinsics fallback
 tools/wholebody_ik_demo.py   interactive solver demo, drag targets in the viewer

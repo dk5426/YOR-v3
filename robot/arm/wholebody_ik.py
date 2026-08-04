@@ -294,7 +294,7 @@ class WholeBodyIK:
         self._right_arm_qpos_adrs = np.array([int(self.model.joint(n).qposadr) for n in self._RIGHT_JOINTS])
 
         # Lift travel, taken from the model so the description stays the single
-        # source of truth for it (currently 0 → 0.9176 m).
+        # source of truth for it (currently 0 → 0.900 m).
         self.lift_range: tuple[float, float] = (
             float(self.model.joint(self._LIFT_JOINT).range[0]),
             float(self.model.joint(self._LIFT_JOINT).range[1]),
