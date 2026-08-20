@@ -5,7 +5,8 @@
 
 Validates the firmware in firmware/lift_controller/ against the PicoLift driver
 in robot/base_motor.py: homing, the position-known contract, absolute moves,
-the stop path, and that the 900 mm travel constant matches the real hardware.
+the stop path, the streamed-velocity mode the whole-body loop uses, and that
+the 900 mm travel constant matches the real hardware.
 
     python tests/hardware/test_02_lift.py --host <robot-ip>
 
@@ -60,6 +61,40 @@ def _wait_still(timeout_s: float = 30.0, settle_s: float = 0.7) -> float | None:
         time.sleep(0.05)
     info("lift did not settle within the timeout")
     return last
+
+
+def _stream_velocity(velocity_m_s: float, duration_s: float,
+                     refresh_s: float = 0.05) -> bool:
+    """Hold a streamed velocity for `duration_s`, refreshing it like the host.
+
+    The firmware stops by itself after 300 ms without a command, so a caller
+    that wants continuous motion has to keep asking. That is the contract, not
+    an inconvenience: it is what stops the column if this process dies.
+    """
+    accepted = True
+    deadline = time.monotonic() + duration_s
+    while time.monotonic() < deadline:
+        if CLIENT.call("lift_set_velocity", float(velocity_m_s)) is False:
+            accepted = False
+        time.sleep(refresh_s)
+    return accepted
+
+
+def _travel_rate(velocity_m_s: float, duration_s: float) -> tuple[float, float]:
+    """(measured m/s, distance m) while streaming `velocity_m_s`.
+
+    The first 0.6 s is excluded: the firmware closes its driver relay and runs
+    its jerk-limited ramp before the column is at speed, so including it would
+    measure the ramp rather than the velocity.
+    """
+    _stream_velocity(velocity_m_s, 0.6)
+    start_h, start_t = _height(), time.monotonic()
+    _stream_velocity(velocity_m_s, duration_s)
+    end_h, end_t = _height(), time.monotonic()
+    if start_h is None or end_h is None:
+        return float("nan"), float("nan")
+    distance = end_h - start_h
+    return distance / (end_t - start_t), distance
 
 
 def test_preconditions():
@@ -181,6 +216,198 @@ def test_stop_is_prompt():
                  "this is mechanical (brake or backdrive), not a software delay.")
 
 
+def test_velocity_capability():
+    print("\nstreamed-velocity capability")
+    st = _status()
+    capable = st.get("velocity_capable")
+    check("the firmware advertises lift_velocity_v1", capable is True,
+          f"capabilities={st.get('capabilities')}")
+    if capable is not True:
+        info("This controller has the older sketch. Flash "
+             "firmware/lift_controller/ before running the velocity stages — "
+             "the whole-body loop will otherwise fall back to bang-bang "
+             "up/down/stop, which is correct but is not what you are testing.")
+    check("the RPC surface agrees", CLIENT.call("lift_supports_velocity") == capable,
+          f"lift_supports_velocity()={CLIENT.call('lift_supports_velocity')}")
+
+
+def _velocity_ready() -> bool:
+    st = _status()
+    if st.get("velocity_capable") is not True:
+        check("firmware supports streamed velocity", False, "skipping — old firmware")
+        return False
+    if st.get("position_known") is not True:
+        check("lift homed before the velocity stages", False, "skipping — home first")
+        return False
+    height = _height()
+    if height is None or not (0.15 < height < TRAVEL_M - 0.15):
+        info(f"height {height} is too close to an end of travel; "
+             f"move to mid-travel first")
+        return False
+    return True
+
+
+def test_velocity_small():
+    print("\nstreamed velocity: +/-5 mm/s")
+    if not _velocity_ready():
+        return
+
+    confirm("Stream +5 mm/s for 4 s, then -5 mm/s for 4 s. The lift moves slowly.")
+    with guard(CLIENT):
+        countdown(3, "streaming +5 mm/s")
+        up_rate, up_distance = _travel_rate(+0.005, 4.0)
+        CLIENT.call("lift_set_velocity", 0.0)
+        time.sleep(1.0)
+        countdown(2, "streaming -5 mm/s")
+        down_rate, down_distance = _travel_rate(-0.005, 4.0)
+        CLIENT.call("lift_set_velocity", 0.0)
+    _wait_still(timeout_s=10.0)
+
+    check("it rose at about 5 mm/s", abs(up_rate - 0.005) < 0.002,
+          f"{up_rate * 1000:.2f} mm/s over {up_distance * 1000:+.1f} mm")
+    check("it descended at about 5 mm/s", abs(down_rate + 0.005) < 0.002,
+          f"{down_rate * 1000:.2f} mm/s over {down_distance * 1000:+.1f} mm")
+    smooth = ask_yes_no("Was the motion smooth, without stalling or hunting?")
+    if smooth is not None:
+        check("motion at 5 mm/s is smooth", smooth)
+
+
+def test_velocity_larger():
+    print("\nstreamed velocity: +/-10 mm/s")
+    if not _velocity_ready():
+        return
+
+    confirm("Stream +10 mm/s for 4 s, then -10 mm/s for 4 s.")
+    with guard(CLIENT):
+        countdown(3, "streaming +10 mm/s")
+        up_rate, up_distance = _travel_rate(+0.010, 4.0)
+        CLIENT.call("lift_set_velocity", 0.0)
+        time.sleep(1.0)
+        countdown(2, "streaming -10 mm/s")
+        down_rate, down_distance = _travel_rate(-0.010, 4.0)
+        CLIENT.call("lift_set_velocity", 0.0)
+    _wait_still(timeout_s=10.0)
+
+    check("it rose at about 10 mm/s", abs(up_rate - 0.010) < 0.003,
+          f"{up_rate * 1000:.2f} mm/s over {up_distance * 1000:+.1f} mm")
+    check("it descended at about 10 mm/s", abs(down_rate + 0.010) < 0.003,
+          f"{down_rate * 1000:.2f} mm/s over {down_distance * 1000:+.1f} mm")
+
+
+def test_velocity_zero_hold():
+    print("\nstreamed velocity: zero hold")
+    if not _velocity_ready():
+        return
+
+    confirm("Move at +8 mm/s, then hold at zero for 3 s. The lift must stop and stay.")
+    with guard(CLIENT):
+        countdown(2, "moving, then holding")
+        _stream_velocity(+0.008, 2.0)
+        CLIENT.call("lift_set_velocity", 0.0)
+        time.sleep(0.8)                      # let the ramp to zero finish
+        held = _height()
+        _stream_velocity(0.0, 3.0)           # refreshed zero: an explicit hold
+        after = _height()
+
+    check("the column held its height", held is not None and after is not None
+          and abs(after - held) < 0.002,
+          f"{(after - held) * 1000:+.1f} mm drift" if held and after else "no reading")
+    check("height telemetry kept arriving during the hold",
+          _status().get("height_age_s") is not None
+          and _status().get("height_age_s") < 1.0,
+          f"age={_status().get('height_age_s')}")
+
+
+def test_velocity_reversal():
+    print("\nstreamed velocity: reversal through zero")
+    if not _velocity_ready():
+        return
+
+    confirm("Reverse from +10 mm/s straight to -10 mm/s in one command.")
+    with guard(CLIENT):
+        countdown(2, "reversing")
+        _stream_velocity(+0.010, 3.0)
+        top = _height()
+        _stream_velocity(-0.010, 4.0)        # no zero in between: the firmware inserts it
+        bottom = _height()
+        CLIENT.call("lift_set_velocity", 0.0)
+    _wait_still(timeout_s=10.0)
+
+    check("the direction actually reversed",
+          top is not None and bottom is not None and bottom < top,
+          f"{top:.4f} -> {bottom:.4f} m" if top and bottom else "no reading")
+    clean = ask_yes_no("Did it pass smoothly through zero, with no jolt or grinding?")
+    if clean is not None:
+        check("reversal ramps through zero before changing direction", clean)
+        if clean is False:
+            info("A jolt means the direction pin moved while pulses were still "
+                 "being generated. That is the one thing the ramp-through-zero "
+                 "rule exists to prevent — stop and check the firmware version.")
+
+
+def test_velocity_command_timeout():
+    print("\nstreamed velocity: 300 ms command timeout")
+    if not _velocity_ready():
+        return
+
+    info("This is the check that matters most: it is the only thing that stops "
+         "the column if the host process dies mid-move.")
+    confirm("Move at +10 mm/s, then STOP SENDING. The lift must stop by itself.")
+    with guard(CLIENT):
+        countdown(2, "moving, then going silent")
+        _stream_velocity(+0.010, 2.5)
+        silent_from = time.monotonic()
+        h_at_silence = _height()
+        settled = _wait_still(timeout_s=10.0, settle_s=0.5)
+        stopped_after = time.monotonic() - silent_from
+
+    check("the lift stopped without being told to", settled is not None)
+    check("it stopped within a second of the last command", stopped_after < 2.0,
+          f"{stopped_after:.2f} s (300 ms timeout + the ramp down)")
+    if settled is not None and h_at_silence is not None:
+        coast_mm = (settled - h_at_silence) * 1000.0
+        check("it coasted less than 15 mm past the last command",
+              abs(coast_mm) < 15.0, f"{coast_mm:+.1f} mm")
+
+
+def test_velocity_respects_limits():
+    print("\nstreamed velocity: limit switches")
+    if _status().get("velocity_capable") is not True:
+        check("firmware supports streamed velocity", False, "skipping — old firmware")
+        return
+    if _status().get("position_known") is not True:
+        check("lift homed before the limit test", False, "skipping — home first")
+        return
+
+    confirm("Stream UP into the upper limit switch. The firmware must stop itself.",
+            token="READY")
+    with guard(CLIENT):
+        countdown(3, "driving up to the limit")
+        _stream_velocity(+0.010, 90.0)       # long enough to reach the switch
+        CLIENT.call("lift_set_velocity", 0.0)
+    settled = _wait_still(timeout_s=15.0)
+
+    st = _status()
+    check("the upper limit switch is active", st.get("upper_limit") is True,
+          f"upper_limit={st.get('upper_limit')}")
+    check("the firmware reported the limit",
+          "limit" in str(st.get("last_event", "")).lower(),
+          f"last_event={st.get('last_event')!r}")
+    if settled is not None:
+        check("height is pinned to the top of travel",
+              abs(settled - TRAVEL_M) < NOMINAL_TOLERANCE, f"{settled:.4f} m")
+
+    # ...and it must still be possible to drive away from the switch.
+    with guard(CLIENT):
+        countdown(2, "driving back down off the switch")
+        _stream_velocity(-0.010, 4.0)
+        CLIENT.call("lift_set_velocity", 0.0)
+    off = _wait_still(timeout_s=10.0)
+    check("driving away from a closed limit still works",
+          off is not None and settled is not None and off < settled - 0.005,
+          f"{settled:.4f} -> {off:.4f} m" if off and settled else "no reading")
+
+
 def test_travel_matches_reality():
     print("\ntravel constant vs the real lift")
     info(f"The stack asserts {TRAVEL_M * 1000:.0f} mm of travel in five places "
@@ -245,6 +472,16 @@ def main() -> int:
             test_home,
             test_absolute_moves,
             test_stop_is_prompt,
+            # Streamed velocity: the path the whole-body loop uses. Deliberately
+            # after the discrete moves, so a fault here cannot be blamed on the
+            # basics, and smallest command first.
+            test_velocity_capability,
+            test_velocity_small,
+            test_velocity_larger,
+            test_velocity_zero_hold,
+            test_velocity_reversal,
+            test_velocity_command_timeout,
+            test_velocity_respects_limits,
             test_travel_matches_reality,
             test_limits_hold,
         )

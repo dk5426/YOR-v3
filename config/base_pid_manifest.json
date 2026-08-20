@@ -1,0 +1,32 @@
+{
+  "manifest_version": 1,
+  "description": "Commissioned swerve PID gains for the YORv3 base. Applied to controller RAM by tools/base_pid_preflight.py before robot/yor.py opens the motor controllers. RAM is not persistent: re-run the preflight after every SPARK power cycle.",
+  "can_interface": "can0",
+  "pid_slot": 0,
+  "roles": {
+    "drive": {
+      "p": 0.35,
+      "i": 0.0,
+      "d": 0.0,
+      "velocity_ff": 0.23,
+      "output_min": -1.0,
+      "output_max": 1.0,
+      "notes": "Feed-forward dominated rather than a conventional PD loop. Kd is deliberately zero: a tested value of 10 caused an audibly harsh 100 Hz torque ripple and rough deceleration during floor testing."
+    },
+    "steering": {
+      "p": 20.0,
+      "i": 0.0,
+      "d": 6.0,
+      "velocity_ff": 0.0,
+      "output_min": -0.25,
+      "output_max": 0.25,
+      "notes": "The +/-0.25 output limit is part of the commissioned set. Full-range steering (Kp=10, Kd=0, output -1.0..1.0) is NOT validated and must stay a separate commissioning experiment."
+    }
+  },
+  "modules": {
+    "FL": { "drive": 1, "steering": 5 },
+    "FR": { "drive": 4, "steering": 8 },
+    "RR": { "drive": 3, "steering": 7 },
+    "RL": { "drive": 2, "steering": 6 }
+  }
+}

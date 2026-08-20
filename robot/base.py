@@ -218,6 +218,7 @@ class BaseController:
         origin: tuple[float, float],
         grid_res: float,
         control_hz: int = 30,
+        relay_hz: int = 108,
         k_pos: float = 1.5,
         ki_pos: float = 0.01,
         kd_pos: float = 0.15,
@@ -229,7 +230,26 @@ class BaseController:
     ):
         self.origin = origin
         self.grid_res = grid_res
+        # Two rates, because this loop does two unrelated jobs.
+        #
+        # `rate` paces the navigation modes (MOVE_TO, PATH_FOLLOWING). Their
+        # PIDs close on the Odin SLAM pose, which arrives at 20 Hz, and the
+        # gains below were tuned against that. Running them faster does not
+        # produce new information: the pose is unchanged on the extra cycles,
+        # so `(e - prev_e)/dt` reads zero four times and then spikes on the
+        # fifth, and `vel_alpha` — an EMA applied once per tick — smooths over
+        # a five-times-shorter window than it was tuned for.
+        #
+        # `relay_rate` paces BASE_VEL, which is not a controller at all: it
+        # forwards whatever velocity was last written to `target_velocity`
+        # straight through to the wheels. The whole-body loop writes that
+        # attribute at 108 Hz (robot/wholebody_control.py), so anything slower
+        # here silently discards solver output — the former 20 Hz relay let most
+        # base velocities be overwritten before the wheels ever saw them. This
+        # is the one path that has to keep up with the producer.
         self.rate = RateLimiter(control_hz, name="BaseController")
+        self.relay_rate = RateLimiter(relay_hz, name="BaseController-relay",
+                                      warn=False)
 
         self.yor = yor
         self.base = Base(max_vel=base_max_vel, max_accel=base_max_accel)
@@ -347,7 +367,7 @@ class BaseController:
                 self.base.set_target_base_velocity(
                     np.asarray(self.target_velocity, dtype=float), smooth=True
                 )
-                self.rate.sleep()
+                self.relay_rate.sleep()
                 continue
 
             if self.slam_sub is None:

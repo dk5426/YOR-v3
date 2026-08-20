@@ -62,11 +62,51 @@ constexpr float DOWN_MAX_JERK_MM_S3 = 200.0f;
 // Homing is upward at a separate fixed speed and does not use the S-curve.
 constexpr float HOMING_SPEED_MM_S = 35.0f;
 
+// ---------------- Streamed velocity mode ----------------
+//
+// "vel <signed mm/s>" is the whole-body path: the host runs a position PD
+// against measured height and streams the resulting velocity. This firmware
+// SHAPES that request, it does not close a velocity loop — there is no
+// measured column velocity to close one against. It plans a quintic
+// minimum-jerk transition from the velocity it is currently commanding to the
+// one that was asked for, and converts the result into a step frequency.
+//
+// The discrete up / down / distance / home moves above are untouched by any
+// of this and keep their own direction-specific profiles.
+constexpr float VEL_MAX_MM_S = 50.0f;
+// Below this the stepper is asked for so few pulses per second that a
+// commanded "creep" is indistinguishable from a hold, so it is treated as a
+// hold: pulses stop, but the mode, the driver power and the telemetry stay.
+constexpr float VEL_MIN_ACTIVE_MM_S = 0.5f;
+constexpr float VEL_MAX_ACCEL_MM_S2 = 200.0f;
+constexpr float VEL_MAX_JERK_MM_S3 = 2000.0f;
+// A transition always takes at least VEL_RAMP_MIN_S, so a stream of tiny
+// changes cannot turn into a stream of step discontinuities, and never more
+// than VEL_RAMP_MAX_S, so a large reversal still completes in bounded time.
+constexpr float VEL_RAMP_MIN_S = 0.040f;
+constexpr float VEL_RAMP_MAX_S = 2.000f;
+constexpr unsigned long VEL_UPDATE_INTERVAL_US = 1000000UL / 324UL;
+// The host refreshes at least every 100 ms. Losing three refreshes in a row
+// means the link or the host is gone, and the column must not keep moving.
+constexpr unsigned long VEL_COMMAND_TIMEOUT_MS = 300;
+// A hold is temporary. After this long at zero the mode exits and the driver
+// relay opens, so a forgotten stream does not leave the driver energised.
+constexpr unsigned long VEL_ZERO_IDLE_MS = 5000;
+
+// Protocol capability advertisement. The host must see this before it may use
+// streamed velocity: an older sketch simply does not print it, and the host
+// then falls back to up / down / stop.
+//
+// F() keeps it, and the velocity mode's other messages, in flash. This sketch
+// runs on a 2 KB AVR and string literals otherwise live in RAM, where the new
+// text alone would cost a seventh of it.
+#define PROTOCOL_CAPABILITIES F("Capabilities: lift_velocity_v1")
+
 // Allow relay, driver and brake time to become ready.
 constexpr unsigned long DRIVER_STARTUP_MS = 500;
 
 // Python's reader parses lines in the exact form "Height: <number> mm".
-constexpr unsigned long TELEMETRY_INTERVAL_MS = 50;
+constexpr unsigned long TELEMETRY_INTERVAL_US = 1000000UL / 36UL;
 
 constexpr int32_t MAX_HEIGHT_PULSES =
     static_cast<int32_t>(MAX_HEIGHT_MM * PULSES_PER_MM + 0.5f);
@@ -78,6 +118,7 @@ enum MotionMode : uint8_t {
   MOTION_CONTINUOUS,
   MOTION_DISTANCE,
   MOTION_HOMING,
+  MOTION_VELOCITY,
 };
 
 enum StopReason : uint8_t {
@@ -87,6 +128,7 @@ enum StopReason : uint8_t {
   STOP_UPPER_LIMIT,
   STOP_LOWER_LIMIT,
   STOP_SOFTWARE_LIMIT,
+  STOP_VELOCITY_TIMEOUT,
 };
 
 volatile uint32_t generatedPulses = 0;
@@ -101,7 +143,27 @@ volatile bool homingMove = false;
 volatile StopReason stopReason = STOP_NONE;
 
 MotionMode motionMode = MOTION_IDLE;
-unsigned long lastTelemetryMs = 0;
+unsigned long lastTelemetryUs = 0;
+
+// Streamed velocity state. Only loop() touches these.
+float velCommandedMMs = 0.0f;     // what the ramp is putting out right now
+float velRampFromMMs = 0.0f;
+float velRampToMMs = 0.0f;
+float velRampDurationS = 0.0f;
+unsigned long velRampStartUs = 0;
+// A reversal is not a single ramp: the pulse train has to reach zero before
+// DIR may change, so the far side of the reversal waits here.
+float velPendingTargetMMs = 0.0f;
+bool velReversePending = false;
+unsigned long lastVelCommandMs = 0;
+unsigned long lastVelUpdateUs = 0;
+unsigned long velZeroSinceMs = 0;
+bool velTimedOut = false;
+// A host that keeps asking to drive into a closed limit switch would otherwise
+// be answered thirty times a second. These latch the refusal until that
+// direction is clear again.
+bool velBlockedUp = false;
+bool velBlockedDown = false;
 
 // Planned normal-motion profile. These are only accessed from loop().
 float activeStartSpeedMMs = UP_START_SPEED_MM_S;
@@ -130,6 +192,12 @@ bool lowerLimitActive() {
 
 // ---------------- Timer1 control ----------------
 
+// Set by setPulseFrequency() while the pulse train is running; applied by the
+// overflow ISR at TOP. See the comment at the end of TIMER1_OVF_vect.
+volatile uint16_t pendingTimerTop = 0;
+volatile uint8_t pendingTimerClockBits = (1 << CS10);
+volatile bool timerUpdatePending = false;
+
 void stopPulseTrainFromISR(StopReason reason) {
   // Stop Timer1 clock.
   TCCR1B &= ~((1 << CS12) | (1 << CS11) | (1 << CS10));
@@ -142,6 +210,8 @@ void stopPulseTrainFromISR(StopReason reason) {
 
   stopReason = reason;
   pulseTrainRunning = false;
+  // Nothing will reach an overflow to apply it now.
+  timerUpdatePending = false;
 }
 
 ISR(TIMER1_OVF_vect) {
@@ -192,6 +262,18 @@ ISR(TIMER1_OVF_vect) {
 
   if (finiteMove && generatedPulses >= targetPulses) {
     stopPulseTrainFromISR(STOP_COMPLETE);
+    return;
+  }
+
+  // A frequency change is committed here, at TOP, rather than the moment it is
+  // computed. ICR1 is not double-buffered in mode 14, so writing it mid-cycle
+  // can drop a step or stretch one period audibly — and the velocity ramp
+  // rewrites it at 324 Hz.
+  if (timerUpdatePending) {
+    ICR1 = pendingTimerTop;
+    OCR1A = static_cast<uint16_t>((static_cast<uint32_t>(pendingTimerTop) + 1UL) / 2UL);
+    TCCR1B = (1 << WGM13) | (1 << WGM12) | pendingTimerClockBits;
+    timerUpdatePending = false;
   }
 }
 
@@ -210,29 +292,61 @@ void configureTimer1() {
   interrupts();
 }
 
-void setPulseFrequency(float frequencyHz) {
+// f = clock / (prescaler * (TOP + 1)). Prescaler 1 covers everything down to
+// 16 MHz / 65536 = 244 Hz, which is 0.76 mm/s. The velocity mode's minimum
+// active speed is 0.5 mm/s (160 Hz), so a second prescaler is needed below
+// that; prescaler 8 reaches 30.5 Hz, well under anything commandable.
+void computeTimerSettings(float frequencyHz, uint16_t &top, uint8_t &clockBits) {
   if (frequencyHz < 1.0f) {
     frequencyHz = 1.0f;
   }
 
-  // f = 16 MHz / (prescaler * (TOP + 1)); prescaler 1 is used.
-  uint32_t top = static_cast<uint32_t>(16000000.0f / frequencyHz) - 1UL;
+  float timerClockHz = 16000000.0f;
+  clockBits = (1 << CS10);                       // prescaler 1
 
-  if (top < 3UL) {
-    top = 3UL;
+  if (frequencyHz < (16000000.0f / 65536.0f)) {
+    timerClockHz = 2000000.0f;
+    clockBits = (1 << CS11);                     // prescaler 8
   }
-  if (top > 65535UL) {
-    top = 65535UL;
+
+  uint32_t value = static_cast<uint32_t>(timerClockHz / frequencyHz) - 1UL;
+
+  if (value < 3UL) {
+    value = 3UL;
   }
+  if (value > 65535UL) {
+    value = 65535UL;
+  }
+
+  top = static_cast<uint16_t>(value);
+}
+
+void setPulseFrequency(float frequencyHz) {
+  uint16_t top;
+  uint8_t clockBits;
+  computeTimerSettings(frequencyHz, top, clockBits);
 
   noInterrupts();
 
-  ICR1 = static_cast<uint16_t>(top);
-  OCR1A = static_cast<uint16_t>((top + 1UL) / 2UL);
+  // While the timer is clocked, hand the new period to the overflow ISR. While
+  // it is stopped no overflow is coming, so it must be applied here — that is
+  // also the path that starts the pulse train.
+  const bool timerClocked =
+      (TCCR1B & ((1 << CS12) | (1 << CS11) | (1 << CS10))) != 0;
 
-  // Non-inverting PWM on D9, mode 14, prescaler 1.
-  TCCR1A = (1 << COM1A1) | (1 << WGM11);
-  TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10);
+  if (timerClocked) {
+    pendingTimerTop = top;
+    pendingTimerClockBits = clockBits;
+    timerUpdatePending = true;
+  } else {
+    ICR1 = top;
+    OCR1A = static_cast<uint16_t>((static_cast<uint32_t>(top) + 1UL) / 2UL);
+
+    // Non-inverting PWM on D9, mode 14.
+    TCCR1A = (1 << COM1A1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13) | (1 << WGM12) | clockBits;
+    timerUpdatePending = false;
+  }
 
   interrupts();
 }
@@ -349,6 +463,412 @@ float motionProfileSpeed(unsigned long nowUs, bool isFinite) {
   return activeStartSpeedMMs;
 }
 
+// ---------------- Streamed velocity mode ----------------
+
+// Both are defined further down. The Arduino build generates prototypes by
+// itself, but declaring them keeps this a valid translation unit for the
+// host-side harness in tests/firmware/ as well.
+void printHeight();
+void stopMotion();
+
+// Reuses smootherStep() above: quintic, so acceleration and jerk are both zero
+// at each end of a velocity transition.
+void planVelocityRamp(float targetMMs) {
+  // A ramp already heading there must be left alone. The host refreshes an
+  // unchanged command every 100 ms as a keepalive, and replanning on each of
+  // those would restart the transition from wherever it had reached — the
+  // velocity would approach the request asymptotically and never arrive.
+  if (velRampDurationS > 0.0f && fabs(targetMMs - velRampToMMs) < 0.0001f) {
+    return;
+  }
+
+  const float delta = fabs(targetMMs - velCommandedMMs);
+
+  if (delta < 0.0001f) {
+    velCommandedMMs = targetMMs;
+    velRampFromMMs = targetMMs;
+    velRampToMMs = targetMMs;
+    velRampDurationS = 0.0f;
+    return;
+  }
+
+  // Smootherstep peaks at 1.875x the mean acceleration and 5.773503x the mean
+  // jerk, so these are the shortest durations that respect both limits.
+  const float accelerationLimitedTime = 1.875f * delta / VEL_MAX_ACCEL_MM_S2;
+  const float jerkLimitedTime = sqrt(5.773503f * delta / VEL_MAX_JERK_MM_S3);
+
+  float duration = accelerationLimitedTime > jerkLimitedTime
+                       ? accelerationLimitedTime
+                       : jerkLimitedTime;
+  duration = constrain(duration, VEL_RAMP_MIN_S, VEL_RAMP_MAX_S);
+
+  velRampFromMMs = velCommandedMMs;
+  velRampToMMs = targetMMs;
+  velRampDurationS = duration;
+  velRampStartUs = micros();
+}
+
+float velocityRampOutput(unsigned long nowUs) {
+  if (velRampDurationS <= 0.0f) {
+    return velRampToMMs;
+  }
+
+  const float elapsedS =
+      static_cast<float>(nowUs - velRampStartUs) * 0.000001f;
+
+  if (elapsedS >= velRampDurationS) {
+    velRampDurationS = 0.0f;
+    return velRampToMMs;
+  }
+
+  const float phase = elapsedS / velRampDurationS;
+  return velRampFromMMs +
+         (velRampToMMs - velRampFromMMs) * smootherStep(phase);
+}
+
+void stopVelocityPulses(StopReason reason) {
+  noInterrupts();
+  if (pulseTrainRunning) {
+    stopPulseTrainFromISR(reason);
+  }
+  interrupts();
+  digitalWrite(PUL_PIN, LOW);
+}
+
+void exitVelocityMode(bool powerOff) {
+  stopVelocityPulses(STOP_USER);
+
+  noInterrupts();
+  stopReason = STOP_NONE;
+  interrupts();
+
+  motionMode = MOTION_IDLE;
+  velCommandedMMs = 0.0f;
+  velRampFromMMs = 0.0f;
+  velRampToMMs = 0.0f;
+  velRampDurationS = 0.0f;
+  velPendingTargetMMs = 0.0f;
+  velReversePending = false;
+  velZeroSinceMs = 0;
+  velTimedOut = false;
+  velBlockedUp = false;
+  velBlockedDown = false;
+
+  if (powerOff) {
+    setDriverPower(false);
+  }
+
+  printHeight();
+}
+
+// DIR may only change while no pulses are being generated, which is why a
+// reversal ramps to zero first.
+void applyVelocityDirection(bool commandUp) {
+  stopVelocityPulses(STOP_NONE);
+  digitalWrite(DIR_PIN, commandUp ? DIR_UP_LEVEL : DIR_DOWN_LEVEL);
+  delay(10);
+
+  noInterrupts();
+  movingUp = commandUp;
+  stopReason = STOP_NONE;
+  interrupts();
+}
+
+// The limit switches are checked here as well as in the ISR: the ISR can only
+// stop a train that is already running, and this is what stops one starting
+// into a switch that is already closed.
+bool limitBlocksDirection(bool commandUp) {
+  if (commandUp && upperLimitActive()) {
+    noInterrupts();
+    positionPulses = MAX_HEIGHT_PULSES;
+    positionKnown = true;
+    interrupts();
+    return true;
+  }
+
+  if (!commandUp && lowerLimitActive()) {
+    noInterrupts();
+    positionPulses = 0;
+    positionKnown = true;
+    interrupts();
+    return true;
+  }
+
+  return false;
+}
+
+// Same question, but reported at most once per blockage. Driving away from the
+// switch clears the latch, so the lift is never stuck against a limit.
+bool velocityDirectionBlocked(bool commandUp) {
+  bool &latched = commandUp ? velBlockedUp : velBlockedDown;
+
+  if (!limitBlocksDirection(commandUp)) {
+    latched = false;
+    return false;
+  }
+
+  if (!latched) {
+    latched = true;
+    Serial.println(commandUp ? F("UP blocked: upper limit is active.")
+                             : F("DOWN blocked: lower limit is active."));
+    printHeight();
+  }
+
+  return true;
+}
+
+void startVelocityPulses(float magnitudeMMs) {
+  bool running;
+  bool commandUp;
+  noInterrupts();
+  running = pulseTrainRunning;
+  commandUp = movingUp;
+  interrupts();
+
+  if (running) {
+    setPulseFrequency(magnitudeMMs * PULSES_PER_MM);
+    return;
+  }
+
+  if (velocityDirectionBlocked(commandUp)) {
+    velCommandedMMs = 0.0f;
+    velRampToMMs = 0.0f;
+    velRampDurationS = 0.0f;
+    velReversePending = false;
+    return;
+  }
+
+  noInterrupts();
+  generatedPulses = 0;
+  targetPulses = 0;
+  finiteMove = false;
+  homingMove = false;
+  stopReason = STOP_NONE;
+  pulseTrainRunning = true;
+  interrupts();
+
+  setPulseFrequency(magnitudeMMs * PULSES_PER_MM);
+}
+
+// Enters velocity mode from idle. Powering the driver is the slow part, so it
+// happens once here rather than on every command in the stream.
+bool enterVelocityMode(bool commandUp) {
+  if (velocityDirectionBlocked(commandUp)) {
+    return false;
+  }
+
+  setDriverPower(true);
+  delay(DRIVER_STARTUP_MS);
+
+  if (limitBlocksDirection(commandUp)) {
+    setDriverPower(false);
+    Serial.println(commandUp
+                       ? F("UP blocked: upper limit became active during startup.")
+                       : F("DOWN blocked: lower limit became active during startup."));
+    printHeight();
+    return false;
+  }
+
+  digitalWrite(DIR_PIN, commandUp ? DIR_UP_LEVEL : DIR_DOWN_LEVEL);
+  delay(10);
+
+  noInterrupts();
+  generatedPulses = 0;
+  targetPulses = 0;
+  movingUp = commandUp;
+  finiteMove = false;
+  homingMove = false;
+  stopReason = STOP_NONE;
+  pulseTrainRunning = false;
+  interrupts();
+
+  motionMode = MOTION_VELOCITY;
+  velCommandedMMs = 0.0f;
+  velRampFromMMs = 0.0f;
+  velRampToMMs = 0.0f;
+  velRampDurationS = 0.0f;
+  velPendingTargetMMs = 0.0f;
+  velReversePending = false;
+  velZeroSinceMs = 0;
+  velTimedOut = false;
+  lastVelUpdateUs = micros();
+  lastTelemetryUs = 0;
+
+  Serial.println(F("Velocity mode."));
+  return true;
+}
+
+void setVelocityTarget(float targetMMs) {
+  const bool wantUp = targetMMs > 0.0f;
+  const bool moving = fabs(velCommandedMMs) >= VEL_MIN_ACTIVE_MM_S;
+
+  bool currentlyUp;
+  noInterrupts();
+  currentlyUp = movingUp;
+  interrupts();
+
+  if (fabs(targetMMs) < VEL_MIN_ACTIVE_MM_S) {
+    velReversePending = false;
+    planVelocityRamp(0.0f);
+    return;
+  }
+
+  if (moving && wantUp != currentlyUp) {
+    // Ramp through zero, then pick the request up again on the far side.
+    velPendingTargetMMs = targetMMs;
+    velReversePending = true;
+    planVelocityRamp(0.0f);
+    return;
+  }
+
+  if (velocityDirectionBlocked(wantUp)) {
+    // Hold at zero rather than planning a ramp startVelocityPulses() would
+    // refuse a few milliseconds later. The switch is re-read on every request,
+    // so the moment it clears the next command moves the lift.
+    velReversePending = false;
+    planVelocityRamp(0.0f);
+    return;
+  }
+
+  if (!moving && wantUp != currentlyUp) {
+    applyVelocityDirection(wantUp);
+  }
+
+  velReversePending = false;
+  planVelocityRamp(targetMMs);
+}
+
+// The "vel <signed mm/s>" entry point. Clamping happens here so nothing
+// downstream has to trust the host.
+void requestVelocity(float requestedMMs) {
+  if (isnan(requestedMMs) || isinf(requestedMMs)) {
+    Serial.println(F("Invalid velocity."));
+    return;
+  }
+
+  requestedMMs = constrain(requestedMMs, -VEL_MAX_MM_S, VEL_MAX_MM_S);
+  if (fabs(requestedMMs) < VEL_MIN_ACTIVE_MM_S) {
+    requestedMMs = 0.0f;
+  }
+
+  // A velocity command supersedes a discrete move, exactly as a discrete move
+  // supersedes another one.
+  if (motionMode != MOTION_IDLE && motionMode != MOTION_VELOCITY) {
+    stopMotion();
+  }
+
+  if (motionMode != MOTION_VELOCITY) {
+    // A zero request from idle is a no-op rather than a reason to energise the
+    // driver: the host streams zero whenever it is inside its deadband, and
+    // cycling the relay for that would wear it out for nothing.
+    if (requestedMMs == 0.0f) {
+      lastVelCommandMs = millis();
+      return;
+    }
+    if (!enterVelocityMode(requestedMMs > 0.0f)) {
+      return;
+    }
+  }
+
+  lastVelCommandMs = millis();
+  velTimedOut = false;
+  setVelocityTarget(requestedMMs);
+}
+
+void updateVelocityMode() {
+  const unsigned long nowMs = millis();
+  const unsigned long nowUs = micros();
+
+  StopReason reason;
+  bool running;
+  noInterrupts();
+  reason = stopReason;
+  running = pulseTrainRunning;
+  interrupts();
+
+  // A limit reached by the ISR ends velocity mode outright. The host will see
+  // the line, and its next "vel" command starts a fresh, re-checked mode.
+  if (!running && (reason == STOP_UPPER_LIMIT || reason == STOP_LOWER_LIMIT ||
+                   reason == STOP_SOFTWARE_LIMIT)) {
+    switch (reason) {
+      case STOP_UPPER_LIMIT:
+        Serial.println(F("LIMIT HIT: upper limit."));
+        break;
+      case STOP_LOWER_LIMIT:
+        Serial.println(F("LIMIT HIT: lower limit."));
+        break;
+      default:
+        Serial.println(F("LIMIT HIT: software travel limit."));
+        break;
+    }
+    exitVelocityMode(true);
+    return;
+  }
+
+  if (!velTimedOut && (nowMs - lastVelCommandMs) > VEL_COMMAND_TIMEOUT_MS) {
+    velTimedOut = true;
+    velReversePending = false;
+    planVelocityRamp(0.0f);
+    Serial.println(F("Velocity command timeout; ramping to zero."));
+  }
+
+  if ((nowUs - lastVelUpdateUs) >= VEL_UPDATE_INTERVAL_US) {
+    // Advance the ideal schedule instead of resetting it to `nowUs`. loop()
+    // wakes on a 2 ms grid, so this intentionally alternates 2 ms and 4 ms
+    // gaps while preserving a 324 Hz average rather than collapsing to 250 Hz.
+    // Skip missed slots after a long serial read rather than replaying them as
+    // a burst; the ramp itself is evaluated at the current wall-clock time.
+    const unsigned long elapsedUs = nowUs - lastVelUpdateUs;
+    lastVelUpdateUs +=
+        (elapsedUs / VEL_UPDATE_INTERVAL_US) * VEL_UPDATE_INTERVAL_US;
+
+    velCommandedMMs = velocityRampOutput(nowUs);
+    const float magnitude = fabs(velCommandedMMs);
+
+    if (magnitude < VEL_MIN_ACTIVE_MM_S) {
+      velCommandedMMs = 0.0f;
+      stopVelocityPulses(STOP_NONE);
+
+      if (velReversePending) {
+        velReversePending = false;
+        applyVelocityDirection(velPendingTargetMMs > 0.0f);
+        planVelocityRamp(velPendingTargetMMs);
+        velPendingTargetMMs = 0.0f;
+        velZeroSinceMs = 0;
+      } else if (velZeroSinceMs == 0) {
+        velZeroSinceMs = nowMs;
+      }
+    } else {
+      velZeroSinceMs = 0;
+      startVelocityPulses(magnitude);
+    }
+  }
+
+  // Height keeps streaming while the mode holds at zero, so the host's PD
+  // never has to servo against a measurement that stopped arriving.
+  if (lastTelemetryUs == 0 || (nowUs - lastTelemetryUs) >= TELEMETRY_INTERVAL_US) {
+    lastTelemetryUs = lastTelemetryUs == 0
+                          ? nowUs
+                          : lastTelemetryUs
+                                + ((nowUs - lastTelemetryUs) / TELEMETRY_INTERVAL_US)
+                                      * TELEMETRY_INTERVAL_US;
+    printHeight();
+  }
+
+  if (velCommandedMMs == 0.0f && !velReversePending) {
+    if (velTimedOut) {
+      Serial.println(F("Velocity stopped: no command for 300 ms."));
+      exitVelocityMode(true);
+      return;
+    }
+    if (velZeroSinceMs != 0 && (nowMs - velZeroSinceMs) >= VEL_ZERO_IDLE_MS) {
+      Serial.println(F("Velocity idle; exiting velocity mode."));
+      exitVelocityMode(true);
+      return;
+    }
+  }
+}
+
 // ---------------- Height telemetry ----------------
 
 void printHeight() {
@@ -378,12 +898,20 @@ void printStatus() {
   Serial.print("Lower limit: ");
   Serial.println(lowerLimitActive() ? "ACTIVE" : "clear");
 
+  // The host's parser accepts exactly IDLE, UP or DOWN, so a velocity-mode
+  // hold reports IDLE — which is also what it is: no pulses are being made.
   Serial.print("Motion: ");
-  if (motionMode == MOTION_IDLE) {
+  if (motionMode == MOTION_IDLE || !pulseTrainRunning) {
     Serial.println("IDLE");
   } else {
     Serial.println(movingUp ? "UP" : "DOWN");
   }
+
+  Serial.print(F("Velocity: "));
+  Serial.print(velCommandedMMs, 2);
+  Serial.println(F(" mm/s"));
+
+  Serial.println(PROTOCOL_CAPABILITIES);
 
   printHeight();
 }
@@ -456,6 +984,12 @@ void finishMotion() {
 }
 
 void stopMotion() {
+  if (motionMode == MOTION_VELOCITY) {
+    Serial.println(F("Motion stopped by user."));
+    exitVelocityMode(true);
+    return;
+  }
+
   if (motionMode == MOTION_IDLE) {
     setDriverPower(false);
     return;
@@ -578,7 +1112,7 @@ bool startMotion(bool commandUp, MotionMode requestedMode, float distanceMM = 0.
   interrupts();
 
   motionMode = requestedMode;
-  lastTelemetryMs = 0;
+  lastTelemetryUs = 0;
   profileStartUs = micros();
 
   // All ISR-visible state is valid before Timer1 starts producing pulses.
@@ -609,6 +1143,13 @@ void updateMotion() {
     return;
   }
 
+  // Velocity mode runs its own supervision: a stopped pulse train there is a
+  // zero hold, not a finished move.
+  if (motionMode == MOTION_VELOCITY) {
+    updateVelocityMode();
+    return;
+  }
+
   if (!pulseTrainRunning) {
     finishMotion();
     return;
@@ -623,14 +1164,50 @@ void updateMotion() {
 
   setPulseFrequency(speedMMs * PULSES_PER_MM);
 
-  const unsigned long now = millis();
-  if (lastTelemetryMs == 0 || (now - lastTelemetryMs) >= TELEMETRY_INTERVAL_MS) {
-    lastTelemetryMs = now;
+  const unsigned long nowUs = micros();
+  if (lastTelemetryUs == 0 || (nowUs - lastTelemetryUs) >= TELEMETRY_INTERVAL_US) {
+    lastTelemetryUs = lastTelemetryUs == 0
+                          ? nowUs
+                          : lastTelemetryUs
+                                + ((nowUs - lastTelemetryUs) / TELEMETRY_INTERVAL_US)
+                                      * TELEMETRY_INTERVAL_US;
     printHeight();
   }
 }
 
 // ---------------- Serial commands ----------------
+
+bool parseSignedFloat(const String &text, float &out) {
+  if (text.length() == 0) {
+    return false;
+  }
+
+  bool sawDigit = false;
+  bool sawPoint = false;
+
+  for (uint16_t i = 0; i < text.length(); i++) {
+    const char c = text.charAt(i);
+    if (c >= '0' && c <= '9') {
+      sawDigit = true;
+    } else if (c == '.') {
+      if (sawPoint) {
+        return false;
+      }
+      sawPoint = true;
+    } else if ((c == '+' || c == '-') && i == 0) {
+      continue;
+    } else {
+      return false;
+    }
+  }
+
+  if (!sawDigit) {
+    return false;
+  }
+
+  out = text.toFloat();
+  return true;
+}
 
 void processCommand(String command) {
   command.trim();
@@ -670,13 +1247,29 @@ void processCommand(String command) {
 
   const int separator = command.indexOf(' ');
   String action = command;
+  String argument = "";
   bool hasDistance = false;
   float distanceMM = DEFAULT_MOVE_MM;
 
   if (separator > 0) {
     action = command.substring(0, separator);
-    distanceMM = command.substring(separator + 1).toFloat();
+    argument = command.substring(separator + 1);
+    argument.trim();
+    distanceMM = argument.toFloat();
     hasDistance = true;
+  }
+
+  if (action == "vel") {
+    // Parsed strictly: String::toFloat() answers 0.0 for anything it does not
+    // understand, and a silent zero here would read as a legitimate hold and
+    // keep refreshing the command timeout.
+    float requested = 0.0f;
+    if (!hasDistance || !parseSignedFloat(argument, requested)) {
+      Serial.println(F("Invalid velocity."));
+      return;
+    }
+    requestVelocity(requested);
+    return;
   }
 
   if (action == "up") {
@@ -691,7 +1284,8 @@ void processCommand(String command) {
         distanceMM);
   } else {
     Serial.println(
-        "Commands: up, down, stop, home, up 200, down 200, status, power on, power off");
+        F("Commands: up, down, stop, home, up 200, down 200, vel 12.5, status, "
+          "power on, power off"));
   }
 }
 
@@ -725,7 +1319,10 @@ void setup() {
   }
 
   Serial.println("Lift controller ready.");
-  Serial.println("Python commands: up, down, stop, home");
+  // The host reads this to decide whether it may stream velocity. An older
+  // sketch does not print it, and the host then stays on up / down / stop.
+  Serial.println(PROTOCOL_CAPABILITIES);
+  Serial.println(F("Python commands: up, down, stop, home, vel <signed mm/s>"));
   Serial.println("Optional commands: up 200, down 200, status, power on, power off");
   printHeight();
 }

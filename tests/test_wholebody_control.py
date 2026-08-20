@@ -34,9 +34,11 @@ class FakeArm:
     def __init__(self, q0):
         self.q = np.asarray(q0, dtype=float).copy()
         self.commands = 0
+        self.reads = 0
         self.gripper = 0.0
 
     def get_joint_positions(self):
+        self.reads += 1
         return self.q.copy()
 
     def set_joint_target(self, joint_target, gripper_target=None, preview_time=0.1):
@@ -137,19 +139,29 @@ def test_arm_tracking():
     start_err = np.linalg.norm(wbc.forward_kinematics()[0].translation() - goal)
     for _ in range(200):
         wbc._step()
+        # Arm dispatch runs on its own decoupled loop in the real system (see
+        # _arm_dispatch_tick); flush one full interpolated segment per solve
+        # tick here so the fake arm actually receives commands.
+        for _ in range(wbc.config.arm_interpolation_steps):
+            wbc._arm_dispatch_tick()
     end_err = np.linalg.norm(wbc.forward_kinematics()[0].translation() - goal)
 
-    check("arms were commanded", left.commands > 100, f"{left.commands} commands")
+    check("arm commands crossed the deadband", left.commands > 0,
+          f"{left.commands} commands")
     check("EE converged toward target", end_err < 0.01,
           f"{start_err*100:.1f} cm -> {end_err*100:.2f} cm")
     check("right arm held still", np.linalg.norm(
         wbc.forward_kinematics()[1].translation() - T_r.translation()) < 0.02)
 
 
-def test_arm_step_clamp():
-    print("\nper-cycle joint step clamp")
-    wbc, left, right, base = build(enable_base_motion=False, arm_max_vel_rad_s=0.5)
-    max_step = 0.5 * wbc.dt
+def test_arm_command_lookahead():
+    print("\nbounded arm command look-ahead")
+    wbc, left, right, base = build(
+        enable_base_motion=False,
+        arm_max_vel_rad_s=0.5,
+        arm_command_lookahead_s=0.10,
+    )
+    max_lead = 0.5 * 0.10
     import mink
     T_l, _ = wbc.forward_kinematics()
     far = mink.SE3.from_rotation_and_translation(
@@ -160,9 +172,68 @@ def test_arm_step_clamp():
     for _ in range(50):
         before = left.q.copy()
         wbc._step()
+        for _ in range(wbc.config.arm_interpolation_steps):
+            wbc._arm_dispatch_tick()
         worst = max(worst, float(np.max(np.abs(left.q - before))))
-    check("no joint moved faster than the clamp", worst <= max_step + 1e-9,
-          f"worst {worst:.5f} rad vs limit {max_step:.5f}")
+    check("command never exceeds the bounded look-ahead", worst <= max_lead + 1e-9,
+          f"worst {worst:.5f} rad vs limit {max_lead:.5f}")
+
+    # Open-loop WBC is seeded once during init and must not read encoders during
+    # ordinary control ticks.
+    left.reads = right.reads = 0
+    wbc._step()
+    check("open-loop WBC performs no arm reads during a control tick",
+          left.reads == 0 and right.reads == 0,
+          f"left={left.reads} right={right.reads}")
+
+    # The low-level fake can report a different physical state, but open-loop
+    # dispatch must continue from its last command rather than snapping its
+    # reference to that feedback.
+    commanded_before = wbc._commanded_left_q.copy()
+    left.q += 0.25
+    left.reads = 0
+    wbc._step()
+    check("open-loop command reference ignores changed encoder feedback",
+          left.reads == 0 and np.max(np.abs(
+              wbc._commanded_left_q - commanded_before)) <= max_lead + 1e-9,
+          f"reads={left.reads}")
+
+
+def test_arm_joint_deadband():
+    print("\narm joint deadband")
+    wbc, left, right, base = build(arm_joint_deadband_rad=0.05)
+    from types import SimpleNamespace
+
+    left_q = wbc._commanded_left_q.copy()
+    right_q = wbc._commanded_right_q.copy()
+    before_left = left.commands
+    before_right = right.commands
+
+    # Exactly 0.05 rad is inside the band, matching resetToHome's `> 0.05`
+    # test. No low-level command should be emitted for either arm.
+    wbc._dispatch_arms(SimpleNamespace(
+        left_arm_q=left_q + 0.05,
+        right_arm_q=right_q - 0.049,
+    ))
+    check("50 mrad or less holds the previous arm command",
+          left.commands == before_left and right.commands == before_right)
+
+    target = left_q.copy()
+    target[0] += 0.051
+    target[1] += 0.020
+    wbc._dispatch_arms(SimpleNamespace(
+        left_arm_q=target,
+        right_arm_q=right_q,
+    ))
+    # _dispatch_arms only stages the goal now; one dispatch tick sends the
+    # first (and here, only necessary) interpolated sub-step.
+    wbc._arm_dispatch_tick()
+    moved = wbc._commanded_left_q - left_q
+    check("a joint beyond 50 mrad is dispatched", left.commands == before_left + 1,
+          f"joint 1 delta={moved[0]:.3f} rad")
+    check("deadband is applied independently per joint",
+          abs(moved[0] - 0.051) < 1e-12 and abs(moved[1]) < 1e-12,
+          str(moved[:2]))
 
 
 def test_lift_servo():
@@ -193,6 +264,8 @@ def test_lift_without_feedback():
     before = base.lift_state
     for _ in range(20):
         wbc._step()
+        for _ in range(wbc.config.arm_interpolation_steps):
+            wbc._arm_dispatch_tick()
     check("refuses to drive a bang-bang lift blind", base.lift_state == before,
           f"state stayed {base.lift_state}")
 
@@ -229,12 +302,16 @@ def test_fix_base_and_toggles():
         T_l.rotation(), T_l.translation() + np.array([0.0, -1.5, 0.0]))
 
     wbc.toggle_fix_base(True)
+    base_model_before = wbc.ik.configuration.q[wbc.ik.base_qpos_adrs].copy()
     wbc.set_left_ee_target(unreachable)
     base.velocity_commands.clear()
     for _ in range(50):
         wbc._step()
     nonzero = [c for c in base.velocity_commands if np.any(np.abs(c) > 1e-9)]
     check("fix_base suppresses base commands", not nonzero, f"{len(nonzero)} non-zero")
+    check("fix_base suppresses virtual base motion", np.allclose(
+        wbc.ik.configuration.q[wbc.ik.base_qpos_adrs], base_model_before),
+        str(wbc.ik.configuration.q[wbc.ik.base_qpos_adrs]))
 
     wbc.toggle_fix_base(False)
     check("toggle_collision_avoidance flips", wbc.toggle_collision_avoidance() is False)
@@ -242,10 +319,31 @@ def test_fix_base_and_toggles():
     check("toggle_base_motion off", wbc.toggle_base_motion(False) is False)
     check("toggle_base_motion on", wbc.toggle_base_motion(True) is True)
 
+    lift_wbc, *_ = build(enable_base_motion=False, enable_lift_motion=False)
+    lift_before = float(
+        lift_wbc.ik.configuration.q[lift_wbc.ik._lift_qpos_adr]
+    )
+    check("toggle_fix_lift on", lift_wbc.ik.toggle_fix_lift(True) is True)
+    lift_left, _ = lift_wbc.forward_kinematics()
+    lift_goal = mink.SE3.from_rotation_and_translation(
+        lift_left.rotation(), lift_left.translation() + np.array([0.0, -0.4, 0.2]))
+    lift_wbc.set_left_ee_target(lift_goal)
+    for _ in range(50):
+        lift_wbc._step()
+    lift_after = float(
+        lift_wbc.ik.configuration.q[lift_wbc.ik._lift_qpos_adr]
+    )
+    check("fix_lift suppresses virtual lift motion",
+          abs(lift_after - lift_before) < 1e-4,
+          f"{lift_before:.6f} -> {lift_after:.6f}")
+
 
 def test_manual_override():
     print("\nmanual override arbitration")
-    wbc, left, right, base = build()
+    # Keep the override live for the whole deterministic manual-stepping
+    # section; collision-QP runtime varies enough across machines that the
+    # production timeout can otherwise expire before 20 steps complete.
+    wbc, left, right, base = build(manual_override_timeout_s=60.0)
     import mink
     T_l, _ = wbc.forward_kinematics()
     wbc.set_left_ee_target(mink.SE3.from_rotation_and_translation(
@@ -255,6 +353,8 @@ def test_manual_override():
     base.velocity_commands.clear()
     for _ in range(20):
         wbc._step()
+        for _ in range(wbc.config.arm_interpolation_steps):
+            wbc._arm_dispatch_tick()
     nonzero = [c for c in base.velocity_commands if np.any(np.abs(c) > 1e-9)]
     check("base yields to a manual drive command", not nonzero, f"{len(nonzero)} non-zero")
 
@@ -262,6 +362,8 @@ def test_manual_override():
     commands_before = left.commands
     for _ in range(20):
         wbc._step()
+        for _ in range(wbc.config.arm_interpolation_steps):
+            wbc._arm_dispatch_tick()
     check("arms yield to a manual joint command", left.commands == commands_before)
 
     wbc._manual_base_until = 0.0    # expire the window
@@ -269,7 +371,33 @@ def test_manual_override():
     base.velocity_commands.clear()
     for _ in range(20):
         wbc._step()
+        for _ in range(wbc.config.arm_interpolation_steps):
+            wbc._arm_dispatch_tick()
     check("authority returns after the window", left.commands > commands_before)
+
+
+def test_emergency_stop_resume():
+    print("\nemergency-stop / resume lifecycle")
+    wbc, left, right, base = build(enable_base_motion=False)
+    wbc.start()
+    time.sleep(0.05)
+
+    wbc.emergency_stop()
+    commands_at_stop = left.commands
+    check("e-stop removes the finished worker", wbc._thread is None)
+    check("e-stop marks control stopped", wbc._running is False)
+
+    import mink
+    T_l, _ = wbc.forward_kinematics()
+    wbc.set_left_ee_target(mink.SE3.from_rotation_and_translation(
+        T_l.rotation(), T_l.translation() + np.array([0.0, -0.10, 0.0])))
+    wbc.start()
+    time.sleep(0.05)
+    check("start launches a new worker after e-stop",
+          wbc._thread is not None and wbc._thread.is_alive())
+    check("resumed worker dispatches arm commands", left.commands > commands_at_stop,
+          f"{commands_at_stop} -> {left.commands}")
+    wbc.stop()
 
 
 def test_axis_map_and_odometry():
@@ -303,6 +431,7 @@ def test_state_snapshot():
     required = {
         "left_ee_wxyz_xyz", "right_ee_wxyz_xyz", "lift", "base_xytheta",
         "base_velocity", "fix_base", "collision_avoidance",
+        "base_motion_enabled", "lift_motion_enabled", "fix_lift",
     }
     missing = required - set(state)
     check("carries every key the teleop client reads", not missing, str(missing))
@@ -315,12 +444,14 @@ def main() -> int:
     for test in (
         test_init,
         test_arm_tracking,
-        test_arm_step_clamp,
+        test_arm_command_lookahead,
+        test_arm_joint_deadband,
         test_lift_servo,
         test_lift_without_feedback,
         test_base_motion,
         test_fix_base_and_toggles,
         test_manual_override,
+        test_emergency_stop_resume,
         test_axis_map_and_odometry,
         test_state_snapshot,
     ):

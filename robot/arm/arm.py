@@ -37,8 +37,9 @@ class ArmNode:
         can_port: str,
         is_left_arm: bool = True,
         dynamixel_gripper: bool = False,
-        default_kp: Optional[float | list[float]] = 15.0,
-        default_kd: Optional[float | list[float]] = 0.8,
+        native_gripper: bool = False,
+        default_kp: Optional[float | list[float]] = 8.0,
+        default_kd: Optional[float | list[float]] = 1.0,
         gravity_comp_scale: float = 1.0,
         firmware_version=None,
     ):
@@ -59,6 +60,8 @@ class ArmNode:
             self.config = ControllerConfig()
             self.config.interface_name = can_port
             self.config.urdf_path = self.urdf_path
+            # Run nerolib's native interpolation loop at its commissioned rate.
+            self.config.controller_freq_hz = 250.0
             
             # Defines home position (originally in ControllerConfig)
             # UPDATED: Using a safe intermediate home based on current readouts to avoid J1 limits/issues
@@ -86,7 +89,7 @@ class ArmNode:
                 else:
                     self.config.default_kd = [float(x) for x in default_kd]
 
-            self.config.gravity_compensation = False
+            self.config.gravity_compensation = True
             self.config.gravity_comp_scale = gravity_comp_scale
 
             if firmware_version is not None:
@@ -109,7 +112,16 @@ class ArmNode:
         self.q_offset = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
         self.dynamixel_gripper = dynamixel_gripper
+        # The arm's *own* gripper, driven by nerolib over the arm's CAN bus.
+        # YORv3 ships with no gripper on either arm, so this is off by default
+        # and gripper values from the whole-body / teleop path are dropped
+        # rather than sent to an actuator that is not there. Set it True only
+        # when a native gripper is physically fitted.
+        self.native_gripper = bool(native_gripper)
         self.gripper = None
+
+        if not self.native_gripper and not self.dynamixel_gripper:
+            print(f"[ArmNode] {can_port}: no gripper fitted — gripper control disabled")
 
         if self.dynamixel_gripper:
             # If your Gripper class uses /dev/ttyUSB0 internally, this will fail when unplugged.
@@ -136,10 +148,11 @@ class ArmNode:
 
 
 
-    def init(self):
+    def init(self) -> bool:
+        """Move all seven joints through nerolib's coordinated home trajectory."""
         if self.nero is None:
             print("[ArmNode] Warning: Nero not initialized, init() skipping hardware calls.")
-            return
+            return False
 
         # Move to home position
         print(f"[ArmNode] Moving to home position...")
@@ -147,6 +160,7 @@ class ArmNode:
         
         q = self.get_joint_positions()
         print(f"q_reached: {np.round(q, 4)}")
+        return True
 
 
     def home(self, gripper_target: float = 1.0):
@@ -164,7 +178,7 @@ class ArmNode:
         self.set_joint_target(np.zeros(7), gripper_target=1.00, preview_time=2.0)
 
     def set_joint_target(
-        self, joint_target: np.ndarray, gripper_target: float | None = None, preview_time: float = 0.1
+        self, joint_target: np.ndarray, gripper_target: float | None = None, preview_time: float = 0.01
     ):
         if self.nero:
             try:
@@ -174,9 +188,12 @@ class ArmNode:
                 
                 target_pos = (joint_target + self.q_offset).tolist()
                 
-                # Nerolib expects normalized gripper position (0 for close, 1 for fully open)
+                # Nerolib expects normalized gripper position (0 for close, 1 for fully open).
+                # With no native gripper fitted the field still has to be sent, but it is
+                # pinned open so a teleop gripper value can never command a missing
+                # actuator; the dynamixel gripper, when present, is driven separately below.
                 target_gripper = 1.0
-                if gripper_target is not None:
+                if gripper_target is not None and self.native_gripper:
                     target_gripper = float(gripper_target)
                 
                 self.nero.set_target(
@@ -192,20 +209,20 @@ class ArmNode:
             self.gripper.move_to_pos(int(gripper_target * self.gripper_range + self.close_gripper_value))
 
     def open_gripper(self):
-        if not self.dynamixel_gripper:
+        if self.dynamixel_gripper:
+            self.gripper.move_to_pos(self.open_gripper_value)
+        elif self.native_gripper:
             q = self.get_joint_positions()
             self.set_joint_target(q, gripper_target=1.0)  
             time.sleep(0.5)
-        else:
-            self.gripper.move_to_pos(self.open_gripper_value)
 
     def close_gripper(self):
-        if not self.dynamixel_gripper:
+        if self.dynamixel_gripper:
+            self.gripper.move_to_pos(self.close_gripper_value)
+        elif self.native_gripper:
             q = self.get_joint_positions()
             self.set_joint_target(q, gripper_target=0.0)
             time.sleep(0.5)
-        else:
-            self.gripper.move_to_pos(self.close_gripper_value)
 
     def set_gain(self, kp, kd):
         """
@@ -277,7 +294,7 @@ class ArmNode:
                 new_target_gripper_pos=self.get_gripper_pose(),
                 minimum_duration=0.0
             )
-            # Give the C++ control loop (500Hz) a few cycles to ingest this 
+            # Give the 250 Hz C++ control loop a few cycles to ingest this
             # and 'snap' its internal trajectory state before we change gains.
             time.sleep(0.02)
 

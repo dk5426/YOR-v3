@@ -14,8 +14,11 @@
 # whole-body loop's authority over that subsystem for a moment
 # (manual_override_timeout_s), so the two controllers never fight over the
 # same actuator.
+
 import sys
+import argparse
 import functools
+import threading
 import time
 import numpy as np
 import mink
@@ -32,12 +35,15 @@ if str(_ROOT) not in sys.path:
 from robot.arm.arm import ArmNode
 from robot.base import BaseController
 from robot.wholebody_control import WholeBodyController, WholeBodyHardwareConfig
+from tools.base_pid_preflight import DEFAULT_MANIFEST, sync_from_manifest
 from commlink import RPCServer
 from nerolib import FirmwareVersion
 
 THOR_IP = '192.168.1.11'
 
 YOR_PORT = 5557
+LIFT_STARTUP_HOME_WAIT_S = 30.0
+LIFT_STARTUP_HEIGHT_M = 0.450
 
 
 def require_initialization(func):
@@ -70,8 +76,12 @@ class YOR():
         no_arms: bool = False,
         wholebody: bool = True,
         wholebody_config: Optional[WholeBodyHardwareConfig] = None,
+        flash_base_pid: bool = True,
+        base_pid_manifest: Optional[Path] = None,
     ):
         self._initialized = False
+        self._flash_base_pid = bool(flash_base_pid)
+        self._base_pid_manifest = Path(base_pid_manifest) if base_pid_manifest else DEFAULT_MANIFEST
 
         self.slam_sub = None
         self._reset_nav = False
@@ -84,7 +94,16 @@ class YOR():
             base_max_accel=base_max_accel,
             origin=(0.0, 0.0),
             grid_res=0.05,
+            # Navigation closes on the 20 Hz SLAM pose, so it is paced by it.
             control_hz=20,
+            # Whole-body control now publishes base commands at 30 Hz
+            # (WholeBodyHardwareConfig.control_hz). The relay is deliberately
+            # kept faster than that, not matched to it: it only has to stay at
+            # or above the producer's rate to never discard a solver update,
+            # and 108 Hz also preserves the swerve loop's own 3x-oversampled
+            # S-curve profiling (base_motor.py CONTROL_FREQ = 324 = 108 * 3),
+            # which has no reason to be retuned here.
+            relay_hz=108,
         )
         self.base = self.base_controller.base
         self.no_arms = no_arms
@@ -93,18 +112,24 @@ class YOR():
         self.wholebody: Optional[WholeBodyController] = None
         self._wholebody_requested = wholebody and not no_arms
         self._wholebody_config = wholebody_config
+        self._homing_lock = threading.Lock()
 
         if not self.no_arms:
+            # Neither gripper is fitted on this robot, so both gripper paths are
+            # switched off explicitly: a gripper value arriving from teleop is
+            # dropped rather than sent to an actuator that is not there.
             self.left_arm = ArmNode(
                 can_port="can_left",
                 dynamixel_gripper=False,
-                firmware_version=FirmwareVersion.DEFAULT,
+                native_gripper=False,
+                firmware_version=FirmwareVersion.V111,
             )
             self.right_arm = ArmNode(
                 can_port="can_right",
                 is_left_arm=False,
                 dynamixel_gripper=False,
-                firmware_version=FirmwareVersion.DEFAULT,
+                native_gripper=False,
+                firmware_version=FirmwareVersion.V111,
             )
 
     def init(self):
@@ -112,17 +137,74 @@ class YOR():
             print("Warning: YOR already initialized")
             return
 
-        # Start the SparkFlex control loop
+        # The commissioned swerve gains, before anything drives a wheel. The
+        # SPARKs hold them in RAM, so a controller power cycle silently
+        # restores stock gains and that one module then steers and drives
+        # unlike its three neighbours.
+        self._sync_base_pid_gains()
+
+        # Actively hold the chassis still throughout startup homing.
+        print("[YOR] base: locked at zero velocity for startup homing")
+        self.base_controller.mode = "BASE_VEL"
+        self.base_controller.target_velocity = np.zeros(3, dtype=float)
         self.base.start_control()
+        self.base.set_target_base_velocity(np.zeros(3), smooth=False)
         time.sleep(0.5)
 
-        # No homing needed for Pico lift; ignore if present
-        time.sleep(0.5)
+        # Wait for the lift controller to finish booting before sending home.
+        print("[YOR] lift: waiting for controller to be ready...")
+        ready_start = time.time()
+        while time.time() - ready_start < 3.0:
+            if self.base._pico_lift.get_capabilities():
+                break
+            time.sleep(0.1)
 
-        # Arms remain optional
+        # Establish an absolute lift zero, then move to the arm-safe height.
+        print(
+            f"[YOR] lift: homing at startup; waiting up to "
+            f"{LIFT_STARTUP_HOME_WAIT_S:.0f}s"
+        )
+        self.base.lift_home()
+        home_start = time.time()
+        while time.time() - home_start < LIFT_STARTUP_HOME_WAIT_S:
+            lift_status = self.base.get_lift_status()
+            if lift_status.get("homed") is True:
+                break
+            time.sleep(0.5)
+
+        lift_status = self.base.get_lift_status()
+        if (
+            not lift_status.get("available", False)
+            or lift_status.get("homed") is not True
+            or lift_status.get("position_known") is not True
+        ):
+            self.base.lift_stop()
+            raise RuntimeError(
+                "lift startup home did not complete within 30s: "
+                f"homed={lift_status.get('homed')}, "
+                f"position_known={lift_status.get('position_known')}, "
+                f"last_event={lift_status.get('last_event')!r}"
+            )
+        print(f"[YOR] lift: home complete at {lift_status.get('height_m')} m")
+
+        print(f"[YOR] lift: moving to {LIFT_STARTUP_HEIGHT_M * 1000:.0f} mm from zero")
+        if not self.base.lift_to_height(LIFT_STARTUP_HEIGHT_M):
+            self.base.lift_stop()
+            raise RuntimeError(
+                f"lift startup move to {LIFT_STARTUP_HEIGHT_M * 1000:.0f} mm "
+                "did not complete"
+            )
+        print(f"[YOR] lift: startup position {self.base.get_lift_height()} m")
+
+        # Home the arms sequentially so only one arm moves at a time.
         if not self.no_arms:
-            self.left_arm.init()
-            self.right_arm.init()
+            print("[YOR] arms: homing all 7 left-arm joints")
+            if not self.left_arm.init():
+                raise RuntimeError("left arm joint homing did not complete")
+            print("[YOR] arms: left arm home; homing all 7 right-arm joints")
+            if not self.right_arm.init():
+                raise RuntimeError("right arm joint homing did not complete")
+            print("[YOR] arms: all joints home")
 
         self._initialized = True
 
@@ -134,7 +216,48 @@ class YOR():
                 base_controller=self.base_controller,
                 config=self._wholebody_config,
             )
+            if not self.wholebody.config.enable_base_motion:
+                self.wholebody.toggle_fix_base(True)
+            if not self.wholebody.config.enable_lift_motion:
+                self.wholebody.ik.toggle_fix_lift(True)
             self.wholebody.start()
+
+    def _sync_base_pid_gains(self) -> None:
+        """Bring the swerve controllers to config/base_pid_manifest.json.
+
+        Runs through the SparkFlex objects base_motor.py already opened, and
+        before base.start_control(): no second set of device handles touches
+        the bus, and the control loop is not yet sending setpoints. Each
+        controller is read first and written only if it differs, so a restart
+        that did not power-cycle the SPARKs writes nothing.
+
+        Raises if any controller cannot be brought to the commissioned values.
+        Driving on gains nobody can name is the failure this exists to prevent,
+        and it is far harder to diagnose from the robot's behaviour than a
+        refusal to start. Pass flash_base_pid=False to start without it; the
+        same check is still available as `python tools/base_pid_preflight.py`.
+        """
+        if not self._flash_base_pid:
+            print("[YOR] base PID sync skipped (flash_base_pid=False)")
+            return
+
+        print("[YOR] base PID: syncing swerve gains")
+        started = time.time()
+        ok, problems = sync_from_manifest(
+            self.base.swerve_devices(),
+            manifest_path=self._base_pid_manifest,
+            log=lambda line: print(f"[YOR] base PID: {line}"),
+        )
+        print(f"[YOR] base PID: {time.time() - started:.1f}s")
+
+        if not ok:
+            for problem in problems:
+                print(f"[YOR] base PID: {problem}")
+            raise RuntimeError(
+                f"swerve PID sync failed with {len(problems)} problem(s); the base "
+                "control loop was not started. Fix the CAN bus or the manifest, or "
+                "construct YOR with flash_base_pid=False to start without it."
+            )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Base — direct control (joystick, nav). Suspends whole-body base authority.
@@ -279,6 +402,33 @@ class YOR():
         self.base.lift_home()
 
     @require_initialization
+    def lift_set_velocity(self, velocity_m_s: float) -> bool:
+        """Stream a lift velocity in metres per second: + is up, - is down.
+
+        Direct control, like lift_up/lift_down/lift_stop: it suspends the
+        whole-body loop's authority over the lift for manual_override_timeout_s
+        so the two never fight over the column. The firmware stops by itself if
+        no command arrives for 300 ms, so a caller that wants continuous motion
+        must keep calling — at least every 100 ms.
+
+        Returns False when the value is not a finite number, or when the
+        attached controller cannot stream velocity; check
+        lift_supports_velocity() first.
+        """
+        if not hasattr(self.base, "lift_set_velocity"):
+            print("[YOR] base has no lift_set_velocity()")
+            return False
+        self._manual_lift()
+        return bool(self.base.lift_set_velocity(velocity_m_s))
+
+    @require_initialization
+    def lift_supports_velocity(self) -> bool:
+        """Whether the attached lift firmware advertised streamed velocity."""
+        if not hasattr(self.base, "lift_supports_velocity"):
+            return False
+        return bool(self.base.lift_supports_velocity())
+
+    @require_initialization
     def get_lift_height(self) -> float:
         return self.base.get_lift_height()
 
@@ -395,17 +545,102 @@ class YOR():
             L_preview_time=L_preview_time, R_preview_time=R_preview_time,
         )
 
-    @require_initialization
-    @require_wholebody
-    def home_left_arm(self):
-        """Reset the left EE target to its home pose (the solver drives there)."""
-        self.wholebody.home_left_arm()
+    def _home_arm_joints(self, sides: tuple[str, ...]) -> bool:
+        """Run the Quest arm-home sequence with exclusive actuator ownership."""
+        if self.no_arms:
+            print("[YOR] arm homing refused: arms are disabled")
+            return False
+        if not self._homing_lock.acquire(blocking=False):
+            print("[YOR] arm homing already in progress")
+            return False
+
+        active_wholebody = self.wholebody
+        runtime_config = (
+            active_wholebody.config
+            if active_wholebody is not None
+            else self._wholebody_config
+        )
+        previous_fix_base = False
+        previous_fix_lift = False
+        previous_collisions = True
+        try:
+            if active_wholebody is not None:
+                previous_fix_base = bool(active_wholebody.ik.fix_base)
+                previous_fix_lift = bool(active_wholebody.ik.fix_lift)
+                previous_collisions = bool(active_wholebody.ik.avoid_collisions)
+                active_wholebody.toggle_fix_base(True)
+
+            print("[YOR] Quest home: locking base at zero velocity")
+            self.base_controller.mode = "BASE_VEL"
+            self.base_controller.target_velocity = np.zeros(3, dtype=float)
+            self.base.set_target_base_velocity(np.zeros(3), smooth=False)
+            time.sleep(0.1)
+
+            if active_wholebody is not None:
+                active_wholebody.stop()
+                self.wholebody = None
+
+            lift_status = self.base.get_lift_status()
+            if lift_status.get("position_known") is not True:
+                raise RuntimeError(
+                    "lift position is unknown; restart the hardware node to home the lift"
+                )
+
+            print(
+                f"[YOR] Quest home: moving lift to "
+                f"{LIFT_STARTUP_HEIGHT_M * 1000:.0f} mm from zero"
+            )
+            if not self.base.lift_to_height(LIFT_STARTUP_HEIGHT_M):
+                raise RuntimeError("lift did not reach the 450 mm arm-home height")
+
+            for side in sides:
+                arm = self.left_arm if side == "left" else self.right_arm
+                print(f"[YOR] Quest home: homing all 7 {side}-arm joints")
+                if not arm.init():
+                    raise RuntimeError(f"{side} arm joint homing did not complete")
+
+            # Seed a fresh controller from the new joint and lift state so a
+            # stale pre-home target cannot pull the arm back after resuming.
+            if self._wholebody_requested:
+                self.wholebody = WholeBodyController(
+                    left_arm=self.left_arm,
+                    right_arm=self.right_arm,
+                    base=self.base,
+                    base_controller=self.base_controller,
+                    config=runtime_config,
+                )
+                self.wholebody.toggle_fix_base(previous_fix_base)
+                self.wholebody.ik.toggle_fix_lift(previous_fix_lift)
+                self.wholebody.toggle_collision_avoidance(previous_collisions)
+                self.wholebody.start()
+
+            print("[YOR] Quest home: complete")
+            return True
+        except Exception as exc:
+            self.base_controller.mode = "BASE_VEL"
+            self.base_controller.target_velocity = np.zeros(3, dtype=float)
+            self.base.set_target_base_velocity(np.zeros(3), smooth=False)
+            self.base.lift_stop()
+            self.wholebody = None
+            print(f"[YOR] Quest home failed: {exc}")
+            return False
+        finally:
+            self._homing_lock.release()
 
     @require_initialization
-    @require_wholebody
-    def home_right_arm(self):
-        """Reset the right EE target to its home pose (the solver drives there)."""
-        self.wholebody.home_right_arm()
+    def home_left_arm(self) -> bool:
+        """Quest Y: lock base, lift to 450 mm, then home all left joints."""
+        return self._home_arm_joints(("left",))
+
+    @require_initialization
+    def home_right_arm(self) -> bool:
+        """Quest B: lock base, lift to 450 mm, then home all right joints."""
+        return self._home_arm_joints(("right",))
+
+    @require_initialization
+    def home_arms(self) -> bool:
+        """Quest Y+B: run one lift preamble, then home left and right arms."""
+        return self._home_arm_joints(("left", "right"))
 
     @require_initialization
     @require_wholebody
@@ -539,6 +774,10 @@ class YOR():
                 base_controller=self.base_controller,
                 config=self._wholebody_config,
             )
+            if not self.wholebody.config.enable_base_motion:
+                self.wholebody.toggle_fix_base(True)
+            if not self.wholebody.config.enable_lift_motion:
+                self.wholebody.ik.toggle_fix_lift(True)
         self.wholebody.start()
         return True
 
@@ -639,16 +878,60 @@ class YOR():
 
 
 def main():
-    yor = YOR(no_arms=False)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--flash-base-pid", action=argparse.BooleanOptionalAction, default=True,
+        help="sync the swerve PID gains from the manifest before the base control "
+             "loop starts, writing only the controllers that differ (default: on). "
+             "--no-flash-base-pid starts on whatever gains the controllers hold, "
+             "which after a SPARK power cycle are the stock ones")
+    parser.add_argument(
+        "--base-pid-manifest", type=Path, default=None, metavar="PATH",
+        help=f"PID manifest to sync from (default: {DEFAULT_MANIFEST})")
+    parser.add_argument(
+        "--no-arms", action="store_true",
+        help="skip both arm controllers and their startup joint homing")
+    parser.add_argument(
+        "--no-base-motion", action="store_true",
+        help="keep the whole-body IK base fixed and disable wheel dispatch")
+    parser.add_argument(
+        "--no-lift-motion", action="store_true",
+        help="keep the whole-body IK lift fixed and disable lift dispatch")
+    args = parser.parse_args()
+
+    wholebody_config = WholeBodyHardwareConfig(
+        enable_base_motion=not args.no_base_motion,
+        enable_lift_motion=not args.no_lift_motion,
+    )
+
+    yor = YOR(
+        no_arms=args.no_arms,
+        wholebody_config=wholebody_config,
+        flash_base_pid=args.flash_base_pid,
+        base_pid_manifest=args.base_pid_manifest,
+    )
     yor.init()
     server = RPCServer(yor, port=YOR_PORT, threaded=True)
 
+    shutdown_started = False
+
     def graceful_shutdown():
+        nonlocal shutdown_started
+        if shutdown_started:
+            return
+        shutdown_started = True
+
         print("\nRPC Server stopping...")
-        server.stop()
 
         if yor.wholebody is not None:
             yor.wholebody.stop()
+
+        # Stop hardware workers before RPC teardown/interpreter shutdown so
+        # PicoLift cannot keep reconnecting after Ctrl-C.
+        yor.base.stop_control()
+        yor.base._pico_lift._shutdown()
+
+        server.stop()
 
         if not yor.no_arms:
             if yor.left_arm is not None:
@@ -661,8 +944,13 @@ def main():
 
     atexit.register(graceful_shutdown)
     server.start()
-    while True:
-        time.sleep(1)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        graceful_shutdown()
 
 
 if __name__ == "__main__":

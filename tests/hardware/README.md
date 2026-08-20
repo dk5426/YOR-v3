@@ -123,11 +123,24 @@ standing still, is far cheaper than catching it at speed.
 column; no cables that snag over the full travel.
 
 Homing, the position-known contract, absolute moves through the firmware's
-motion profile, stop responsiveness, and the travel constant against a tape
-measure.
+motion profile, stop responsiveness, the streamed-velocity mode, and the travel
+constant against a tape measure.
 
 Run this before any whole-body test: the solver uses the lift as a DOF and
 trusts `get_lift_height()` completely.
+
+The velocity stages are the ones to watch, because that is the path the
+whole-body loop now uses. They run in increasing order of consequence — ±5 mm/s,
+±10 mm/s, zero hold, reversal, command timeout, limit switches — and the first
+of them checks that the controller advertises `lift_velocity_v1` at all. If it
+does not, the board still has the older sketch: flash
+`firmware/lift_controller/` before reading anything into the results, because
+the whole-body loop falls back to bang-bang up/down/stop without it.
+
+The command-timeout stage is the most important single check in this file. It
+is the only thing that stops the column if the host process dies mid-move: the
+firmware ramps to zero 300 ms after the last `vel` command and opens the driver
+relay.
 
 The travel check matters more than it looks. That number is duplicated in five
 places (firmware, `base_motor.py`, `yor.py`, `wholebody_teleop.py`, the MJCF)
@@ -227,7 +240,7 @@ print a follow-up line naming the constant or file to look at. Beyond that:
 | Rotation translates | `LENGTH`/`WIDTH` do not match the real module positions |
 | One wheel does not move | that module's CAN link or encoder — `test_00` names which |
 | Solver not converging | the node console prints the solver error; often an unreachable EE target |
-| Arms drift from the model | `use_measured_arm_state` off, or an arm encoder is wrong — collision avoidance is now unsafe |
+| Arms drift from the model | WBC is configured open-loop (`use_measured_arm_state=False`); stop immediately because model-based collision avoidance no longer represents the physical arm pose |
 | SLAM pose jitters at rest | lighting and texture, or the Odin is not rigidly mounted |
 | SLAM translates during a pure spin | `T_cam_to_base` in `config/odin.yaml` is wrong |
 

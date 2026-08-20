@@ -13,6 +13,9 @@ Input backends (pick with --input):
   keyboard  Terminal keys, zero extra deps (default; runs anywhere).
   gamepad   Xbox / PS4 controller via pygame.
   oculus    Meta Quest controllers via ZMQ (reuses oculus_msgs protocol).
+            Controller poses are 1€-filtered on arrival — tune with
+            --filter-min-cutoff / --filter-beta, or disable with
+            --no-pose-filter.
 
 Run
 ---
@@ -56,7 +59,14 @@ _REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO))
 
 from commlink import RPCClient
+from robot.teleop.filters import PoseFilter
 
+# Quest tracking arrives at approximately 72 Hz (may change -- unconfirmed) and
+# is 1-euro filtered on OculusSource's own receive thread at that native rate,
+# independent of this loop's own rate. This client tick just samples whatever
+# pose the filter last produced, so it does not need to divide evenly into the
+# Quest rate. 30 Hz matches the whole-body controller's own dispatch rate on
+# hardware -- see WholeBodyHardwareConfig.control_hz in wholebody_control.py.
 LOOP_RATE = 30  # Hz
 # Matches the "Slider 7" range in description/robot_wholebody.xml; the server
 # clamps to the model regardless, this just keeps the client's own bookkeeping
@@ -103,6 +113,7 @@ class TeleopCommand:
     lift_target: Optional[float] = None
     home_left: bool = False
     home_right: bool = False
+    home_arms: bool = False
     home_lift: bool = False
     toggle_fix_base: bool = False
     toggle_collisions: bool = False
@@ -294,24 +305,50 @@ class OculusSource(InputSource):
     X (left) / A (right) toggle per-arm engagement. While engaged, the arm
     target follows the controller's pose delta since engagement (position and
     orientation), using the same frame decomposition as the hardware teleop.
-    Y / B home the arms. Right thumbstick Y drives the lift.
+    Y / B run the safe home sequence for the left / right arm; pressing Y+B
+    together homes both after a single base-lock and lift-to-450-mm preamble.
+    Right thumbstick Y drives the lift.
+
+    Poses are 1€-filtered as they arrive (see robot/teleop/filters.py), at the
+    headset's ~72 Hz rather than the 30 Hz teleop loop, so tracker jitter does
+    not reach the IK and a tracking dropout holds the target instead of
+    throwing it. Pass pose_filter=False to stream the raw poses.
     """
 
     VR_CONTROLLER_TOPIC = b"oculus_controller"
     LIFT_SPEED = 0.15  # m/s at full stick
 
-    def __init__(self, host: str, port: int = 5555):
+    def __init__(self, host: str, port: int = 5555, pose_filter: bool = True,
+                 filter_min_cutoff: float = 3.0, filter_beta: float = 8.0,
+                 yaw_correction_deg: float = 270.0):
         self.host, self.port = host, port
+        self._filters = {
+            side: PoseFilter(min_cutoff=filter_min_cutoff,
+                             rot_min_cutoff=filter_min_cutoff,
+                             beta=filter_beta)
+            for side in ("left", "right")
+        } if pose_filter else {}
+        self._last_glitch_report = 0.0
+        self._reported_drops = 0
         # controller frame → robot frame
         self.H = mink.SE3.from_rotation(mink.SO3.from_matrix(
             np.array([[0, -1, 0], [0, 0, 1], [-1, 0, 0]])
         ))
+        # The Quest tracking space is fixed, but its planar axes are rotated
+        # relative to the robot as it sits in the room.  Keep this calibration
+        # separate from H: it rotates only translation about robot Z and must
+        # not change the controller-local orientation mapping.
+        self.translation_yaw_correction = mink.SO3.from_z_radians(
+            np.deg2rad(float(yaw_correction_deg))
+        )
+        self.yaw_correction_deg = float(yaw_correction_deg)
         self._latest = None
         self._latest_lock = threading.Lock()
         self._stop = threading.Event()
         self._engaged = {"left": False, "right": False}
         self._clutch: dict[str, tuple[mink.SE3, mink.SE3]] = {}
         self._debounce: dict[str, float] = {}
+        self._button_down: dict[str, bool] = {}
 
     def start(self) -> None:
         import zmq  # deferred so keyboard mode needs no zmq
@@ -336,15 +373,43 @@ class OculusSource(InputSource):
             try:
                 _, message = sock.recv_multipart()
                 cs = self._parse(message.decode())
+                poses = self._filtered(cs)
                 with self._latest_lock:
-                    self._latest = cs
+                    self._latest = (cs, poses)
             except self._zmq.ZMQError:
                 pass  # timeout — loop and re-check stop flag
         sock.close()
         ctx.destroy()
 
+    def _filtered(self, cs) -> dict[str, mink.SE3]:
+        """Smooth this sample's controller poses (identity if filtering is off).
+
+        Runs on the receive thread so the filters see every message the headset
+        sends, not just the ones the 30 Hz teleop loop happens to pick up.
+        """
+        poses = {"left": cs.left_SE3, "right": cs.right_SE3}
+        if not self._filters:
+            return poses
+        for side, filt in self._filters.items():
+            poses[side] = filt(poses[side], cs.created_timestamp)
+
+        # Report dropouts, but at most every couple of seconds and only when
+        # the count has actually moved — this runs at ~72 Hz.
+        dropped = sum(f.rejected for f in self._filters.values())
+        now = time.time()
+        if dropped > self._reported_drops and now - self._last_glitch_report > 2.0:
+            print(f"\n[oculus] dropped {dropped - self._reported_drops} pose "
+                  f"samples as tracking glitches ({dropped} total)")
+            self._reported_drops, self._last_glitch_report = dropped, now
+        return poses
+
     def _debounced(self, name: str, value: bool) -> bool:
-        if value:
+        # A long-running home RPC can outlast the old time-only debounce. Use
+        # a rising edge as well, so holding Y/B never launches a second home
+        # the instant the first one returns.
+        was_down = self._button_down.get(name, False)
+        self._button_down[name] = bool(value)
+        if value and not was_down:
             now = time.time()
             if now - self._debounce.get(name, 0.0) > BUTTON_DEBOUNCE_TIME:
                 self._debounce[name] = now
@@ -356,32 +421,55 @@ class OculusSource(InputSource):
         """Controller delta → EE target (translate + rotate decomposed)."""
         X_Cdelta = X_Cinit.inverse().multiply(X_Ctarget)
         X_Rdelta = self.H.inverse() @ X_Cdelta @ self.H
-        target_pos = X_ee_init.translation() + X_Rdelta.translation()
+
+        # Translation belongs to the fixed Quest tracking frame.  Taking it
+        # from X_Cdelta would express it in the controller's local frame at
+        # clutch time, making merely tilting the controller rotate the meaning
+        # of "forward".  Map the tracking-frame displacement into robot axes,
+        # then apply the room calibration about robot Z.
+        controller_displacement = (
+            X_Ctarget.translation() - X_Cinit.translation()
+        )
+        robot_displacement = self.H.rotation().inverse().apply(
+            controller_displacement
+        )
+        target_pos = (
+            X_ee_init.translation()
+            + self.translation_yaw_correction.apply(robot_displacement)
+        )
         target_rot = X_ee_init.rotation() @ X_Rdelta.rotation()
         return mink.SE3(np.concatenate([target_rot.wxyz, target_pos]))
 
     def update(self, state: TeleopState, dt: float) -> TeleopCommand:
         cmd = TeleopCommand()
         with self._latest_lock:
-            cs = self._latest
-        if cs is None:
+            latest = self._latest
+        if latest is None:
             return cmd
+        cs, poses = latest
+        home_pressed: dict[str, bool] = {}
 
         for side, engage_btn, home_btn, ctrl_T, tgt_attr in (
-            ("left",  cs.left_x,  cs.left_y,  cs.left_SE3,  "left_target"),
-            ("right", cs.right_a, cs.right_b, cs.right_SE3, "right_target"),
+            ("left",  cs.left_x,  cs.left_y,  poses["left"],  "left_target"),
+            ("right", cs.right_a, cs.right_b, poses["right"], "right_target"),
         ):
             if self._debounced(f"{side}_engage", engage_btn):
                 self._engaged[side] = not self._engaged[side]
                 if self._engaged[side]:
                     self._clutch[side] = (ctrl_T, getattr(state, tgt_attr))
                 print(f"[oculus] {side} {'engaged' if self._engaged[side] else 'disengaged'}")
-            if self._debounced(f"{side}_home", home_btn):
+            home_pressed[side] = self._debounced(f"{side}_home", home_btn)
+            if home_pressed[side]:
                 self._engaged[side] = False
                 setattr(cmd, f"home_{side}", True)
             if self._engaged[side]:
                 X_Cinit, X_ee_init = self._clutch[side]
                 setattr(cmd, tgt_attr, self._ee_target(X_Cinit, X_ee_init, ctrl_T))
+
+        if home_pressed.get("left") and home_pressed.get("right"):
+            cmd.home_left = False
+            cmd.home_right = False
+            cmd.home_arms = True
 
         stick_y = apply_deadzone(np.array([cs.right_thumbstick_axes[1]]))[0]
         if stick_y != 0.0:
@@ -426,14 +514,29 @@ class WholeBodyTeleop:
 
     def _dispatch(self, cmd: TeleopCommand) -> None:
         st = self.state
-        if cmd.home_left:
-            self.yor.home_left_arm()
-            st.left_target = mink.SE3(np.array(self.yor.get_state()["left_ee_wxyz_xyz"]))
-            print("\n[teleop] left arm → home")
-        if cmd.home_right:
-            self.yor.home_right_arm()
-            st.right_target = mink.SE3(np.array(self.yor.get_state()["right_ee_wxyz_xyz"]))
-            print("\n[teleop] right arm → home")
+        home_result = None
+        home_label = None
+        if cmd.home_arms:
+            home_result = self.yor.home_arms()
+            home_label = "both arms"
+        elif cmd.home_left:
+            home_result = self.yor.home_left_arm()
+            home_label = "left arm"
+        elif cmd.home_right:
+            home_result = self.yor.home_right_arm()
+            home_label = "right arm"
+
+        if home_label is not None:
+            if home_result:
+                srv = self.yor.get_state()
+                st.left_target = mink.SE3(np.array(srv["left_ee_wxyz_xyz"]))
+                st.right_target = mink.SE3(np.array(srv["right_ee_wxyz_xyz"]))
+                st.lift_target = float(srv["lift"])
+                st.fix_base = bool(srv["fix_base"])
+                st.collision_avoidance = bool(srv["collision_avoidance"])
+                print(f"\n[teleop] {home_label} home sequence complete")
+            else:
+                print(f"\n[teleop] {home_label} home sequence FAILED")
         if cmd.home_lift:
             self.yor.lift_home()
             st.lift_target = float(self.yor.get_state()["lift"])
@@ -508,6 +611,15 @@ def main() -> None:
     parser.add_argument("--rate", type=int, default=LOOP_RATE, help="loop rate (Hz)")
     parser.add_argument("--oculus-host", default="10.21.116.241",
                         help="Quest headset IP (oculus input only)")
+    parser.add_argument("--no-pose-filter", action="store_true",
+                        help="stream raw Quest poses (skip 1€ filtering)")
+    parser.add_argument("--filter-min-cutoff", type=float, default=3.0,
+                        help="1€ cutoff (Hz) at rest — lower = smoother, laggier")
+    parser.add_argument("--filter-beta", type=float, default=8.0,
+                        help="1€ speed coefficient — higher = more responsive "
+                             "while moving, passes more jitter")
+    parser.add_argument("--oculus-yaw-correction", type=float, default=270.0,
+                        help="CCW Quest-to-robot XY correction in degrees")
     parser.add_argument("--step", type=float, default=0.02,
                         help="keyboard nudge step in metres")
     args = parser.parse_args()
@@ -519,7 +631,11 @@ def main() -> None:
     elif args.input == "gamepad":
         source = GamepadSource()
     else:
-        source = OculusSource(host=args.oculus_host)
+        source = OculusSource(host=args.oculus_host,
+                              pose_filter=not args.no_pose_filter,
+                              filter_min_cutoff=args.filter_min_cutoff,
+                              filter_beta=args.filter_beta,
+                              yaw_correction_deg=args.oculus_yaw_correction)
 
     print(f"[teleop] target = {args.target}")
     WholeBodyTeleop(source, host=args.host, port=port, rate_hz=args.rate).run()

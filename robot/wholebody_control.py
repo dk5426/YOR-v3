@@ -7,19 +7,27 @@ solver (robot/arm/wholebody_ik.py) over the same description
 configuration comes from and where the solution is dispatched:
 
                         simulation                  hardware
-    measure     data.qpos (previous solve)   arm encoders, lift height,
-                                             base odometry
+    measure     data.qpos (previous solve)   arm startup seed / previous command,
+                                             lift height, base odometry
     dispatch    data.qpos + mj_forward       ArmNode.set_joint_target()   ×2
                                              PicoLift up/down/stop
                                              Base.set_target_base_velocity()
 
-Control flow, once per cycle (default 100 Hz):
+Control flow, once per cycle (default 30 Hz):
 
   1. read measured state and push it into the IK configuration
   2. solve whole-body IK for the current EE / lift targets
   3. dispatch arms, lift and base, each with its own clamp and its own
      enable flag
   4. integrate the commanded base velocity into the odometry estimate
+
+Lift and base are dispatched directly from that 30 Hz loop. Arms are not: each
+solved joint target is handed to a second, faster loop (default 90 Hz, see
+`_arm_dispatch_tick`/`_arm_dispatch_loop`) that interpolates it against the
+previous target over a few fixed sub-steps before sending anything to
+nerolib. This reproduces YOR_D's own arm-commanding chain -- a Cartesian
+target arriving no faster than 30 Hz, smoothed by frequent, short-duration
+joint commands rather than one coarse command per solve tick.
 
 Three things are worth knowing before running this on the robot:
 
@@ -42,9 +50,12 @@ Three things are worth knowing before running this on the robot:
   before enabling base motion — a wrong sign means the robot drives the wrong
   way while trying to help the arms reach.
 
-* **The lift is bang-bang.** PicoLift only knows up / down / stop, so the loop
-  runs a deadband servo against the solver's lift command rather than sending
-  a position.
+* **The lift has two dispatch paths.** Against a controller that advertises
+  `lift_velocity_v1`, the loop runs a position PD against measured height and
+  streams the resulting velocity, which the firmware then shapes. Against an
+  older controller — which only knows up / down / stop — it falls back to the
+  original deadband bang-bang servo. Either way `set_lift_target()` takes a
+  height in metres: the teleop client cannot tell the two apart.
 """
 
 from __future__ import annotations
@@ -101,28 +112,94 @@ class BaseAxisMap:
 class WholeBodyHardwareConfig:
     """Rates, clamps and enables for the hardware whole-body loop."""
 
-    control_hz: float = 100.0
+    # One solve tick per 30 Hz teleop target -- matches the teleop client's
+    # LOOP_RATE (robot/teleop/wholebody_teleop.py). The base relay deliberately
+    # runs faster than this (108 Hz, see robot/yor.py) rather than matching it,
+    # so it never falls behind; the swerve loop's own 3x-oversampled S-curve
+    # profiling (base_motor.py CONTROL_FREQ) is unaffected by this rate.
+    control_hz: float = 30.0
 
     # ── Arms ────────────────────────────────────────────────────────────────
     enable_arm_motion: bool = True
-    # Passed to nerolib as the minimum duration of the commanded move; it also
-    # smooths the 500 Hz interpolation inside the controller.
-    arm_preview_time: float = 0.05
-    # Hard cap on how fast a joint may be asked to move, independent of the
-    # solver's own velocity limit. Converted to a per-cycle step internally.
-    arm_max_vel_rad_s: float = 2.0
-    # Feed the arm encoders back into the IK each cycle. Closing the loop on
-    # the real configuration keeps collision avoidance honest; turning it off
-    # runs the solver open-loop from its own previous solution (smoother, but
-    # the model can drift away from the robot).
-    use_measured_arm_state: bool = True
+    # Arm joint targets are NOT sent to nerolib straight off the 30 Hz solve --
+    # a fresh 7-DOF target only every 33.3 ms is a coarser stream than YOR_D's
+    # proven arm-commanding chain (per-arm IK at 90 Hz, 3-step interpolation
+    # per 30 Hz Cartesian target), which is what this pattern reproduces:
+    # each newly-solved joint target is interpolated against the previous one
+    # over `arm_interpolation_steps` sub-steps, dispatched at `arm_dispatch_hz`
+    # by a dedicated thread decoupled from the 30 Hz solve loop. See
+    # _dispatch_arms / _arm_dispatch_tick / _arm_dispatch_loop.
+    arm_dispatch_hz: float = 90.0
+    arm_interpolation_steps: int = 3
+    # Minimum duration passed to nerolib/Ruckig for each interpolated
+    # sub-target (i.e. one arm_dispatch_hz tick, not one solve tick). Keep
+    # this close to one dispatch-tick period: a value much longer than the
+    # actual dispatch period turns every update into a tiny stop-and-go
+    # trajectory and caps observed speed (previously diagnosed at 55.6 ms
+    # against a much faster loop). 0.0108 is the same ~0.97-of-one-tick
+    # margin used at the former 108 Hz single-loop rate, now applied to the
+    # 90 Hz arm dispatch tick.
+    arm_preview_time: float = 0.0108
+    # Match nerolib's resetToHome acceptance band: a joint target must differ
+    # from the WBC arm reference by more than 0.05 rad before it is dispatched.
+    # The band is applied independently to all seven joints.
+    arm_joint_deadband_rad: float = 0.05
+    # Hard cap on how far ahead of measured state a streamed joint target may
+    # sit. This is a bounded look-ahead, not a per-cycle step: if the WBC stream
+    # stops, Ruckig safely comes to rest at a target no farther than
+    # arm_max_vel_rad_s * arm_command_lookahead_s away.
+    arm_command_lookahead_s: float = 0.10
+    # Hard cap used to derive that maximum look-ahead distance, independent of
+    # the solver's own velocity limit.
+    #
+    # This matches `joint_vel_max` in robot/arm/arm.py (3.0 rad/s). A smaller
+    # number here would silently override the commissioned native limit — the
+    # arms would never reach the speed the controller is configured for, and
+    # the discrepancy would only show up as sluggish whole-body tracking.
+    arm_max_vel_rad_s: float = 3.0
+    # Open-loop arm planning: seed from the encoders once at startup, then
+    # advance IK from its previous commanded solution without reading arm
+    # feedback each cycle. Nerolib's low-level motor PD remains closed-loop,
+    # but the WBC model can drift from the physical arms if tracking is poor.
+    use_measured_arm_state: bool = False
 
-    # ── Lift (bang-bang PicoLift) ───────────────────────────────────────────
+    # ── Lift ────────────────────────────────────────────────────────────────
     enable_lift_motion: bool = True
-    # Stop band around the solver's lift command. Below this the lift is
+    # Stop band for the bang-bang fallback only. Below this the lift is
     # commanded to stop, which also keeps serial traffic down.
     lift_deadband_m: float = 0.01
     use_measured_lift: bool = True
+
+    # Position PD, used when the controller advertises streamed velocity.
+    #
+    #     velocity = Kp * (desired - measured) - Kd * d(measured)/dt
+    #
+    # The derivative is taken from the *measurement*, never from the error, so
+    # that moving the target does not produce a derivative kick — with Kd at
+    # 0.05 s a 10 cm target step differentiated as error would ask for metres
+    # per second on the first cycle.
+    lift_kp: float = 2.0                  # 1/s
+    lift_kd: float = 0.05                 # s
+    # Height (Arduino telemetry, ~36 Hz -- unrelated to this loop's own rate)
+    # now arrives about as often as this loop runs (30 Hz), rather than once
+    # every three cycles as when this loop ran at 108 Hz. This is the time
+    # constant that turns the raw sample-to-sample difference into a usable
+    # velocity regardless of exactly how the two rates line up.
+    lift_derivative_tau: float = 0.1      # s
+    # Inside this band the command is exactly zero, not merely small.
+    lift_velocity_deadband_m: float = 0.005
+    lift_max_velocity_m_s: float = 0.05
+    # Height older than this, while the lift is being driven, stops it.
+    lift_feedback_max_age_s: float = 0.5
+    # ...but not for this long after motion is first requested: the firmware
+    # closes the driver relay and waits DRIVER_STARTUP_MS (500 ms) before it
+    # generates a pulse or a height line, so a fresh command has to be allowed
+    # to outlive one staleness window before it can be judged.
+    lift_feedback_grace_s: float = 1.0
+    # A gap this large between control cycles invalidates the derivative: the
+    # loop stalled, and the height difference across the gap is not a velocity
+    # anything should act on.
+    lift_control_gap_s: float = 0.25
 
     # ── Base ────────────────────────────────────────────────────────────────
     # Whole-body base motion is *emergent*: the solver rolls the chassis only
@@ -163,8 +240,8 @@ class WholeBodyHardwareConfig:
     # get_state() — it should stay small. If it grows steadily, flip the sign.
     slam_yaw_sign: float = +1.0
     # Rate limits on the correction. The SLAM pose steps discontinuously on
-    # loop closure; applied directly at 100 Hz the solver would see the end
-    # effectors teleport and command a large arm velocity on the next tick.
+    # loop closure; applied directly at the WBC rate the solver would see the
+    # end effectors teleport and command a large arm velocity on the next tick.
     # Bleeding the offset in at these rates keeps the IK configuration
     # continuous — 10 cm of accumulated drift is removed in ~1 s, while a 1 m
     # loop-closure jump is absorbed over ~10 s.
@@ -174,6 +251,88 @@ class WholeBodyHardwareConfig:
     # and SLAM have diverged far more than drift explains (wrong yaw_sign,
     # wheel slip, or the robot was picked up).
     slam_offset_warn_m: float = 0.50
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lift position -> velocity
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LiftVelocityPD:
+    """Turns a lift *position* target into a bounded velocity request.
+
+        velocity = Kp * (desired - measured) - Kd * filtered d(measured)/dt
+
+    Two details matter more than the gains:
+
+    * **The derivative is of the measurement, not of the error.** A target step
+      — which is exactly what an operator lift command is — would otherwise
+      differentiate to a huge transient. Differentiating the measurement makes
+      the D term pure damping, which is what it is for here.
+
+    * **The derivative is low-pass filtered.** Height (Arduino telemetry, ~36 Hz)
+      and this loop (30 Hz) now run at close to the same rate, rather than the
+      loop running 3x faster as before, so the unfiltered difference is less
+      sample-and-hold-y than it used to be -- but `tau` still turns it into a
+      usable velocity rather than an artefact of however the two rates land.
+
+    The object is deliberately state-holding and resettable: every event that
+    breaks the continuity of the measurement — a stale reading, a manual
+    override, a disarm, a stalled control loop — must clear the filter, or the
+    first cycle afterwards damps against a velocity that was never real.
+    """
+
+    def __init__(self, kp: float, kd: float, tau: float, deadband: float,
+                 max_velocity: float, max_gap_s: float = 0.25) -> None:
+        self.kp = float(kp)
+        self.kd = float(kd)
+        self.tau = float(tau)
+        self.deadband = float(deadband)
+        self.max_velocity = float(max_velocity)
+        self.max_gap_s = float(max_gap_s)
+        self.reset()
+
+    def reset(self) -> None:
+        self._last_height: Optional[float] = None
+        self._last_time: Optional[float] = None
+        self._filtered_velocity = 0.0
+
+    @property
+    def filtered_velocity(self) -> float:
+        """The damping term's view of how fast the column is moving (m/s)."""
+        return self._filtered_velocity
+
+    def update(self, desired_m: float, measured_m: float, now: float) -> float:
+        """One cycle. Returns the velocity to command, in m/s."""
+        self._update_derivative(measured_m, now)
+
+        error = float(desired_m) - float(measured_m)
+        if abs(error) <= self.deadband:
+            # Exactly zero, not a small residual: a lift that is close enough
+            # must be still, so the column is not left humming against the
+            # last few tenths of a millimetre.
+            return 0.0
+
+        velocity = self.kp * error - self.kd * self._filtered_velocity
+        return float(np.clip(velocity, -self.max_velocity, self.max_velocity))
+
+    def _update_derivative(self, measured_m: float, now: float) -> None:
+        measured_m = float(measured_m)
+        last_height, last_time = self._last_height, self._last_time
+        self._last_height, self._last_time = measured_m, float(now)
+
+        if last_height is None or last_time is None:
+            return
+
+        dt = float(now) - last_time
+        if dt <= 0.0 or dt > self.max_gap_s:
+            # Either time did not advance or the loop stalled. Neither gives a
+            # velocity worth damping against.
+            self._filtered_velocity = 0.0
+            return
+
+        raw = (measured_m - last_height) / dt
+        alpha = dt / (self.tau + dt) if self.tau > 0.0 else 1.0
+        self._filtered_velocity += alpha * (raw - self._filtered_velocity)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,7 +486,7 @@ class SlamPoseListener:
     Two reasons this exists rather than reading an existing pose:
 
     * **The control loop must not touch the network.** commlink's subscriber is
-      pull-mode — every read is a round trip to Thor. A 100 Hz loop cannot
+      pull-mode — every read is a round trip to Thor. A 30 Hz loop cannot
       afford one, so this thread polls at its own rate and the loop reads
       whatever was cached.
     * **BaseController's pose is not usable here.** `_send_base_command` pins
@@ -464,7 +623,7 @@ class WholeBodyController:
                 dt=self.dt,
                 solver="pyqpmad",
                 max_iters=10,
-                base_posture_cost=5e-2,
+                base_posture_cost=1e-1,
                 lift_posture_cost=1e-4,
                 arm_posture_cost=1e-3,
             )
@@ -492,9 +651,48 @@ class WholeBodyController:
                 self.config.slam_pose_port,
                 self.config.slam_pose_hz,
             )
+        self.lift_pd = LiftVelocityPD(
+            kp=self.config.lift_kp,
+            kd=self.config.lift_kd,
+            tau=self.config.lift_derivative_tau,
+            deadband=self.config.lift_velocity_deadband_m,
+            max_velocity=self.config.lift_max_velocity_m_s,
+            max_gap_s=self.config.lift_control_gap_s,
+        )
+
         self._last_base_velocity = np.zeros(3)   # world frame, as commanded
         self._last_base_command = np.zeros(3)    # what Base was actually sent
+        # The hardware sync already reads both arms once per control tick. Keep
+        # those samples for dispatch instead of making two more blocking CAN
+        # reads after solving.
+        self._measured_left_q: Optional[np.ndarray] = None
+        self._measured_right_q: Optional[np.ndarray] = None
+        self._commanded_left_q: Optional[np.ndarray] = None
+        self._commanded_right_q: Optional[np.ndarray] = None
+        # Arm dispatch runs on its own thread/rate, decoupled from the 30 Hz
+        # solve loop -- see _dispatch_arms / _arm_dispatch_tick. `_arm_seg_*`
+        # is the interpolation state bridging the two: `_dispatch_arms` (30 Hz)
+        # only ever writes `_arm_seg_goal`/`_arm_seg_revision` under the lock;
+        # `_arm_dispatch_tick` (90 Hz) owns everything else and needs no lock
+        # for it, since only that one thread ever touches it.
+        self._arm_dispatch_lock = threading.Lock()
+        self._arm_seg_goal: dict[str, Optional[np.ndarray]] = {"left": None, "right": None}
+        self._arm_seg_revision = {"left": 0, "right": 0}
+        self._arm_seg_active_revision = {"left": -1, "right": -1}
+        self._arm_seg_start: dict[str, Optional[np.ndarray]] = {"left": None, "right": None}
+        self._arm_seg_current: dict[str, Optional[np.ndarray]] = {"left": None, "right": None}
+        self._arm_seg_step = {"left": 0, "right": 0}
         self._last_lift_command: Optional[str] = None
+        # Streamed-velocity bookkeeping. `_lift_driving_since` is what makes the
+        # staleness check fair across the firmware's driver-startup delay.
+        self._lift_velocity_mode: Optional[bool] = None
+        self._lift_cmd_velocity = 0.0
+        self._lift_driving_since: Optional[float] = None
+        # Latched by a refusal, cleared only by feedback that is actually
+        # fresh. Without the latch a refusal would clear its own precondition
+        # and the lift would run in bursts against a dead link.
+        self._lift_feedback_blocked = False
+        self._lift_refresh_requested = 0.0
         self._last_solve_ok = False
         self._solve_error: Optional[str] = None
 
@@ -504,6 +702,7 @@ class WholeBodyController:
         self._lift_unavailable_warned = False
 
         self._thread: Optional[threading.Thread] = None
+        self._arm_thread: Optional[threading.Thread] = None
         self._running = False
         self.initialized = False
 
@@ -520,7 +719,16 @@ class WholeBodyController:
         self.odometry.reset()
         # The odometry origin just moved, so any earlier SLAM alignment is void.
         self.slam_frame.reset()
-        self._sync_from_hardware()
+        # Open-loop mode still needs one encoder snapshot so its initial model
+        # and first command start at the robot's actual pose.
+        self._sync_from_hardware(force_arm_read=True)
+        self._commanded_left_q = self._measured_left_q.copy()
+        self._commanded_right_q = self._measured_right_q.copy()
+        # Arm dispatch interpolates from wherever it last actually sent a
+        # command -- seed that with the same measured pose so the very first
+        # segment is smoothed too, instead of jumping straight to the goal.
+        self._arm_seg_current["left"] = self._commanded_left_q.copy()
+        self._arm_seg_current["right"] = self._commanded_right_q.copy()
 
         T_l, T_r = self.ik.forward_kinematics()
         with self._lock:
@@ -537,14 +745,29 @@ class WholeBodyController:
 
     def start(self) -> None:
         if self._thread is not None:
-            return
+            # emergency_stop() can race with a restart request: the worker may
+            # still be unwinding even though _running is already false. Do not
+            # mistake that stale thread object for an active control loop.
+            if self._running and self._thread.is_alive():
+                return
+            if self._thread is not threading.current_thread():
+                self._thread.join(timeout=2.0)
+            self._thread = None
+        if self._arm_thread is not None:
+            if self._arm_thread is not threading.current_thread():
+                self._arm_thread.join(timeout=2.0)
+            self._arm_thread = None
         if not self.initialized:
             self.init()
         self._running = True
         self._thread = threading.Thread(
             target=self._control_loop, name="wholebody-control", daemon=True
         )
+        self._arm_thread = threading.Thread(
+            target=self._arm_dispatch_loop, name="wholebody-arm-dispatch", daemon=True
+        )
         self._thread.start()
+        self._arm_thread.start()
 
     def stop(self) -> None:
         if self._thread is None:
@@ -552,6 +775,9 @@ class WholeBodyController:
         self._running = False
         self._thread.join(timeout=2.0)
         self._thread = None
+        if self._arm_thread is not None:
+            self._arm_thread.join(timeout=2.0)
+            self._arm_thread = None
         self._halt_base()
         self._halt_lift()
         if self.slam_pose is not None:
@@ -561,6 +787,21 @@ class WholeBodyController:
     def emergency_stop(self) -> None:
         """Stop the loop and freeze every actuator where it stands."""
         self._running = False
+        # A stopped worker must not remain attached: start() uses _thread to
+        # distinguish an already-running loop from one that needs launching.
+        # Leaving it here made resume_wholebody() report success while no
+        # control loop existed, so later EE targets were silently ignored.
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._thread = None
+        # Join the arm-dispatch thread too, and before the hold-in-place
+        # commands below, so it cannot race those with one more stale
+        # interpolated step.
+        arm_thread = self._arm_thread
+        if arm_thread is not None and arm_thread is not threading.current_thread():
+            arm_thread.join(timeout=2.0)
+        self._arm_thread = None
         self._halt_base()
         self._halt_lift()
         for arm in (self.left_arm, self.right_arm):
@@ -697,8 +938,10 @@ class WholeBodyController:
             "base_velocity": base_vel.tolist(),
             "base_command": base_cmd.tolist(),
             "fix_base": self.ik.fix_base,
+            "fix_lift": self.ik.fix_lift,
             "collision_avoidance": self.ik.avoid_collisions,
             "base_motion_enabled": self.config.enable_base_motion,
+            "lift_motion_enabled": self.config.enable_lift_motion,
             "solved": self._last_solve_ok,
             "solve_error": self._solve_error,
             "left_joint_positions": q[self.ik._left_arm_qpos_adrs].tolist(),
@@ -711,6 +954,11 @@ class WholeBodyController:
                 else float(self._slam_pose_age)
             ),
             "slam_base_correction_m": float(self._slam_offset_m),
+            # Lift dispatch, for diagnosis: which path is live, what it last
+            # asked for, and how old the height it acted on was.
+            "lift_velocity_mode": bool(self._lift_velocity_mode),
+            "lift_command_velocity": float(self._lift_cmd_velocity),
+            "lift_feedback_age_s": self._lift_feedback_age(),
         }
 
     # ── Control loop ─────────────────────────────────────────────────────────
@@ -752,12 +1000,14 @@ class WholeBodyController:
 
     # ── Measurement ──────────────────────────────────────────────────────────
 
-    def _sync_from_hardware(self) -> None:
+    def _sync_from_hardware(self, force_arm_read: bool = False) -> None:
         """Push measured arm / lift / base state into the IK configuration."""
         left_q = right_q = None
-        if self.config.use_measured_arm_state:
+        if force_arm_read or self.config.use_measured_arm_state:
             left_q = self.left_arm.get_joint_positions()
             right_q = self.right_arm.get_joint_positions()
+            self._measured_left_q = np.asarray(left_q, dtype=float).copy()
+            self._measured_right_q = np.asarray(right_q, dtype=float).copy()
 
         lift = self._measured_lift() if self.config.use_measured_lift else None
         self.ik.set_measured_state(
@@ -824,23 +1074,117 @@ class WholeBodyController:
     def _dispatch_arms(self, result) -> None:
         if self.arms_manually_overridden:
             return
-        max_step = self.config.arm_max_vel_rad_s * self.dt
-        for arm, q_cmd in (
-            (self.left_arm, result.left_arm_q),
-            (self.right_arm, result.right_arm_q),
+        max_lead = (
+            self.config.arm_max_vel_rad_s
+            * self.config.arm_command_lookahead_s
+        )
+        for side, arm, q_cmd, measured_q, commanded_q in (
+            ("left", self.left_arm, result.left_arm_q,
+             self._measured_left_q, self._commanded_left_q),
+            ("right", self.right_arm, result.right_arm_q,
+             self._measured_right_q, self._commanded_right_q),
         ):
-            q_now = arm.get_joint_positions()
-            q_safe = q_now + np.clip(np.asarray(q_cmd) - q_now, -max_step, max_step)
-            arm.set_joint_target(q_safe, preview_time=self.config.arm_preview_time)
+            reference_q = measured_q if self.config.use_measured_arm_state else commanded_q
+            if reference_q is None:
+                # Initialization normally guarantees a reference. Keep this
+                # fallback for isolated callers that invoke dispatch directly.
+                reference_q = arm.get_joint_positions()
+            q_now = np.asarray(reference_q, dtype=float)
+            delta = np.asarray(q_cmd, dtype=float) - q_now
+            deadband = max(0.0, float(self.config.arm_joint_deadband_rad))
+            # A tiny numerical margin makes an intended 0.050000 rad change
+            # behave like nerolib's inclusive homing tolerance despite binary
+            # floating-point representation.
+            outside_deadband = np.abs(delta) > deadband + 1e-12
+            if not np.any(outside_deadband):
+                continue
+            # Hold each joint independently until its accumulated target error
+            # exceeds the same 0.05 rad tolerance used by nerolib homing.
+            delta = np.where(outside_deadband, delta, 0.0)
+            q_safe = q_now + np.clip(
+                delta,
+                -max_lead,
+                max_lead,
+            )
+            # Stage the goal for the arm-dispatch thread rather than sending it
+            # to nerolib directly -- see _arm_dispatch_tick for why (YOR_D-style
+            # sub-step interpolation at a higher, decoupled rate).
+            with self._arm_dispatch_lock:
+                self._arm_seg_goal[side] = q_safe.copy()
+                self._arm_seg_revision[side] += 1
+            if side == "left":
+                self._commanded_left_q = q_safe.copy()
+            else:
+                self._commanded_right_q = q_safe.copy()
+
+    def _arm_dispatch_tick(self) -> None:
+        """One interpolation step toward the latest staged arm target.
+
+        Bridges the 30 Hz solve loop to nerolib at a steadier, higher rate:
+        each newly-staged joint target (from `_dispatch_arms`) is interpolated
+        against wherever dispatch last actually left off, over
+        `arm_interpolation_steps` sub-steps, each sent with a short
+        `arm_preview_time`. This is YOR_D's own proven arm-commanding pattern
+        (fixed-step interpolation feeding nerolib every ~11 ms), reproduced
+        here instead of one coarse ~33 ms command per solve tick.
+
+        Called both by `_arm_dispatch_loop` (the real background thread) and
+        directly by tests, so it takes no arguments and is safe to call any
+        number of times -- it dispatches nothing once the current segment is
+        exhausted and no new one has been staged.
+        """
+        if self.arms_manually_overridden or not self.config.enable_arm_motion:
+            return
+        steps = max(1, int(self.config.arm_interpolation_steps))
+        for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
+            with self._arm_dispatch_lock:
+                revision = self._arm_seg_revision[side]
+                goal = self._arm_seg_goal[side]
+            if goal is None:
+                continue
+            if revision != self._arm_seg_active_revision[side]:
+                # A fresh target arrived. Interpolate from wherever dispatch
+                # actually last left off (which may be mid-segment, not the
+                # previous goal, if this revision changed before the last one
+                # finished) so there is never a position discontinuity.
+                self._arm_seg_active_revision[side] = revision
+                current = self._arm_seg_current[side]
+                self._arm_seg_start[side] = current if current is not None else goal
+                self._arm_seg_step[side] = 0
+            start = self._arm_seg_start[side]
+            step = self._arm_seg_step[side]
+            if start is None or step >= steps:
+                continue
+            alpha = float(step + 1) / float(steps)
+            q_cmd = start + alpha * (goal - start)
+            self._arm_seg_step[side] = step + 1
+            self._arm_seg_current[side] = q_cmd
+            try:
+                arm.set_joint_target(q_cmd, preview_time=self.config.arm_preview_time)
+            except Exception as exc:
+                print(f"[wholebody] {side} arm dispatch failed: {exc}")
+
+    def _arm_dispatch_loop(self) -> None:
+        rate = RateLimiter(self.config.arm_dispatch_hz, warn=False)
+        while self._running:
+            try:
+                self._arm_dispatch_tick()
+            except Exception as exc:
+                # One bad tick must not take the thread down -- the next
+                # solve-tick revision will recover it.
+                print(f"[wholebody] arm dispatch tick failed: {exc}")
+            rate.sleep()
 
     def _dispatch_lift(self, result) -> None:
         if self.lift_manually_overridden:
             self._last_lift_command = None  # re-issue after the override lapses
+            # The operator moved the column out from under the PD; its stored
+            # measurement history describes a motion this loop did not command.
+            self.lift_pd.reset()
+            self._lift_cmd_velocity = 0.0
+            self._lift_driving_since = None
+            self._lift_feedback_blocked = False
             return
-
-        height = self._measured_lift()
-        if height is None:
-            return  # no feedback → refuse to drive a bang-bang actuator
 
         # An explicit lift_target is an operator instruction, so it is what the
         # lift servos to. Otherwise follow the solver, which raises or lowers
@@ -857,6 +1201,156 @@ class WholeBodyController:
         goal = self.ik.clamp_lift(
             self.lift_target if self.lift_target is not None else result.lift_q
         )
+
+        if self._lift_velocity_available():
+            self._dispatch_lift_velocity(goal)
+        else:
+            self._dispatch_lift_bang_bang(goal)
+
+    # -- streamed velocity (firmware advertises lift_velocity_v1) ------------
+
+    def _lift_velocity_available(self) -> bool:
+        """Whether to stream velocity rather than bang-bang up/down/stop.
+
+        The answer comes from the *controller's* capability line, not from the
+        presence of a Python method: an older sketch has no "vel" command and
+        would sit still while the host thought it was driving. The age query
+        has to exist too, since the PD is not allowed to run without being able
+        to tell fresh feedback from stale.
+        """
+        supports = getattr(self.base, "lift_supports_velocity", None)
+        has_age = getattr(self.base, "get_lift_height_age", None)
+        try:
+            available = bool(supports and has_age and supports())
+        except Exception:
+            available = False
+
+        if available != self._lift_velocity_mode:
+            if self._lift_velocity_mode is not None:
+                # Switching paths mid-run: leave the one being abandoned in a
+                # stopped state rather than with a command still standing.
+                self._halt_lift()
+            print("[wholebody] lift control: "
+                  + ("streamed velocity (lift_velocity_v1)" if available
+                     else "up/down/stop (no velocity capability reported)"))
+            self._lift_velocity_mode = available
+        return available
+
+    def _lift_feedback_age(self) -> Optional[float]:
+        try:
+            age = self.base.get_lift_height_age()
+        except Exception:
+            return None
+        return None if age is None else float(age)
+
+    def _lift_position_known(self) -> Optional[bool]:
+        known = getattr(self.base, "lift_position_known", None)
+        if known is None:
+            return None
+        try:
+            return known()
+        except Exception:
+            return None
+
+    def _dispatch_lift_velocity(self, goal: float) -> None:
+        height = self._measured_lift()
+        if height is None or self._lift_position_known() is False:
+            self._refuse_lift("height is unknown")
+            return
+
+        now = time.monotonic()
+        age = self._lift_feedback_age()
+        fresh = age is not None and age <= self.config.lift_feedback_max_age_s
+
+        if fresh:
+            self._lift_feedback_blocked = False
+        else:
+            # A parked column reports nothing — the firmware streams height
+            # while it moves, not at rest — so an old reading on a lift that is
+            # standing still is simply the last true one, and starting from it
+            # is allowed. What is not allowed is *continuing* on it: once
+            # motion has been asked for, telemetry has to appear and keep
+            # appearing. The grace window covers the firmware closing its
+            # driver relay before the first height line can exist.
+            started = self._lift_driving_since
+            within_grace = (
+                started is not None
+                and (now - started) <= self.config.lift_feedback_grace_s
+            )
+            if self._lift_feedback_blocked or (started is not None and not within_grace):
+                self._refuse_lift(f"height telemetry stale ({age})")
+                return
+
+        velocity = self.lift_pd.update(goal, height, now)
+        self._send_lift_velocity(velocity)
+
+    def _send_lift_velocity(self, velocity: float) -> None:
+        velocity = float(velocity)
+        if not math.isfinite(velocity):
+            self._refuse_lift("PD produced a non-finite velocity")
+            return
+
+        try:
+            self.base.lift_set_velocity(velocity)
+        except Exception as exc:
+            print(f"[wholebody] lift velocity command failed: {exc}")
+            return
+
+        if velocity == 0.0:
+            self._lift_driving_since = None
+        elif self._lift_cmd_velocity == 0.0:
+            self._lift_driving_since = time.monotonic()
+        self._lift_cmd_velocity = velocity
+
+    def _refuse_lift(self, reason: str) -> None:
+        """Command zero, forget the derivative, and stay refused.
+
+        The latch matters: a refusal sets the commanded velocity to zero, and
+        without it the very next cycle would see a lift that is not being
+        driven, allow it to start again, and the lift would inch along against
+        feedback nobody can trust.
+        """
+        if not self._lift_feedback_blocked:
+            print(f"[wholebody] lift held: {reason}")
+        self._lift_feedback_blocked = True
+
+        self.lift_pd.reset()
+        self._lift_driving_since = None
+        if self._lift_cmd_velocity != 0.0:
+            try:
+                self.base.lift_set_velocity(0.0)
+            except Exception as exc:
+                print(f"[wholebody] lift stop failed: {exc}")
+        self._lift_cmd_velocity = 0.0
+        self._request_lift_refresh()
+
+    def _request_lift_refresh(self) -> None:
+        """Ask the controller for a status line while the lift is held.
+
+        The latch can only be cleared by a fresh height, and a held lift is not
+        moving, so nothing would produce one. A `status` request does, without
+        commanding any motion. Rate-limited because it is a serial round trip
+        in a 30 Hz loop, not because it is expensive to be right.
+        """
+        now = time.monotonic()
+        if now - self._lift_refresh_requested < 2.0:
+            return
+        self._lift_refresh_requested = now
+        status = getattr(self.base, "get_lift_status", None)
+        if status is None:
+            return
+        try:
+            status()
+        except Exception as exc:
+            print(f"[wholebody] lift status request failed: {exc}")
+
+    # -- bang-bang (older firmware: up / down / stop only) -------------------
+
+    def _dispatch_lift_bang_bang(self, goal: float) -> None:
+        height = self._measured_lift()
+        if height is None:
+            return  # no feedback → refuse to drive a bang-bang actuator
+
         error = goal - height
         if abs(error) <= self.config.lift_deadband_m:
             command = "stop"
@@ -950,11 +1444,20 @@ class WholeBodyController:
         self._last_base_command = np.zeros(3)
 
     def _halt_lift(self) -> None:
+        """Stop the lift and forget everything the PD knew about its motion.
+
+        `lift_stop` is the hard stop in both firmwares: it ends velocity mode
+        outright rather than ramping, which is what a disarm should do.
+        """
         try:
             self.base.lift_stop()
         except Exception as exc:
             print(f"[wholebody] lift stop failed: {exc}")
         self._last_lift_command = None
+        self._lift_cmd_velocity = 0.0
+        self._lift_driving_since = None
+        self._lift_feedback_blocked = False
+        self.lift_pd.reset()
 
     @staticmethod
     def _set_gripper(arm, value: float) -> None:

@@ -1,4 +1,5 @@
 import math
+import os
 import re
 import threading
 import time
@@ -35,7 +36,17 @@ drivetrain_can = "can0"
 POLICY_CONTROL_FREQ = 10
 POLICY_CONTROL_PERIOD_NS = int(1e9 / POLICY_CONTROL_FREQ)
 
-CONTROL_FREQ = 250  # Hz control loop
+# Hz control loop. Three ticks per whole-body cycle: the BASE_VEL relay in
+# robot/base.py forwards a new velocity at 108 Hz, and the S-curve profiler
+# below integrates at this rate, so 3× gives it something to interpolate
+# across instead of stepping once per arriving command.
+#
+# Each tick puts 16 frames on the 1 Mbit/s bus (8 heartbeats + 4 steer
+# positions + 4 drive velocities), so this is also the knob that sets bus
+# load: 5184 frames/s here, on top of the 50 Hz periodic status each of the
+# 8 SPARKs streams back. Raising it further is a bus-utilisation decision,
+# not a free one.
+CONTROL_FREQ = 324
 CONTROL_PERIOD = 1.0 / CONTROL_FREQ
 
 NUM_SWERVES = 4
@@ -48,6 +59,26 @@ TIRE_RADIUS = 0.0381  # m
 # commands to the model, so a smaller number here would silently truncate
 # the top of the workspace.
 LIFT_MAX_HEIGHT_M = 0.900  # m
+
+# Stable udev path for this robot's FT232-connected lift Arduino. Unlike
+# /dev/ttyUSB0, this does not change when USB devices are enumerated in a
+# different order. YOR_LIFT_SERIAL_PORT can override it for replacement
+# hardware or bench testing.
+LIFT_SERIAL_PORT = (
+    "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG02XPI5-if00-port0"
+)
+
+# Streamed-velocity limits. These mirror VEL_MAX_MM_S and VEL_MIN_ACTIVE_MM_S in
+# firmware/lift_controller/lift_controller.ino. The firmware clamps as well —
+# it has to, since it cannot trust the host — but clamping here too means the
+# host always knows exactly what it asked for.
+LIFT_MAX_VELOCITY_MM_S = 50.0
+LIFT_MIN_VELOCITY_MM_S = 0.5
+# Refresh interval for an unchanged velocity. Comfortably inside the firmware's
+# 300 ms command timeout, so a steady command never looks like a dead link.
+LIFT_VELOCITY_KEEPALIVE_S = 0.100
+# Capability token the firmware advertises when it understands "vel".
+LIFT_VELOCITY_CAPABILITY = "lift_velocity_v1"
 
 MODULE_ORDER = ("FL", "FR", "RR", "RL")
 
@@ -93,8 +124,9 @@ class PicoLift:
     Wire protocol (see the sketch for the authoritative list):
 
         sent      up | down | stop | home | "up <mm>" | "down <mm>"
-                  status | power on | power off
-        received  "Height: <n> mm"            every 50 ms *while moving*
+                  "vel <signed mm/s>" | status | power on | power off
+        received  "Capabilities: lift_velocity_v1"  (banner and status)
+                  "Height: <n> mm"            at 36 Hz *while moving*
                   "Height: unknown (run home)"  position not established
                   "Home complete." / "Home failed: ..." / "Home stopped."
                   "Move complete." / "LIMIT HIT: ..." / "Motion stopped..."
@@ -110,6 +142,12 @@ class PicoLift:
       must clear the cached height when it does — otherwise a controller reset
       leaves the host confidently reporting a stale height that
       `lift_to_height` would then act on.
+
+    Streamed velocity (`set_velocity_mm_s`) is only usable against a firmware
+    that says so: `supports_velocity()` reflects the controller's own
+    capability line, not the presence of this method. An older sketch answers
+    "vel" with its usage banner and keeps sitting still, so a host that assumed
+    support would silently command nothing.
     """
 
     _HEIGHT_PATTERN = re.compile(r"Height:\s*(-?[\d.]+)\s*mm")
@@ -117,17 +155,20 @@ class PicoLift:
     _UPPER_LIMIT_PATTERN = re.compile(r"Upper limit:\s*(ACTIVE|clear)", re.IGNORECASE)
     _LOWER_LIMIT_PATTERN = re.compile(r"Lower limit:\s*(ACTIVE|clear)", re.IGNORECASE)
     _MOTION_PATTERN = re.compile(r"Motion:\s*(IDLE|UP|DOWN)", re.IGNORECASE)
+    _CAPABILITIES_PATTERN = re.compile(r"Capabilities:\s*(.+)", re.IGNORECASE)
     # The firmware banner. Seeing it mid-run means the board reset (USB glitch,
     # watchdog, someone re-flashed) and every cached fact about it is void.
     _READY_PATTERN = re.compile(r"Lift controller ready", re.IGNORECASE)
 
     def __init__(
         self,
-        device_path: str = "/dev/ttyACM0",
+        device_path: str = LIFT_SERIAL_PORT,
         baud: int = 115200,
         timeout: float = 0.2,
     ):
-        self.device_path = device_path
+        # Allow replacement hardware and bench setups to select another port
+        # without editing robot code.
+        self.device_path = os.environ.get("YOR_LIFT_SERIAL_PORT", device_path)
         self.baud = baud
         self.timeout = timeout
 
@@ -140,8 +181,19 @@ class PicoLift:
         self._drain_thread = None
         self._drain_stop = threading.Event()
 
+        # Streamed-velocity gating. Separate from _lock, which _send() holds.
+        self._vel_lock = threading.Lock()
+        self._last_velocity_mm_s: Optional[float] = None
+        self._last_velocity_send_ts = 0.0
+
         self._height_lock = threading.Lock()
         self._height_m: Optional[float] = None
+        # When that height arrived (time.monotonic). A height with no age is a
+        # height nobody should servo against — see get_height_age().
+        self._height_ts: Optional[float] = None
+        # Capability tokens from the firmware's "Capabilities:" line. Empty
+        # means it has not said, which is not the same as "no".
+        self._capabilities: set[str] = set()
         # None until the firmware tells us either way. False means the lift has
         # no established zero and every height it reports is meaningless.
         self._position_known: Optional[bool] = None
@@ -191,6 +243,31 @@ class PicoLift:
         self._drain_thread = threading.Thread(target=self._drain_loop, daemon=True)
         self._drain_thread.start()
 
+    def _shutdown(self) -> None:
+        """Stop reconnecting and close the serial device during node exit."""
+        self._drain_stop.set()
+
+        # Stop the mechanism before closing an active link.  Write directly so
+        # shutdown can never trigger _send()'s reconnect path.
+        with self._lock:
+            if self._ser is not None and getattr(self._ser, "is_open", False):
+                try:
+                    self._ser.write(b"\r\nstop\r\n")
+                    self._ser.flush()
+                except Exception:
+                    pass
+
+        if self._drain_thread is not None and self._drain_thread.is_alive():
+            self._drain_thread.join(timeout=max(1.0, self.timeout + 0.5))
+
+        with self._lock:
+            try:
+                if self._ser is not None:
+                    self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
     def _drain_loop(self) -> None:
         while not self._drain_stop.is_set():
             try:
@@ -203,7 +280,7 @@ class PicoLift:
                 if data:
                     try:
                         line = data.decode("utf-8").strip()
-                        # "Height:" streams at 20 Hz during a move; logging every
+                        # "Height:" streams at 36 Hz during a move; logging every
                         # one of them buries everything else in the node's output.
                         if not self._HEIGHT_PATTERN.search(line):
                             print(f"[LIFT] {line}")
@@ -230,16 +307,32 @@ class PicoLift:
         if self._READY_PATTERN.search(line):
             with self._height_lock:
                 self._height_m = None
+                self._height_ts = None
                 self._position_known = None
                 self._homed = None
                 self._motion = "IDLE"
                 self._last_event = "controller reset"
+                # A reset board may be a *different* build. It re-announces its
+                # capabilities on the next line; until then we know nothing.
+                self._capabilities = set()
+            with self._vel_lock:
+                self._last_velocity_mm_s = None
+                self._last_velocity_send_ts = 0.0
             print("[PicoLift] controller reset — height invalidated, needs home")
+            return
+
+        match = self._CAPABILITIES_PATTERN.search(line)
+        if match:
+            tokens = {t.strip().lower() for t in match.group(1).split() if t.strip()}
+            with self._height_lock:
+                self._capabilities |= tokens
+            print(f"[PicoLift] firmware capabilities: {', '.join(sorted(tokens))}")
             return
 
         if self._HEIGHT_UNKNOWN_PATTERN.search(line):
             with self._height_lock:
                 self._height_m = None
+                self._height_ts = None
                 self._position_known = False
             return
 
@@ -247,6 +340,7 @@ class PicoLift:
         if match:
             with self._height_lock:
                 self._height_m = float(match.group(1)) / 1000.0
+                self._height_ts = time.monotonic()
                 self._position_known = True
             return
 
@@ -281,6 +375,7 @@ class PicoLift:
                 self._homed = False
                 self._position_known = False
                 self._height_m = None
+                self._height_ts = None
                 self._last_event = line
         elif (lowered.startswith("move complete")
               or lowered.startswith("motion stopped")
@@ -347,6 +442,11 @@ class PicoLift:
 
     def stop(self) -> None:
         self._last_cmd = None
+        # A discrete stop ends velocity mode in the firmware, so the next
+        # streamed command must go out immediately rather than be deduped
+        # against a value the controller has already forgotten.
+        with self._vel_lock:
+            self._last_velocity_mm_s = None
         self._send("stop")
 
     def move_mm(self, distance_mm: float, up: bool) -> bool:
@@ -365,6 +465,93 @@ class PicoLift:
         self._last_cmd = None   # never dedupe a finite move against a previous one
         self._send(f"{'up' if up else 'down'} {distance_mm:.2f}")
         return True
+
+    def set_velocity_mm_s(self, velocity_mm_s: float) -> bool:
+        """Stream a signed velocity to the firmware: + is up, - is down.
+
+        Millimetres per second is the wire unit; the rest of the robot works in
+        metres, so `Base.lift_set_velocity()` is the converting entry point and
+        this is the transport.
+
+        Returns True when the value was accepted — which is not the same as
+        "a frame was written". A command identical to the last one is only
+        refreshed every LIFT_VELOCITY_KEEPALIVE_S, because the firmware treats
+        a steady stream as proof the host is alive rather than as new
+        information. Three things always go out immediately:
+
+        * a meaningful change (>= the firmware's minimum active velocity),
+        * any transition to or from zero, so a stop is never delayed,
+        * the first command after a reset or a mode change.
+
+        False means nothing was sent and nothing will be: the value was not a
+        finite number.
+        """
+        try:
+            velocity_mm_s = float(velocity_mm_s)
+        except (TypeError, ValueError):
+            print(f"[PicoLift] refusing non-numeric velocity {velocity_mm_s!r}")
+            return False
+
+        if not math.isfinite(velocity_mm_s):
+            print(f"[PicoLift] refusing non-finite velocity {velocity_mm_s!r}")
+            return False
+
+        velocity_mm_s = float(np.clip(
+            velocity_mm_s, -LIFT_MAX_VELOCITY_MM_S, LIFT_MAX_VELOCITY_MM_S))
+        if abs(velocity_mm_s) < LIFT_MIN_VELOCITY_MM_S:
+            velocity_mm_s = 0.0
+
+        now = time.monotonic()
+        with self._vel_lock:
+            last = self._last_velocity_mm_s
+            if last is None:
+                send = True
+            elif velocity_mm_s == 0.0 and last != 0.0:
+                send = True                      # stopping is never deferred
+            elif abs(velocity_mm_s - last) >= LIFT_MIN_VELOCITY_MM_S:
+                send = True                      # a change the lift can express
+            else:
+                send = (now - self._last_velocity_send_ts) >= LIFT_VELOCITY_KEEPALIVE_S
+
+            if send:
+                self._last_velocity_mm_s = velocity_mm_s
+                self._last_velocity_send_ts = now
+
+        if send:
+            # Bypass _send()'s generic repeat suppression: the gate above is
+            # this command's rate limiter, and a suppressed keepalive would
+            # look to the firmware like a lost host.
+            self._last_cmd = None
+            self._send(f"vel {velocity_mm_s:.2f}")
+        return True
+
+    def supports_velocity(self) -> bool:
+        """Whether the *connected firmware* advertised streamed velocity.
+
+        This reads the controller's capability line, so it stays False against
+        an older sketch that has no "vel" command — which is the whole point:
+        the presence of set_velocity_mm_s() proves nothing about the board.
+        """
+        with self._height_lock:
+            return LIFT_VELOCITY_CAPABILITY in self._capabilities
+
+    def get_capabilities(self) -> set:
+        """Every capability token the firmware has announced."""
+        with self._height_lock:
+            return set(self._capabilities)
+
+    def get_height_age(self) -> Optional[float]:
+        """Seconds since the last height line, or None if there has been none.
+
+        Height is only streamed while the lift is moving or holding in velocity
+        mode, so an old age is normal for a parked lift. It matters to anything
+        that servos against the measurement: a control loop must refuse to act
+        on a height that stopped arriving.
+        """
+        with self._height_lock:
+            if self._height_ts is None:
+                return None
+            return time.monotonic() - self._height_ts
 
     def request_status(self) -> None:
         """Ask for a status report; the reply lands in the cached state."""
@@ -425,6 +612,7 @@ class RotationMotor:
 
     def __init__(self, can_if: str, can_id: int, offset_frac: float = 0.0):
         self.dev = SparkFlex(can_if, can_id)
+        self.can_id = int(can_id)
         self.offset = float(offset_frac)
         self.last_cmd_frac = 0.0
 
@@ -473,6 +661,7 @@ class DriveMotor:
 
     def __init__(self, can_if: str, can_id: int):
         self.dev = SparkFlex(can_if, can_id)
+        self.can_id = int(can_id)
 
         if IdleMode and hasattr(self.dev, "SetIdleMode"):
             try:
@@ -574,6 +763,17 @@ class Base:
         self._T_min = 0.01
         self._retarget_eps = 1e-3
 
+    def swerve_devices(self) -> dict[int, Any]:
+        """{CAN id: SparkFlex} for all eight swerve controllers.
+
+        The handles this process already owns. robot/yor.py writes the
+        commissioned PID gains through these at startup (see
+        tools/base_pid_preflight.sync_from_manifest) rather than opening a
+        second set of SparkFlex objects on the same bus, which is not safe.
+        """
+        return {motor.can_id: motor.dev
+                for motor in (*self.rotation_motors, *self.drive_motors)}
+
     # --- Lift controls ---
     def lift_up(self) -> None:
         if self._pico_lift:
@@ -595,6 +795,38 @@ class Base:
         if self._pico_lift:
             return self._pico_lift.get_height()
         return None
+
+    def lift_set_velocity(self, velocity_m_s: float) -> bool:
+        """Stream a lift velocity in metres per second: + is up, - is down.
+
+        The wire protocol is millimetres per second; this is where the robot's
+        unit becomes the controller's. Returns False when the value was not a
+        finite number, or when there is no lift attached — never because the
+        command was merely rate-limited.
+
+        Only call this against a firmware that reports the capability; check
+        `lift_supports_velocity()` first. An older controller answers "vel"
+        with its usage banner and does not move.
+        """
+        if self._pico_lift is None:
+            return False
+        try:
+            metres_per_second = float(velocity_m_s)
+        except (TypeError, ValueError):
+            return False
+        return bool(self._pico_lift.set_velocity_mm_s(metres_per_second * 1000.0))
+
+    def lift_supports_velocity(self) -> bool:
+        """Whether the attached lift firmware advertised streamed velocity."""
+        if self._pico_lift is None:
+            return False
+        return bool(self._pico_lift.supports_velocity())
+
+    def get_lift_height_age(self) -> Optional[float]:
+        """Seconds since the last height telemetry line, or None if none yet."""
+        if self._pico_lift is None:
+            return None
+        return self._pico_lift.get_height_age()
 
     def lift_position_known(self) -> Optional[bool]:
         """Whether the firmware has an established zero. None if not yet known.
@@ -619,12 +851,15 @@ class Base:
         return {
             "available": True,
             "height_m": self._pico_lift.get_height(),
+            "height_age_s": self._pico_lift.get_height_age(),
             "position_known": self._pico_lift.is_position_known(),
             "homed": self._pico_lift.is_homed(),
             "upper_limit": upper,
             "lower_limit": lower,
             "motion": self._pico_lift.get_motion(),
             "last_event": self._pico_lift.get_last_event(),
+            "velocity_capable": self._pico_lift.supports_velocity(),
+            "capabilities": sorted(self._pico_lift.get_capabilities()),
         }
 
     def lift_delta_height(

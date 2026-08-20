@@ -149,13 +149,16 @@ Launched with `show_right_ui=True`. Useful tabs:
 ## 7. Whole-Body Teleop (server + client over RPC)
 
 The production-shaped path: the sim runs as an RPC server, a separate teleop
-client streams EE / lift targets to it at 30 Hz.
+client streams EE / lift targets to it at 30 Hz (the client's default rate;
+the sim server below still solves whole-body IK at its own 108 Hz, unrelated
+to the client rate — see the pipeline note below for how this differs on
+hardware, where the two are matched 1:1).
 
 ### Start the server (terminal 1)
 ```bash
 conda run -n dev mjpython robot/yor_mujoco.py
 ```
-Opens the MuJoCo viewer, runs whole-body IK at 100 Hz, and serves commlink RPC
+Opens the MuJoCo viewer, runs whole-body IK at 108 Hz, and serves commlink RPC
 on **port 8081**.
 
 ### Start the client (terminal 2 — plain `python`, no viewer)
@@ -170,6 +173,56 @@ conda run -n dev python robot/teleop/wholebody_teleop.py --input keyboard
 | `keyboard` (default) | nothing | nudge-based, works everywhere |
 | `gamepad` | `pip install pygame` + controller | hold **L1**/**R1** to steer left/right arm with the sticks, D-pad = lift |
 | `oculus` | Quest streaming to `--oculus-host` | clutch teleop: X/A engage, full 6-DoF pose following |
+
+### Quest pose filtering (`--input oculus`)
+
+Controller poses are smoothed on arrival with a 1€ filter, so tracker jitter
+does not reach the IK and a tracking dropout holds the target instead of
+throwing the arm at it. Dropped samples are reported on the console.
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--filter-min-cutoff` | `3.0` Hz | smoothing while the hand is still — lower is calmer but laggier |
+| `--filter-beta` | `8.0` | how fast the filter opens up with hand speed — raise it if fast reaches feel sluggish |
+| `--no-pose-filter` | off | stream raw poses (for comparing / debugging the headset) |
+
+The 72 Hz input gives the 3 Hz resting cutoff 24 samples per cycle. The adaptive
+cutoff rises with hand speed so a moving controller remains responsive.
+
+On hardware, the command path is:
+
+```text
+Quest/filter ~72 Hz -> teleop RPC 30 Hz -> whole-body IK 30 Hz -+-> arm dispatch 90 Hz (3 sub-steps/solve)
+                                                                 |      -> nerolib onboard tracking 250 Hz
+                                                                 +-> lift / base dispatch 30 Hz
+                                                                        -> base relay 108 Hz -> swerve profiling 324 Hz
+```
+
+Teleop RPC and whole-body IK are matched 1:1 (`WholeBodyHardwareConfig.control_hz`
+and the teleop client's `LOOP_RATE` both 30 Hz). Arms are the one leg that does
+*not* follow the solve rate straight to nerolib: each solved joint target is
+interpolated against the previous one over `arm_interpolation_steps` (3)
+sub-steps, dispatched by a separate thread at `arm_dispatch_hz` (90 Hz) with a
+short `arm_preview_time` — this reproduces YOR_D's own arm-commanding chain
+(a Cartesian target no faster than 30 Hz, smoothed by frequent short-duration
+joint commands) rather than sending nerolib one coarse ~33 ms segment per
+solve tick. Nerolib's 250 Hz onboard loop then tracks whichever of those
+90 Hz segments it was last given. Lift and base dispatch, by contrast, go
+straight from the 30 Hz solve loop with no such intermediate stage — a
+velocity target held slightly longer just keeps driving at that velocity
+rather than decelerating to a stop, so they don't need one. The base relay is
+deliberately *not* matched to the WBC solve rate either: it stays at 108 Hz
+so it never falls behind a (now slower) producer, and so the swerve loop's
+own 3x oversampling (108 Hz relay -> 324 Hz profiling) stays exactly as
+tuned. Quest tracking arrives at roughly 72 Hz independent of all of the
+above and is 1€-filtered on its own receive thread; the 30 Hz teleop loop
+just samples whatever pose that filter last produced. The lift's Arduino
+height telemetry (~36 Hz) is likewise a separate, fixed hardware rate — it
+now arrives at roughly the same cadence as the 30 Hz WBC loop consumes it,
+rather than once every three ticks as when the WBC loop ran at 108 Hz.
+Safety keepalives,
+timeouts, variable step pulses and the separate 20 Hz navigation/SLAM loop are
+deliberately not control samples in this hierarchy.
 
 ### Keyboard map (client terminal, not the viewer!)
 ```
@@ -199,16 +252,47 @@ same client drives it with `--target hw`. See section 8.
 ## 8. Running on the Robot
 
 The hardware node runs the *same* solver over the *same* description; it reads
-the arm encoders and lift height instead of `data.qpos`, and dispatches to
+an initial arm-encoder seed followed by the previous commanded arm state,
+plus measured lift height, instead of `data.qpos`, and dispatches to
 nerolib, the PicoLift and the swerve base instead of writing `qpos`.
 
 ### Start the node (on the robot)
 ```bash
 python robot/yor.py
 ```
-This initialises both arms (each homes through nerolib), starts the base
-control loop, then starts whole-body control at 100 Hz and serves commlink RPC
-on **port 5557**.
+`init()` starts by bringing the swerve controllers to the commissioned PID
+gains in [config/base_pid_manifest.json](../config/base_pid_manifest.json)
+itself — no separate step. It writes through the SparkFlex objects
+`robot/base_motor.py` has already opened, before the base control loop starts,
+so only one set of device handles ever touches the bus. Each controller is read
+first and written only if it differs, so an ordinary restart writes nothing and
+logs `already-set` eight times. Gains live in controller RAM, which a power
+cycle clears, which is why this is checked on every start: a module that
+reverted steers and drives differently from its three neighbours, and that is
+far harder to diagnose from the robot's behaviour than a startup failure.
+
+If a controller cannot be brought to the commissioned values, `init()` raises
+and the base control loop is never started.
+
+```bash
+python robot/yor.py                       # sync the gains at startup (default)
+python robot/yor.py --no-flash-base-pid   # start on whatever the controllers hold
+python robot/yor.py --base-pid-manifest config/experimental_pid.json
+```
+
+`--no-flash-base-pid` is for starting the node on a bench with no CAN bus, or
+for deliberately leaving a controller on the gains it is holding while
+investigating it — remember that after a SPARK power cycle those are the stock
+gains, not the commissioned ones. In code the same switch is
+`YOR(flash_base_pid=False)`.
+
+`python tools/base_pid_preflight.py` remains available for checking or applying
+the gains while the robot process is *not* running — see
+[Swerve PID preflight](#swerve-pid-preflight) below.
+
+`robot/yor.py` then initialises both arms (each homes through nerolib), starts
+the base control loop, then starts whole-body control at 30 Hz and serves
+commlink RPC on **port 5557**.
 
 ### Drive it (from the operator machine)
 ```bash
@@ -304,15 +388,21 @@ Firmware lives in [firmware/lift_controller/](../firmware/lift_controller/) and
 is flashed to the Arduino driving the stepper. `robot/base_motor.py`'s
 `PicoLift` talks to it over serial at 115200.
 
+The lift Arduino defaults to its stable udev path,
+`/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG02XPI5-if00-port0`. For
+replacement hardware or bench testing, override it with
+`YOR_LIFT_SERIAL_PORT=/dev/...` when starting `robot/yor.py`.
+
 ```
 up | down          continuous move until stop/limit
 up <mm> | down <mm>  finite move, firmware runs a jerk-limited S-curve
+vel <signed mm/s>  streamed velocity, + up / - down (whole-body path)
 stop | home        home drives UP to the upper switch, which defines 900 mm
-status             limit switches + motion state + height
+status             limit switches + motion state + height + capabilities
 power on | off     driver relay
 ```
 
-Three behaviours worth knowing before you debug it:
+Four behaviours worth knowing before you debug it:
 
 - **Height only streams while moving.** When idle the last value stands, so
   `get_lift_height()` returns `None` from boot until the first move or home
@@ -328,8 +418,87 @@ Three behaviours worth knowing before you debug it:
   `up` then `stop`: the move gets a real acceleration profile and stops on an
   exact pulse count. Pass `profiled=False` for the old behaviour.
 
+- **The whole-body path streams velocity, not up/down.** `set_lift_target()` is
+  still a height in metres — nothing in the teleop client changes — but the
+  controller now converts it to a velocity and streams that (see
+  [The lift under whole-body control](#the-lift-under-whole-body-control)).
+
 `get_lift_status()` returns height, position-known, homed, both limit switches,
-motion state and the last notable firmware line.
+motion state, the last notable firmware line, how old the height reading is,
+and whether the firmware advertised streamed velocity.
+
+### The lift under whole-body control
+
+`WholeBodyController` runs a position PD against the measured height and
+streams the result as a velocity:
+
+```
+velocity = Kp * (desired - measured) - Kd * filtered d(measured)/dt
+```
+
+| Setting | Value | |
+|---|---:|---|
+| `lift_kp` | 2.0 | 1/s |
+| `lift_kd` | 0.05 | s |
+| `lift_derivative_tau` | 0.1 | s — height arrives at ~36 Hz, the loop now runs at 30 Hz |
+| `lift_velocity_deadband_m` | 0.005 | inside this the command is exactly zero |
+| `lift_max_velocity_m_s` | 0.05 | the host's clamp; the firmware clamps at 50 mm/s too |
+| `lift_feedback_max_age_s` | 0.5 | older than this, while driving, stops the lift |
+| `lift_feedback_grace_s` | 1.0 | covers the firmware's 500 ms driver-relay delay |
+
+Four things about this are worth knowing:
+
+- **The derivative is of the measurement, not of the error.** An operator lift
+  command is a step, and differentiating the error would ask for metres per
+  second on the first cycle. The D term here is pure damping.
+- **It only runs against a firmware that says it can.** The controller reads
+  the `Capabilities: lift_velocity_v1` line; without it the loop falls back to
+  the original `up`/`down`/`stop` deadband servo, and says which path it chose
+  at startup. An older sketch answers `vel` with its usage banner and does not
+  move, so the check has to be the controller's word, not the host's.
+- **Stale or unknown height stops it, and keeps it stopped.** The refusal
+  latches until a fresh reading arrives; a held lift is asked for a `status`
+  every two seconds so it can recover on its own. `get_state()` reports
+  `lift_velocity_mode`, `lift_command_velocity` and `lift_feedback_age_s`.
+- **The firmware shapes what it is sent.** It plans a quintic minimum-jerk
+  transition to each new velocity (200 mm/s², 2000 mm/s³), ramps through zero
+  before changing the direction pin, and stops if no command arrives for
+  300 ms. It is *not* a closed-loop velocity controller — it has no measured
+  column velocity to close against.
+
+### Swerve PID preflight
+
+The commissioned gains live in
+[config/base_pid_manifest.json](../config/base_pid_manifest.json):
+
+| Motor role | Kp | Ki | Kd | Velocity FF | Output range |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Drive | 0.35 | 0.0 | 0.0 | 0.23 | -1.0 to 1.0 |
+| Steering | 20.0 | 0.0 | 6.0 | 0.0 | -0.25 to 0.25 |
+
+`robot/yor.py` applies these on every start, so the command below is for
+working on the base without the robot node running — confirming what a
+controller currently holds, or applying the gains after editing the manifest.
+
+```bash
+python tools/base_pid_preflight.py                # validate, apply, verify
+python tools/base_pid_preflight.py --dry-run      # checks only, opens no device
+python tools/base_pid_preflight.py --verify-only  # read back, write nothing
+```
+
+It validates the manifest, cross-checks the module CAN ids against
+`robot/base_motor.py`, checks the CAN interface is up and that no other process
+owns the controllers — and only then opens a device. Every field it writes is
+read back, and any difference fails the run. Because it opens its own devices,
+it refuses to run while `robot/yor.py` is up: two sets of SparkFlex objects on
+one bus is not safe. The in-process sync at startup runs the same manifest
+checks and the same readback, but reuses the handles the robot already holds.
+
+The steering output limit of ±0.25 is part of the commissioned set. The
+proposed full-range combination (`Kp=10`, `Kd=0`, output ±1.0) is **not**
+validated and must stay a separate commissioning experiment; drive `Kd` is
+deliberately zero, because a tested value of 10 produced an audibly harsh
+100 Hz torque ripple.
 
 ### Feeding the SLAM pose into whole-body IK (optional)
 
@@ -371,7 +540,7 @@ Two things that make this less obvious than it looks:
   `"BASE_VEL"` mode, and in that mode its loop `continue`s before it ever calls
   `get_pose` — so `yor.pose` is stale exactly while whole-body control runs.
 - The control loop never touches the network. commlink's subscriber is
-  pull-mode (one round trip per read), which a 100 Hz loop cannot afford, so the
+  pull-mode (one round trip per read), which a 30 Hz loop cannot afford, so the
   loop only ever reads a cached value.
 
 ### Tuning individual arm joints in the solver
@@ -424,6 +593,7 @@ loop), then `resume_wholebody()`.
 | The *solver's* base odometry is dead-reckoned from the commanded velocity | The solver's idea of where the chassis is drifts. Fine for clutch-based teleop (targets are relative to the current EE pose); absolute world-frame targets degrade the longer the base drives. Fixable — see "Feeding the SLAM pose into whole-body IK" above — but off until `slam_yaw_sign` is calibrated, so it drifts by default. |
 | The Odin's `slam/pcd` cloud is unordered | `pcd_source: slam` reshapes it to `(1,N,4)`, so mapping's 3×3 flying-pixel rejection spans unrelated points and is effectively inert. Acceptable because the Odin filters on-device, but do not read that filter as active. |
 | `BaseAxisMap` signs are unverified | Checked against the conventions in `base.py`, not against the physical robot. Do step 1 of the checklist. |
-| The lift is bang-bang | It servos to a deadband (1 cm by default), so it cannot hold an arbitrary height as precisely as the sim. |
+| The lift PD is not a velocity loop | The host commands a velocity and the firmware shapes it, but nothing measures column velocity, so a stalled or slipping column is only visible as height that stops changing. The 5 mm deadband is the practical holding accuracy. |
+| Against an older lift firmware the lift is bang-bang | Without `Capabilities: lift_velocity_v1` the loop falls back to the 1 cm deadband up/down servo, which cannot hold an arbitrary height as precisely. Check which path is live in `get_state()["lift_velocity_mode"]`. |
 | Self-collision and ground avoidance share one toggle | `c` turns both on or off; separating them needs two `CollisionAvoidanceLimit` instances. |
 | EE frames moved | The whole-body description puts `left_arm_ee`/`right_arm_ee` at the wrist flange with the Wuji hand attached, and the model frame is rotated 90° from the old per-arm description. Any pose recorded against the old `nero-welded-base-and-lift.mjcf` needs re-recording. |

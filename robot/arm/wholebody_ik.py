@@ -149,6 +149,8 @@ class WholeBodyIKConfig:
 
     # DampingTask cost for fix_base mode (lock vx, vy, wz too)
     base_damping_cost: float   = 100.0
+    # DampingTask cost for arm-only hardware mode (lock lift velocity).
+    lift_damping_cost: float   = 100.0
 
     # ── Velocity limits ──────────────────────────────────────────────────────
     # Freejoint linear velocity (m/s) and angular velocity (rad/s)
@@ -334,6 +336,9 @@ class WholeBodyIK:
         for i in self.base_dof_ids:
             bf[i] = self.config.base_damping_cost
         self.base_fix_task = mink.DampingTask(self.model, bf)
+        lf = np.zeros(self.model.nv)
+        lf[self.lift_dof_id] = self.config.lift_damping_cost
+        self.lift_fix_task = mink.DampingTask(self.model, lf)
 
         # ── Limits ───────────────────────────────────────────────────────────
         self.limits = [
@@ -351,8 +356,8 @@ class WholeBodyIK:
         self.avoid_collisions = bool(
             self.config.enable_collision_avoidance and self.collision_limit is not None
         )
-        # Precomputed limit lists so _solve_qp doesn't allocate per call
-        # (it runs max_iters × 200 Hz).
+        # Precomputed limit lists so _solve_qp doesn't allocate per call: the
+        # hardware path may call it max_iters times on every 108 Hz tick.
         self._limits_with_collision = (
             self.limits + [self.collision_limit] if self.collision_limit else self.limits
         )
@@ -360,6 +365,7 @@ class WholeBodyIK:
         # ── State ────────────────────────────────────────────────────────────
         self.initialized  = False
         self.fix_base     = False
+        self.fix_lift     = False
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -423,6 +429,10 @@ class WholeBodyIK:
         self.fix_base = (not self.fix_base) if fix is None else fix
         return self.fix_base
 
+    def toggle_fix_lift(self, fix: Optional[bool] = None) -> bool:
+        self.fix_lift = (not self.fix_lift) if fix is None else fix
+        return self.fix_lift
+
     def toggle_collision_avoidance(self, enable: Optional[bool] = None) -> bool:
         """Enable/disable self-collision avoidance live. No-op if no limit built."""
         if self.collision_limit is None:
@@ -459,6 +469,8 @@ class WholeBodyIK:
         ]
         if self.fix_base:
             tasks.append(self.base_fix_task)
+        if self.fix_lift:
+            tasks.append(self.lift_fix_task)
 
         l_pos = l_ori = r_pos = r_ori = np.inf
         iters = 0
@@ -466,6 +478,16 @@ class WholeBodyIK:
 
         for iters in range(1, self.config.max_iters + 1):
             vel = self._solve_qp(tasks)
+            # Arm-only hardware mode needs exact base and lift locks. High-cost
+            # damping tasks alone still permit small virtual motion when an EE
+            # task competes with them, even though dispatch to the physical
+            # actuators is disabled. Zeroing these solved velocities means only
+            # arm joints are integrated, keeping the IK model consistent with
+            # the stationary chassis and column.
+            if self.fix_base:
+                vel[self.base_dof_ids] = 0.0
+            if self.fix_lift:
+                vel[self.lift_dof_id] = 0.0
             self.configuration.integrate_inplace(vel, self.config.dt)
 
             l_err = self.left_ee_task.compute_error(self.configuration)
@@ -758,4 +780,3 @@ class WholeBodyIK:
         for jn in self._LEFT_JOINTS + self._RIGHT_JOINTS:
             lims[jn] = self.config.arm_vel_limit
         return lims
-
