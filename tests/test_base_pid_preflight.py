@@ -22,9 +22,10 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 from tools.base_pid_preflight import (  # noqa: E402
-    DEFAULT_MANIFEST, PID_FIELDS, check_can_ids_against_base, check_can_interface,
-    compare, load_manifest, main, plan_writes, read_back, run_devices,
-    sync_from_manifest, sync_open_devices, validate_manifest,
+    COMMISSIONED_MANIFEST, DEFAULT_MANIFEST, PID_FIELDS, STOCK_MANIFEST,
+    check_can_ids_against_base,
+    check_can_interface, compare, load_manifest, main, plan_writes, read_back,
+    run_devices, sync_from_manifest, sync_open_devices, validate_manifest,
 )
 
 # The commissioned numbers, restated here so a silent edit to the manifest
@@ -34,6 +35,17 @@ COMMISSIONED = {
               "output_min": -1.0, "output_max": 1.0},
     "steering": {"p": 20.0, "i": 0.0, "d": 6.0, "velocity_ff": 0.0,
                  "output_min": -0.25, "output_max": 0.25},
+}
+
+# What the controllers revert to on a power cycle -- the values persisted in
+# SPARK flash, restated here for the same reason as COMMISSIONED. These are
+# deliberately NOT the REV factory zeros: writing zeros on shutdown would not
+# restore anything, it would leave the base limp until the next power cycle.
+STOCK = {
+    "drive": {"p": 0.2, "i": 0.0, "d": 0.1, "velocity_ff": 0.0,
+              "output_min": -1.0, "output_max": 1.0},
+    "steering": {"p": 2.0, "i": 0.0, "d": 0.01, "velocity_ff": 0.0,
+                 "output_min": -1.0, "output_max": 1.0},
 }
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -110,7 +122,7 @@ def factory(**kwargs):
 
 def test_manifest_values() -> None:
     print("\nthe shipped manifest holds the commissioned values")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     check("manifest validates", not validate_manifest(manifest),
           str(validate_manifest(manifest)))
     for role, expected in COMMISSIONED.items():
@@ -129,7 +141,7 @@ def test_manifest_values() -> None:
 
 def test_can_ids() -> None:
     print("\nCAN ids agree with the running base code")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     check("manifest matches robot/base_motor.py", not check_can_ids_against_base(manifest),
           str(check_can_ids_against_base(manifest)))
 
@@ -148,7 +160,7 @@ def test_can_ids() -> None:
 
 def test_manifest_validation() -> None:
     print("\nbad manifests are rejected before anything is written")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
 
     cases = {
         "non-finite gain": ("roles", lambda m: m["roles"]["drive"].__setitem__("p", float("inf"))),
@@ -171,7 +183,7 @@ def test_manifest_validation() -> None:
 
 def test_apply_and_verify() -> None:
     print("\napply to RAM, then read every field back")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     specs = plan_writes(manifest)
     slot = manifest["pid_slot"]
 
@@ -193,7 +205,7 @@ def test_apply_and_verify() -> None:
 
 def test_readback_catches_a_deaf_controller() -> None:
     print("\na controller that ignores a write fails the preflight")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     specs = plan_writes(manifest)
     slot = manifest["pid_slot"]
 
@@ -209,7 +221,7 @@ def test_readback_catches_a_deaf_controller() -> None:
 
 def test_verify_only_never_writes() -> None:
     print("\n--verify-only writes nothing")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     specs = plan_writes(manifest)
     slot = manifest["pid_slot"]
 
@@ -222,7 +234,7 @@ def test_verify_only_never_writes() -> None:
 
 def test_unreachable_device() -> None:
     print("\na controller that is not on the bus")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     specs = plan_writes(manifest)
 
     def make(interface, can_id):
@@ -260,7 +272,7 @@ def test_tolerance() -> None:
 
 def commissioned_devices(**kwargs) -> dict[int, FakeSpark]:
     """Eight fakes already holding the manifest values, as after a good sync."""
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     slot = manifest["pid_slot"]
     devices = {}
     for spec in plan_writes(manifest):
@@ -273,7 +285,7 @@ def commissioned_devices(**kwargs) -> dict[int, FakeSpark]:
 
 def test_sync_writes_stock_controllers() -> None:
     print("\nstartup sync: stock controllers are written")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     slot = manifest["pid_slot"]
     devices = {spec.can_id: FakeSpark("can0", spec.can_id) for spec in plan_writes(manifest)}
 
@@ -291,7 +303,7 @@ def test_sync_writes_stock_controllers() -> None:
 
 def test_sync_skips_commissioned_controllers() -> None:
     print("\nstartup sync: a controller that already has the gains is left alone")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     devices = commissioned_devices()
 
     results = sync_open_devices(devices, manifest, log=None)
@@ -312,7 +324,7 @@ def test_sync_skips_commissioned_controllers() -> None:
 
 def test_sync_retries_a_dropped_read() -> None:
     print("\nstartup sync: a dropped parameter read is retried, not believed")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     # Enough dropped reads to spoil the first readback pass of every field.
     devices = commissioned_devices(drop_reads=len(PID_FIELDS))
 
@@ -325,7 +337,7 @@ def test_sync_retries_a_dropped_read() -> None:
 
 def test_sync_fails_on_a_deaf_controller() -> None:
     print("\nstartup sync: a controller that ignores the write fails")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     devices = {spec.can_id: FakeSpark("can0", spec.can_id, deaf_field="p")
                for spec in plan_writes(manifest)}
 
@@ -339,7 +351,7 @@ def test_sync_fails_on_a_deaf_controller() -> None:
 
 def test_sync_missing_device() -> None:
     print("\nstartup sync: a controller that is not among the open handles")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     devices = {spec.can_id: FakeSpark("can0", spec.can_id) for spec in plan_writes(manifest)}
     devices.pop(7)
 
@@ -354,7 +366,7 @@ def test_sync_missing_device() -> None:
 
 def test_sync_from_manifest_guards(tmp: Path) -> None:
     print("\nstartup sync: the manifest is checked before any device is touched")
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     devices = {spec.can_id: FakeSpark("can0", spec.can_id) for spec in plan_writes(manifest)}
 
     ok, problems = sync_from_manifest(devices, log=None)
@@ -370,6 +382,84 @@ def test_sync_from_manifest_guards(tmp: Path) -> None:
 
     ok, problems = sync_from_manifest(devices, manifest_path=tmp / "no_such.json", log=None)
     check("a missing manifest is refused", not ok and bool(problems), str(problems))
+
+
+def test_every_shipped_manifest_is_valid() -> None:
+    """Whatever is in config/ must be applyable, not just the two named ones.
+
+    Manifests get added for experiments (base_pid_hybrid.json was added on
+    2026-08-24 to pair the commissioned drive gains with stock steering), and a
+    typo in one is only discovered at the moment the robot is about to drive.
+    """
+    print("\nevery shipped manifest")
+    shipped = sorted((_REPO / "config").glob("base_pid_*.json"))
+    check("there are manifests to check", len(shipped) >= 2, str(len(shipped)))
+    for path in shipped:
+        manifest = load_manifest(path)
+        check(f"{path.name} validates", not validate_manifest(manifest),
+              str(validate_manifest(manifest)))
+        check(f"{path.name} names the controllers base_motor.py uses",
+              not check_can_ids_against_base(manifest),
+              str(check_can_ids_against_base(manifest)))
+        check(f"{path.name} plans all eight controllers", len(plan_writes(manifest)) == 8)
+        # A manifest without a scale silently inherits the module default, which
+        # is only right for one gain set.
+        check(f"{path.name} declares its own drive_command_scale",
+              isinstance(manifest.get("drive_command_scale"), (int, float)),
+              str(manifest.get("drive_command_scale")))
+
+
+def test_defaults_manifest() -> None:
+    """The stock manifest restored on shutdown."""
+    print("\nstock manifest")
+    manifest = load_manifest(STOCK_MANIFEST)
+
+    check("stock manifest validates", not validate_manifest(manifest),
+          str(validate_manifest(manifest)))
+    check("stock manifest matches robot/base_motor.py",
+          not check_can_ids_against_base(manifest), str(check_can_ids_against_base(manifest)))
+    check("all eight controllers are planned", len(plan_writes(manifest)) == 8)
+
+    for role, expected in STOCK.items():
+        actual = {key: manifest["roles"][role][key] for key, _s, _g in PID_FIELDS}
+        check(f"{role} holds the stock values", actual == expected, str(actual))
+
+    # Both manifests write the same slot, or the restore would leave the
+    # commissioned gains in place and merely blank a slot nobody uses.
+    commissioned = load_manifest(COMMISSIONED_MANIFEST)
+    check("stock and commissioned manifests target the same PID slot",
+          manifest["pid_slot"] == commissioned["pid_slot"],
+          f"{manifest['pid_slot']} vs {commissioned['pid_slot']}")
+    check("the two manifests actually differ",
+          manifest["roles"] != commissioned["roles"])
+    # The failure this guards against is subtle: an all-zero "stock" file looks
+    # plausible (they are the REV factory values) but would wipe the
+    # controllers rather than restore them, since these SPARKs hold non-zero
+    # gains in flash.
+    check("the stock manifest is what the robot applies by default",
+          DEFAULT_MANIFEST == STOCK_MANIFEST, str(DEFAULT_MANIFEST))
+    check("stock is a real gain set, not all zeros",
+          any(manifest["roles"][role]["p"] > 0.0 for role in manifest["roles"]),
+          str({r: manifest["roles"][r]["p"] for r in manifest["roles"]}))
+
+
+def test_restore_writes_stock_over_commissioned() -> None:
+    """A restore has to reach controllers that already hold the tuned gains."""
+    print("\nrestoring stock over commissioned gains")
+    FakeSpark.opened = []
+    commissioned = load_manifest(COMMISSIONED_MANIFEST)
+    devices = {spec.can_id: FakeSpark("can0", spec.can_id)
+               for spec in plan_writes(commissioned)}
+
+    sync_open_devices(devices, commissioned, log=None)   # a commissioned robot
+    ok, problems = sync_from_manifest(devices, manifest_path=STOCK_MANIFEST, log=None)
+    check("the restore reports no problems", ok, str(problems))
+
+    slot = commissioned["pid_slot"]
+    for spec in plan_writes(load_manifest(STOCK_MANIFEST)):
+        held = devices[spec.can_id].slots[slot]
+        check(f"{spec.label} ends at stock",
+              all(held[key] == spec.values[key] for key, _s, _g in PID_FIELDS), str(held))
 
 
 def test_yor_syncs_before_the_control_loop() -> None:
@@ -420,6 +510,58 @@ def test_yor_syncs_before_the_control_loop() -> None:
     check("the default keeps the sync on", "default=True" in main_body)
 
 
+def test_yor_restores_defaults_on_shutdown() -> None:
+    """robot/yor.py must hand the controllers back in stock condition.
+
+    Commissioned gains live in controller RAM, which outlives this process.
+    Whatever opens the bus next inherits them silently, so the shutdown path
+    is the only place that can bound how long they are in effect.
+    """
+    print("\nrobot/yor.py shutdown wiring")
+    source = (_REPO / "robot/yor.py").read_text()
+
+    check("YOR knows how to restore the stock gains",
+          "def _restore_base_pid_gains" in source)
+
+    body = source.split("def _restore_base_pid_gains")[1].split("\n    def ")[0]
+    check("the restore reads the stock manifest, not the commissioned one",
+          "self._base_pid_stock_manifest" in body and "COMMISSIONED_MANIFEST" not in body)
+    check("it only undoes a change it made",
+          "if not self._flash_base_pid" in body)
+    check("it stops the control loop before changing gains",
+          "control_loop_running" in body and "stop_control" in body)
+    check("it cannot raise out of the shutdown path", "except Exception" in body)
+
+    # Ordering: the shutdown sequence has to stop the base *before* the
+    # restore, and the restore has to happen while the device handles are
+    # still open -- i.e. before the interpreter tears the process down.
+    shutdown = source.split("def graceful_shutdown")[1].split("atexit.register")[0]
+    check("shutdown calls the restore", "_restore_base_pid_gains" in shutdown, shutdown.strip()[:0])
+    check("the base is stopped before the gains change",
+          shutdown.index("yor.base.stop_control")
+          < shutdown.index("yor._restore_base_pid_gains"))
+    check("the whole-body loop is stopped before that",
+          shutdown.index("yor.wholebody.stop") < shutdown.index("yor.base.stop_control"))
+
+    # init() raises for a living -- a failed lift home, a failed arm home, a
+    # failed PID sync -- and by then the gains may already be written. If the
+    # handler were registered after init(), the one case where the robot is
+    # left in a strange state is the one case the restore would not run.
+    body = source.split("def main()")[1]
+    check("the shutdown handler is registered before init()",
+          body.index("atexit.register(graceful_shutdown)") < body.index("yor.init()"))
+    check("a teardown failure does not skip the steps after it",
+          "def attempt(" in body and "attempt(\"base control loop stop\"" in body)
+
+    main_body = source.split("def main()")[1]
+    check("the command line exposes the switch", "--restore-base-pid" in main_body)
+    check("and it reaches the constructor",
+          "restore_base_pid=args.restore_base_pid" in main_body)
+    check("the stock manifest can be overridden too",
+          "--base-pid-stock-manifest" in main_body
+          and "base_pid_stock_manifest=args.base_pid_stock_manifest" in main_body)
+
+
 def test_environment_guards() -> None:
     print("\nenvironment guards")
     ok, detail = check_can_interface("definitely-not-an-interface")
@@ -441,7 +583,7 @@ def test_cli_dry_run(tmp: Path) -> None:
           main(["--dry-run", "--manifest", str(DEFAULT_MANIFEST)]) == 0)
 
     broken = tmp / "broken_manifest.json"
-    manifest = load_manifest(DEFAULT_MANIFEST)
+    manifest = load_manifest(COMMISSIONED_MANIFEST)
     manifest["roles"]["drive"]["p"] = -1.0
     broken.write_text(json.dumps(manifest))
     check("a dry run of a broken manifest fails",
@@ -468,7 +610,11 @@ def main_() -> int:
     test_sync_retries_a_dropped_read()
     test_sync_fails_on_a_deaf_controller()
     test_sync_missing_device()
+    test_every_shipped_manifest_is_valid()
+    test_defaults_manifest()
+    test_restore_writes_stock_over_commissioned()
     test_yor_syncs_before_the_control_loop()
+    test_yor_restores_defaults_on_shutdown()
     test_environment_guards()
     with tempfile.TemporaryDirectory() as tmp:
         test_sync_from_manifest_guards(Path(tmp))

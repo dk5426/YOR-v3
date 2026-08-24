@@ -473,6 +473,9 @@ class VelocityBase:
 
 def build(base: VelocityBase, **cfg) -> WholeBodyController:
     cfg.setdefault("enable_base_motion", False)
+    # Headless tests shouldn't write real files into
+    # artifacts/wholebody_logs/trajectories/ -- that's for live robot runs.
+    cfg.setdefault("record_trajectories", False)
     wbc = WholeBodyController(
         FakeArm([0.0, 1.32, -1.71, 1.31, 0.0, 0.0, 0.0]),
         FakeArm([0.0, 1.32, 1.71, 1.31, 0.0, 0.0, 0.0]),

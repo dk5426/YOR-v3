@@ -23,7 +23,7 @@ owned by exactly one process at a time, and a second set of SparkFlex objects
 on the same CAN bus while the base control loop is running is a way to corrupt
 both.
 
-The values live in config/base_pid_manifest.json, not here. What this file
+The values live in config/base_pid_stock.json, not here. What this file
 owns is the order of operations, which for the standalone command is:
 
     1. read the manifest and reject anything out of range
@@ -55,7 +55,27 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-DEFAULT_MANIFEST = _REPO / "config/base_pid_manifest.json"
+# Two manifests, same schema, same validation, same readback; only the numbers
+# and the intent differ.
+#
+# STOCK is what the controllers hold in flash and revert to on a power cycle.
+# It is what the robot applies by default, and what robot/yor.py writes back on
+# shutdown -- see YOR._restore_base_pid_gains. Running on it means the speed
+# axis is self-consistent: the stock drive loop is P-only and reaches about
+# half its setpoint, which is exactly what DRIVE_VEL_SCALE = 2.0 was introduced
+# to compensate for.
+#
+# COMMISSIONED is the tuned, feed-forward-dominated set measured on the floor
+# on 2026-08-17. It tracks its setpoint, which means DRIVE_VEL_SCALE = 2.0 is
+# *not* correct for it -- see docs/BASE_COMMAND_LOOP_REVIEW.md finding 6. It is
+# opt-in until that is resolved:
+#
+#     python robot/yor.py --base-pid-manifest config/base_pid_commissioned.json
+STOCK_MANIFEST = _REPO / "config/base_pid_stock.json"
+COMMISSIONED_MANIFEST = _REPO / "config/base_pid_commissioned.json"
+
+# What gets applied when nothing says otherwise.
+DEFAULT_MANIFEST = STOCK_MANIFEST
 
 # Every field the preflight writes, as (manifest key, setter, getter). Readback
 # covers exactly this list, so a field can never be written without being
@@ -123,6 +143,16 @@ def validate_manifest(manifest: dict) -> list[str]:
     if not isinstance(slot, int) or isinstance(slot, bool) or not (0 <= slot <= 3):
         errors.append(f"pid_slot must be an integer 0-3, got {slot!r}")
 
+    # Optional, but if present it has to be sane: it multiplies every wheel
+    # velocity command, so a typo here drives the robot at the wrong speed and
+    # corrupts the odometry with it.
+    scale = manifest.get("drive_command_scale")
+    if scale is not None:
+        if not isinstance(scale, (int, float)) or isinstance(scale, bool):
+            errors.append(f"drive_command_scale must be a number, got {scale!r}")
+        elif not math.isfinite(scale) or not (0.1 <= scale <= 10.0):
+            errors.append(f"drive_command_scale={scale} is outside [0.1, 10.0]")
+
     roles = manifest.get("roles")
     if not isinstance(roles, dict) or not roles:
         errors.append("roles must be a non-empty object")
@@ -169,6 +199,25 @@ def validate_manifest(manifest: dict) -> list[str]:
             seen[can_id] = f"{module_name}.{role_name}"
 
     return errors
+
+
+def drive_command_scale(manifest_path: Path, default: float) -> tuple[float, str]:
+    """The command scale a manifest declares, with a line explaining the choice.
+
+    Bound to the manifest rather than left a module constant because it is only
+    correct for one set of drive gains: the stock P-only loop needs 2.0 to
+    reach the commanded speed, the feed-forward-dominated commissioned loop
+    needs about 1.0, and applying either to the other is a 2x speed error that
+    the odometry silently inherits. Selecting a manifest now selects both.
+    """
+    try:
+        manifest = load_manifest(Path(manifest_path))
+    except Exception as exc:
+        return default, f"{default} (manifest unreadable: {exc}; using the built-in default)"
+    scale = manifest.get("drive_command_scale")
+    if scale is None:
+        return default, f"{default} (manifest declares none; using the built-in default)"
+    return float(scale), f"{float(scale)} (from {Path(manifest_path).name})"
 
 
 def plan_writes(manifest: dict) -> list[DeviceSpec]:
@@ -487,7 +536,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1],
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST,
-                        help="PID manifest to apply (default: config/base_pid_manifest.json)")
+                        help="PID manifest to apply (default: config/base_pid_stock.json)")
     parser.add_argument("--dry-run", action="store_true",
                         help="validate the manifest and the environment; touch no CAN device")
     parser.add_argument("--verify-only", action="store_true",

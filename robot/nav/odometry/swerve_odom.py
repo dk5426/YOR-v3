@@ -41,6 +41,24 @@ MODULE_POSITIONS = np.array([
 # ── Calibration ──────────────────────────────────────────────────────────────
 METERS_PER_ROTATION = 0.049922   # calibrated via calibrate_drive.py (2026-03-30, 5 runs, σ=0.82%)
 
+# UNRESOLVED, and it biases this module's output by about 5%.
+#
+# Two later tape calibrations disagree with the value above and agree with each
+# other: PHASE0_BASELINE measured 0.047530598 over five runs (0.74% CV), and a
+# floor run on 2026-08-24 drove 0.59 m by tape while the wheels turned 12.466
+# motor rotations, which back-solves to 0.0473 -- within 0.4% of PHASE0 and
+# 5.5% below the constant here. Using 0.049922, this module over-reports
+# distance by that 5.5%, and robot/slam_node_.py feeds it straight into the EKF.
+#
+# The likeliest explanation is not that anyone measured wrong: 2026-03-30
+# predates the arms and lift being mounted, and a more heavily loaded tyre has a
+# smaller effective rolling radius. If so both numbers were right for the robot
+# that was weighed, and this one is simply stale.
+#
+# Deliberately NOT changed here. This constant feeds navigation, not base
+# tuning, and the honest fix is to re-run calibrate_drive.py on the robot as it
+# stands now rather than to paste in a number measured for a different purpose.
+
 # ── Physical limits (per step, not per second) ───────────────────────────────
 MAX_STEP_DIST  = 0.05    # m   — max displacement per update (~0.5 m/s at 10ms)
 MAX_STEP_ANGLE = 0.10    # rad — max rotation per update (~5.7° per step)

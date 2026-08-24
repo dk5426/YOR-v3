@@ -1,0 +1,431 @@
+{
+  "created_at": "20260820-205524",
+  "arm": "right",
+  "can_port": "can_right",
+  "mapping_mode": "wholebody_teleop",
+  "scene_xml": "/home/pi-v3/YOR-v3-try/description/scene_wholebody.xml",
+  "scene_sha256": "f0b72a2ede052ab31cd4213329b683978c956503f15f06a91199807f9fe3dc8b",
+  "controller_initial_wxyz_xyz": [
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "translation_mm": 50.0,
+  "rotation_deg": 10.0,
+  "settle_timeout_s": 8.0,
+  "settle_velocity_tolerance_rad_s": 0.08,
+  "settle_stable_time_s": 0.3,
+  "target_position_tolerance_m": 0.03,
+  "target_rotation_tolerance_rad": 0.13962634015954636,
+  "quest_to_robot_translation_frame": [
+    [
+      0.0,
+      -1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ],
+    [
+      -1.0,
+      0.0,
+      0.0
+    ]
+  ],
+  "quest_to_ee_rotation_axes": [
+    [
+      0.0,
+      -1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      -1.0
+    ],
+    [
+      1.0,
+      0.0,
+      0.0
+    ]
+  ],
+  "quest_to_ee_rotation_frame": [
+    [
+      0.0,
+      0.0,
+      1.0
+    ],
+    [
+      -1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      -1.0,
+      0.0
+    ]
+  ],
+  "tests": [
+    {
+      "name": "rotation_pitch_up",
+      "description": "Simulate pitching the controller nose UP by 10 degrees",
+      "controller_target_wxyz_xyz": [
+        0.9961946980917455,
+        0.08715574274765817,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "controller_local_translation_delta_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "controller_local_rotation_vector_rad": [
+        0.17453292519943295,
+        0.0,
+        0.0
+      ],
+      "command_accepted": true,
+      "commanded_ee_wxyz_xyz": [
+        0.07882325499775442,
+        -0.613026434400609,
+        0.029966480308978766,
+        0.7855491679427371,
+        -0.37544718014408,
+        -0.25269130506852155,
+        0.3540093963120363
+      ],
+      "commanded_translation_delta_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "commanded_ee_local_translation_delta_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "commanded_local_rotation_vector_rad": [
+        -2.5290248563136467e-17,
+        1.411674718257544e-16,
+        0.17453292519943292
+      ],
+      "observed_ee_wxyz_xyz": [
+        0.1430076118010517,
+        -0.6130655639848136,
+        -0.019890234153154714,
+        0.7767263455093274,
+        -0.37565240520760323,
+        -0.2527392974660131,
+        0.35442280576067503
+      ],
+      "observed_translation_delta_m": [
+        -0.0002052250635232178,
+        -4.799239749153639e-05,
+        0.000413409448638713
+      ],
+      "observed_ee_local_translation_delta_m": [
+        -0.0003608442715603968,
+        -2.9287146972583957e-06,
+        0.0002917375592054059
+      ],
+      "observed_ee_local_rotation_vector_rad": [
+        0.0009550005299973232,
+        -0.0007473868523769503,
+        0.010990563431760993
+      ],
+      "observed_joint_angles": [
+        -0.0010000000474974513,
+        1.3240000009536743,
+        1.7170000076293945,
+        1.2879999876022339,
+        -0.007000000216066837,
+        0.0020000000949949026,
+        0.19699999690055847
+      ],
+      "outbound_settle": {
+        "success": false,
+        "velocity_settled": true,
+        "pose_within_tolerance": false,
+        "elapsed_s": 0.3015808130003279,
+        "max_joint_velocity_rad_s": 0.0010000000474974513,
+        "position_error_m": 0.0004640344482243307,
+        "rotation_error_rad": 0.16354684641142206,
+        "rotation_error_deg": 9.370544052048777
+      },
+      "operator_observation": "",
+      "baseline_command_accepted": true,
+      "baseline_settle": {
+        "success": false,
+        "velocity_settled": true,
+        "pose_within_tolerance": false,
+        "elapsed_s": 0.30221040199830895,
+        "max_joint_velocity_rad_s": 0.0010000000474974513,
+        "position_error_m": 0.002697526628619697,
+        "rotation_error_rad": 0.16871157807157833,
+        "rotation_error_deg": 9.666461378493326
+      },
+      "baseline_observed_ee_wxyz_xyz": [
+        0.07313184091876536,
+        -0.6173665874748131,
+        0.016241711923163694,
+        0.7831005282256814,
+        -0.3737931640118868,
+        -0.2535850505611088,
+        0.35594384701986964
+      ]
+    },
+    {
+      "name": "rotation_yaw_left",
+      "description": "Simulate yawing the controller nose LEFT by 10 degrees",
+      "controller_target_wxyz_xyz": [
+        0.9961946980917455,
+        0.0,
+        0.08715574274765817,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "controller_local_translation_delta_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "controller_local_rotation_vector_rad": [
+        0.0,
+        0.17453292519943295,
+        0.0
+      ],
+      "command_accepted": true,
+      "commanded_ee_wxyz_xyz": [
+        0.0929760038763502,
+        -0.6237825080325404,
+        -0.09109244993514753,
+        0.7706834700060923,
+        -0.37544718014408,
+        -0.25269130506852155,
+        0.3540093963120363
+      ],
+      "commanded_translation_delta_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "commanded_ee_local_translation_delta_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "commanded_local_rotation_vector_rad": [
+        -0.17453292519943286,
+        -7.881981887002264e-17,
+        1.6229353128283304e-17
+      ],
+      "observed_ee_wxyz_xyz": [
+        0.10321755610260606,
+        -0.6237472605211279,
+        -0.07521538889347942,
+        0.7711213499691191,
+        -0.3693615082201418,
+        -0.25345294556022135,
+        0.3511975081814394
+      ],
+      "observed_translation_delta_m": [
+        0.006085671923938218,
+        -0.0007616404916997999,
+        -0.002811888130596907
+      ],
+      "observed_ee_local_translation_delta_m": [
+        0.0012157010679239863,
+        0.0001259519828905036,
+        -0.006635391538926155
+      ],
+      "observed_ee_local_rotation_vector_rad": [
+        -0.13719449075392962,
+        0.004562197980098982,
+        0.0037164198958205713
+      ],
+      "observed_joint_angles": [
+        -0.0010000000474974513,
+        1.2990000247955322,
+        1.6959999799728394,
+        1.2949999570846558,
+        0.02500000037252903,
+        0.15700000524520874,
+        0.01600000075995922
+      ],
+      "outbound_settle": {
+        "success": true,
+        "velocity_settled": true,
+        "pose_within_tolerance": true,
+        "elapsed_s": 0.301022996998654,
+        "max_joint_velocity_rad_s": 0.0,
+        "position_error_m": 0.006747015181796938,
+        "rotation_error_rad": 0.03779809897633872,
+        "rotation_error_deg": 2.165671544961966
+      },
+      "operator_observation": "",
+      "baseline_command_accepted": true,
+      "baseline_settle": {
+        "success": true,
+        "velocity_settled": true,
+        "pose_within_tolerance": true,
+        "elapsed_s": 0.30124786499800393,
+        "max_joint_velocity_rad_s": 0.0,
+        "position_error_m": 0.0023448212459424144,
+        "rotation_error_rad": 0.03671257529002235,
+        "rotation_error_deg": 2.1034756191745547
+      },
+      "baseline_observed_ee_wxyz_xyz": [
+        0.13469216398425699,
+        -0.6165039465203398,
+        -0.03679926597008472,
+        0.7748720661568252,
+        -0.37754049240055465,
+        -0.2525200184541066,
+        0.35296685548883644
+      ]
+    },
+    {
+      "name": "rotation_about_forward",
+      "description": "Simulate rolling the controller about its FORWARD axis by 10 degrees",
+      "controller_target_wxyz_xyz": [
+        0.9961946980917455,
+        0.0,
+        0.0,
+        -0.08715574274765817,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "controller_local_translation_delta_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "controller_local_rotation_vector_rad": [
+        0.0,
+        0.0,
+        -0.17453292519943295
+      ],
+      "command_accepted": true,
+      "commanded_ee_wxyz_xyz": [
+        0.14848390671147213,
+        -0.6785774618096133,
+        -0.010675724589498345,
+        0.7192851914756837,
+        -0.37544718014408,
+        -0.25269130506852155,
+        0.3540093963120363
+      ],
+      "commanded_translation_delta_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "commanded_ee_local_translation_delta_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "commanded_local_rotation_vector_rad": [
+        -1.4765129836199728e-17,
+        0.1745329251994329,
+        5.3187949178012046e-17
+      ],
+      "observed_ee_wxyz_xyz": [
+        0.1333064462532722,
+        -0.6247715716838173,
+        -0.03759857468904476,
+        0.7684245062362397,
+        -0.3737310526744718,
+        -0.25282229272170076,
+        0.35202725284723185
+      ],
+      "observed_translation_delta_m": [
+        0.0017161274696081974,
+        -0.00013098765317920424,
+        -0.0019821434648044645
+      ],
+      "observed_ee_local_translation_delta_m": [
+        0.0014876028746301589,
+        0.0002133478555134459,
+        -0.0021523625048388523
+      ],
+      "observed_ee_local_rotation_vector_rad": [
+        -0.04225367514456959,
+        0.0219350086916165,
+        0.0024311098360139498
+      ],
+      "observed_joint_angles": [
+        0.009999999776482582,
+        1.3839999437332153,
+        1.8070000410079956,
+        1.2970000505447388,
+        0.07500000298023224,
+        0.07000000029802322,
+        0.007000000216066837
+      ],
+      "outbound_settle": {
+        "success": false,
+        "velocity_settled": true,
+        "pose_within_tolerance": false,
+        "elapsed_s": 0.30153956600042875,
+        "max_joint_velocity_rad_s": 0.0,
+        "position_error_m": 0.002625098850004753,
+        "rotation_error_rad": 0.15834411585476452,
+        "rotation_error_deg": 9.072449549208551
+      },
+      "operator_observation": "",
+      "baseline_command_accepted": true,
+      "baseline_settle": {
+        "success": false,
+        "velocity_settled": true,
+        "pose_within_tolerance": false,
+        "elapsed_s": 0.30402309100099956,
+        "max_joint_velocity_rad_s": 0.0,
+        "position_error_m": 0.0017876485108774707,
+        "rotation_error_rad": 0.15653496815946555,
+        "rotation_error_deg": 8.9687930217521
+      },
+      "baseline_observed_ee_wxyz_xyz": [
+        0.16397887598810584,
+        -0.6662817772057752,
+        0.0028735063922415527,
+        0.727441588413946,
+        -0.3768739567379735,
+        -0.25263210969673994,
+        0.35293399329106245
+      ]
+    }
+  ],
+  "home_ee_wxyz_xyz": [
+    0.14698842991195074,
+    -0.613305434588836,
+    -0.023576325409858264,
+    0.7756900168598195,
+    -0.37544718014408,
+    -0.25269130506852155,
+    0.3540093963120363
+  ],
+  "home_joint_angles": [
+    -0.0010000000474974513,
+    1.3250000476837158,
+    1.7200000286102295,
+    1.3029999732971191,
+    -0.007000000216066837,
+    0.003000000026077032,
+    0.007000000216066837
+  ]
+}

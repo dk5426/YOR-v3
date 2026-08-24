@@ -1,0 +1,6 @@
+[console-log] mirroring output to /home/pi-v3/YOR-v3-try/artifacts/wholebody_logs/yor_20260820_163715.log
+[yor] posture-fix mode: refresh-target
+[PicoLift] Opening serial /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG02XPI5-if00-port0 @ 115200...
+[PicoLift] Serial open OK
+[ArmNode] Initializing can_left with nerolib...
+[ArmNode] Failed to initialize arm on can_left: Failed to enable arm

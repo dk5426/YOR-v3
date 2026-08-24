@@ -66,8 +66,45 @@ class ControllerState:
         return SE3.from_rotation_and_translation(rotation=SO3.from_matrix(rotation_mat), translation=translation)
 
 
-def parse_controller_state(controller_state_string: str) -> ControllerState:
-    left_data, right_data = controller_state_string.split("|")
+def parse_controller_state(
+    controller_state_string: str, legacy: bool = False
+) -> ControllerState:
+    """Parse one Quest ZMQ payload.
+
+    Quest app v0.1 (`com.GRAIL.YORTeleop`) sends two pipe-separated sections,
+    `Left Controller | Right Controller`. v0.2 (`com.GRAIL.Yor_Teleop`) adds a
+    head-pose section first: `Head | Left Controller | Right Controller`. The
+    two are gated by `legacy` rather than auto-detected from the section
+    count, so a mismatch between the flag and what the headset is actually
+    sending fails loudly instead of silently parsing something unintended.
+
+    `legacy=True` requires exactly the two original sections in order.
+    `legacy=False` (default -- v0.2) locates the left/right sections by their
+    `Left Controller:` / `Right Controller:` label regardless of position or
+    how many other sections (head pose, or anything added later) surround
+    them; the head pose itself is not parsed.
+    """
+    sections = controller_state_string.split("|")
+    if legacy:
+        if len(sections) != 2:
+            raise ValueError(
+                "legacy (v0.1) controller payload must have exactly 2 "
+                f"sections (left|right), got {len(sections)}"
+            )
+        left_data, right_data = sections
+    else:
+        left_matches = [
+            s for s in sections if s.strip().lower().startswith("left controller:")
+        ]
+        right_matches = [
+            s for s in sections if s.strip().lower().startswith("right controller:")
+        ]
+        if len(left_matches) != 1 or len(right_matches) != 1:
+            raise ValueError(
+                "controller payload must contain exactly one left and one "
+                f"right controller section (received {len(sections)} sections)"
+            )
+        left_data, right_data = left_matches[0], right_matches[0]
 
     left_data_list = left_data.split(";")[1:-1]
     right_data_list = right_data.split(";")[1:-1]

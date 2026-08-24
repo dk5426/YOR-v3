@@ -175,7 +175,7 @@ def test_oculus_source_hook():
         t += DT
         noisy = np.array([0.2, 0.1, 1.0]) + rng.normal(0.0, 0.003, 3)
         raw.append(noisy)
-        out.append(src._filtered(sample(t, noisy, [0.0, 0.0, 0.0]))["left"].translation())
+        out.append(src._filtered(sample(t, noisy, [0.0, 0.0, 0.0]), t)["left"].translation())
     raw, out = np.array(raw), np.array(out[100:])
     check("receive hook smooths the left controller",
           out.std(axis=0).max() < raw.std(axis=0).max() / 2,
@@ -185,8 +185,58 @@ def test_oculus_source_hook():
     off = OculusSource(host="127.0.0.1", pose_filter=False)
     cs = sample(0.1, [0.2, 0.1, 1.0], [0.0, 0.0, 0.0])
     check("--no-pose-filter passes poses through",
-          np.allclose(off._filtered(cs)["left"].translation(),
+          np.allclose(off._filtered(cs, 0.1)["left"].translation(),
                       cs.left_SE3.translation()))
+
+
+def test_quest_app_versions():
+    print("\nQuest app v0.1 / v0.2 packet gating")
+    from robot.teleop.oculus_msgs import parse_controller_state
+    from robot.teleop.wholebody_teleop import OculusSource
+
+    def section(label, extra):
+        return f"{label}:;{extra};"
+
+    left = section("Left Controller", "  Left X: False;  Left Y: False;  Left Menu: False;"
+                    "  Left Thumbstick: False;  Left Index Trigger: 0;  Left Hand Trigger: 0;"
+                    "  Left Thumbstick Axes: 0,0;  Left Local Position: 0.1,0.2,0.3;"
+                    "  Left Local Rotation: 0,0,0,1")
+    right = section("Right Controller", "  Right A: False;  Right B: False;  Right Menu: False;"
+                     "  Right Thumbstick: False;  Right Index Trigger: 0;  Right Hand Trigger: 0;"
+                     "  Right Thumbstick Axes: 0,0;  Right Local Position: 0.4,0.5,0.6;"
+                     "  Right Local Rotation: 0,0,0,1")
+    head = section("Head", "  Head Position: 0,1.6,0;  Head Rotation: 0,0,0,1")
+
+    v01_payload = left + "|" + right
+    v02_payload = head + "|" + left + "|" + right
+
+    cs = parse_controller_state(v01_payload, legacy=True)
+    check("legacy=True parses a v0.1 (Left|Right) payload",
+          np.allclose(cs.left_local_position, [0.1, 0.2, 0.3])
+          and np.allclose(cs.right_local_position, [0.4, 0.5, 0.6]))
+
+    cs = parse_controller_state(v02_payload)
+    check("legacy=False (default) parses a v0.2 (Head|Left|Right) payload",
+          np.allclose(cs.left_local_position, [0.1, 0.2, 0.3])
+          and np.allclose(cs.right_local_position, [0.4, 0.5, 0.6]))
+
+    cs = parse_controller_state(v01_payload)
+    check("legacy=False also parses a v0.1 payload (label match is order/count agnostic)",
+          np.allclose(cs.left_local_position, [0.1, 0.2, 0.3]))
+
+    raised = False
+    try:
+        parse_controller_state(v02_payload, legacy=True)
+    except ValueError:
+        raised = True
+    check("legacy=True on a v0.2 payload fails loudly instead of misparsing", raised)
+
+    src = OculusSource(host="127.0.0.1", legacy_oculus_app=True)
+    check("OculusSource(legacy_oculus_app=True) stores the gate",
+          src._legacy_oculus_app is True)
+    src = OculusSource(host="127.0.0.1")
+    check("OculusSource defaults to the v0.2 (non-legacy) parser",
+          src._legacy_oculus_app is False)
 
 
 def main() -> int:
@@ -196,6 +246,7 @@ def main() -> int:
         test_pose_tracking_lag,
         test_glitch_rejection,
         test_oculus_source_hook,
+        test_quest_app_versions,
     ):
         test()
 

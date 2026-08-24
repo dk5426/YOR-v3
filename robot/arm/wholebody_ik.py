@@ -55,12 +55,14 @@ Usage (real hardware):
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import mujoco
 import numpy as np
+import qpsolvers
 
 import mink
 
@@ -144,6 +146,138 @@ class WholeBodyIKConfig:
     # Unknown joint names raise at construction rather than being ignored.
     arm_posture_cost_overrides: dict[str, float] = field(default_factory=dict)
 
+    # Whether solve() refreshes the posture task's *entire* reference to the
+    # current configuration every call, or only touches it (lift DOF only)
+    # when a lift_target is given -- the latter is legacy behavior: with no
+    # lift_target (e.g. arms-only sessions where the lift is never touched),
+    # the posture reference is set once at init_from_keyframe() and never
+    # refreshed again, so it becomes a fixed, increasingly stale attractor
+    # for the whole session. True turns the posture task into a proper
+    # minimum-norm null-space regularizer (discourage unnecessary null-space
+    # velocity each solve) instead of a pull toward a fixed, distant point.
+    refresh_posture_target: bool = False
+
+    # ── Redundancy resolution strategy ────────────────────────────────────────
+    # How the null space (the freedom left over once both 6-DOF EE tasks are
+    # satisfied) gets resolved. All three should reach the same EE targets;
+    # they differ in HOW the leftover freedom is used -- which is exactly
+    # what's been under test, see artifacts/wholebody_logs/
+    # posture_fix_commands.md for the empirical story (soft weighting was
+    # tried up to a ~100,000:1 EE:posture ratio and the instability neither
+    # shrank nor moved -- confirming it's structural, not a tuning problem).
+    #
+    #   "soft"            - today's/default behavior: EE tasks and posture
+    #                        both soft costs in one QP (mink.solve_ik's
+    #                        tasks=). Simple and always finds a best-effort
+    #                        answer, but nothing stops the posture term from
+    #                        perturbing EE tracking a little, or the
+    #                        null-space optimum from jumping discontinuously
+    #                        between two equally-cheap points on the arm's
+    #                        self-motion manifold (observed on joints 3/5 --
+    #                        elbow region -- under refresh_posture_target).
+    #                        (A third mode, "hard_constraint", promoted the
+    #                        EE tasks to mink's constraints= for exact
+    #                        null-space confinement. It was implemented, A/B'd
+    #                        on hardware 2026-08-20, and removed: it barely
+    #                        improved on "soft" (3.6 vs 5.3 elbow flips per
+    #                        1000 ticks, against dls_projector's 2.2) and could
+    #                        return no solution at all near a singularity.)
+    #   "dls_projector"    - hand-rolled damped-least-squares pseudoinverse
+    #                        plus explicit null-space projection
+    #                        (q̇ = J⁺ẋ + (I - J⁺J)q̇₀), bypassing mink's task
+    #                        stack for the EE+posture resolution entirely.
+    #                        Never infeasible on its own -- degrades smoothly
+    #                        through singularities/self-motion ambiguity
+    #                        instead of jumping or failing -- at the cost of
+    #                        exactness (bounded leakage, set by dls_damping).
+    #                        Joint/collision limits aren't part of the same
+    #                        solve; they're enforced afterward by projecting
+    #                        the result onto them via a small auxiliary QP.
+    redundancy_resolution: Literal["soft", "dls_projector"] = "dls_projector"
+
+    # Tikhonov/DLS damping λ for "dls_projector"'s pseudoinverse
+    # J⁺ = Jᵀ(JJᵀ + λ²I)⁻¹. Larger = more robust near singularities, at the
+    # cost of slower/less exact EE tracking there. 0.01-0.1 is the usual
+    # range in the redundancy-resolution literature. Unused by "soft".
+    dls_damping: float = 0.05
+
+    # ── dls_projector null-space (secondary) objectives ──────────────────────
+    # Everything in this block shapes ONLY redundancy_resolution=
+    # "dls_projector"; "soft" ignores it entirely.
+    #
+    # The secondary solve picks z in  q̇ = q̇_primary + N z  by minimising a
+    # stacked weighted least-squares of the objectives below, rather than
+    # projecting a single hand-built gradient step. Weights are relative to
+    # each other; only their ratios matter.
+    #
+    # Setting continuity/swivel/manipulability weights to 0 with
+    # nullspace_posture_weight=1 reproduces the older behaviour
+    # (q̇ = q̇_primary + N q̇_posture) exactly -- see
+    # tests/test_nullspace_objectives.py.
+    #
+    # Note dim(null(J)) is only 2 with both arms tracking 6-DOF targets and
+    # the base/lift fixed (14 free DOF - 12 task rows), i.e. one swivel DOF
+    # per arm. A strict task-priority hierarchy would leave nothing below the
+    # first level, so these are weights in one solve, not nested projections.
+    nullspace_posture_weight: float = 1.0
+
+    # Penalise ||q̇ - q̇_prev||, where q̇_prev is the velocity the previous
+    # solve() call actually applied. Damps tick-to-tick changes in null-space
+    # motion (the elbow "swimming" between equivalent solutions) without
+    # touching EE tracking, which lives in the primary term.
+    # Default 0: measured counterproductive on this robot, see the sweep
+    # quoted in _solve_qp_dls_projector. Raise only with a metric in hand.
+    nullspace_continuity_weight: float = 0.0
+
+    # Elbow swivel: hold each arm's elbow at a chosen angle about the
+    # shoulder->wrist axis, instead of letting the solver pick whichever
+    # elbow branch is locally cheapest each tick.
+    # Measured elbow drift over a reversing target with an abrupt
+    # disturbance: weight 0 -> 26.9°, 1.0 -> 8.2°, 5.0 -> 1.9°, with EE
+    # tracking unchanged (0.287 -> 0.235 -> 0.235 mm median). 1.0 is a
+    # conservative starting point; 5.0 held noticeably tighter in the
+    # kinematic sweep and is worth an A/B on hardware.
+    nullspace_swivel_weight: float = 1.0
+    elbow_swivel_gain: float = 1.0
+    # Per-side target swivel angle in radians, keys "left"/"right". Any side
+    # left out is latched from the pose at the first solve after
+    # init_from_keyframe()/init_from_qpos(), so the arm keeps the elbow
+    # branch it started in rather than choosing one.
+    elbow_swivel_targets: dict[str, float] = field(default_factory=dict)
+    # The swivel angle is undefined when the elbow lies on the shoulder-wrist
+    # axis (arm straight). Its weight is faded out smoothly as the elbow's
+    # perpendicular offset falls below this (metres), so a straightening arm
+    # relaxes the objective instead of chasing a singular angle.
+    elbow_swivel_min_offset: float = 0.03
+
+    # Optional manipulability maximisation. OFF by default: the gradient is
+    # finite-differenced (7 perturbed Jacobians per arm per iteration), which
+    # is the most expensive thing in the solve when enabled.
+    enable_manipulability: bool = False
+    manipulability_weight: float = 0.5
+    # Step size in radians along the (normalised) ascent direction, per
+    # solver iteration -- not a multiplier on the raw gradient, whose scale
+    # is arbitrary.
+    manipulability_gain: float = 0.02
+    # Smoothstep gate on mu = sqrt(det(J J^T)) of each arm's 6x7 Jacobian:
+    # inactive at mu >= gate_on, full weight at mu <= gate_full. Keeps the
+    # objective out of the way except when the arm is actually getting close
+    # to a singular configuration. gate_on must exceed gate_full.
+    manipulability_gate_on: float = 0.02
+    manipulability_gate_full: float = 0.005
+    manipulability_fd_step: float = 1e-4
+
+    # Tikhonov term on z in the secondary solve. N is rank-deficient by
+    # construction, so this is what makes the normal equations well posed;
+    # it also bounds z's component outside range(N) to zero.
+    nullspace_regularization: float = 1e-8
+
+    # Singular values below this fraction of the largest are treated as zero
+    # when building the null-space projector, i.e. a direction the arm has
+    # effectively lost is handed to the secondary objectives rather than
+    # being fought over by the primary one.
+    nullspace_rank_tol: float = 1e-6
+
     # DampingTask costs for ground constraint (lock z, roll, pitch)
     ground_lock_cost: float    = 200.0  # high → robot stays upright and on ground
 
@@ -212,9 +346,9 @@ class WholeBodyIK:
 
     The mobile base uses three planar joints (base_x, base_y, base_yaw), so
     mink optimises (x, y, theta) directly with no ground-lock task needed.
-    Arms and lift are controlled as usual. Optional hard-constraint
-    self-collision avoidance keeps the arms clear of the lift column, the
-    chassis, and each other.
+    Arms and lift are controlled as usual. Optional self-collision
+    avoidance (a hard QP constraint) keeps the arms clear of the lift
+    column, the chassis, and each other.
 
     Parameters
     ----------
@@ -228,6 +362,13 @@ class WholeBodyIK:
     _BASE_FREEJOINT  = "base_freejoint"
     _BASE_JOINTS     = ["base_x", "base_y", "base_yaw"]
     _LIFT_JOINT      = "Slider 7"
+    # Shoulder / elbow / wrist bodies used by the elbow-swivel objective.
+    # Verified against the model at the home keyframe: link1+link2 share an
+    # origin at the shoulder, link3+link4 at the elbow, link5+link6 at the
+    # wrist (upper arm 0.310 m, forearm 0.270 m on this robot).
+    _SWIVEL_BODIES   = {"shoulder": "{side}_arm_link1",
+                        "elbow":    "{side}_arm_link3",
+                        "wrist":    "{side}_arm_link5"}
     _LEFT_JOINTS     = [f"left_arm_joint{i}"  for i in range(1, 8)]
     _RIGHT_JOINTS    = [f"right_arm_joint{i}" for i in range(1, 8)]
     _LEFT_EE_SITE    = "left_arm_ee"
@@ -288,6 +429,15 @@ class WholeBodyIK:
         self.base_dof_ids = [self.model.joint(j).dofadr[0] for j in self._BASE_JOINTS]
         self.lift_dof_id  = self.model.joint(self._LIFT_JOINT).dofadr[0]
         self.arm_dof_ids  = [self.model.joint(n).dofadr[0] for n in self._LEFT_JOINTS + self._RIGHT_JOINTS]
+        # Per-arm DOF ids, for objectives that are defined one arm at a time
+        # (elbow swivel, manipulability) rather than over the whole body.
+        # Every DOF the whole-body solver is responsible for, in one array.
+        self._ik_dof_ids = np.array(
+            list(self.base_dof_ids) + [self.lift_dof_id] + list(self.arm_dof_ids))
+        self._left_arm_dof_ids  = np.array(
+            [self.model.joint(n).dofadr[0] for n in self._LEFT_JOINTS])
+        self._right_arm_dof_ids = np.array(
+            [self.model.joint(n).dofadr[0] for n in self._RIGHT_JOINTS])
 
         # qpos addresses
         self.base_qpos_adrs = np.array([int(self.model.joint(j).qposadr) for j in self._BASE_JOINTS])
@@ -363,6 +513,24 @@ class WholeBodyIK:
         )
 
         # ── State ────────────────────────────────────────────────────────────
+        # dls_projector secondary-objective state.
+        # _prev_vel is the velocity the last solve() actually applied (after
+        # fix_base/fix_lift zeroing), used by the continuity objective.
+        # _swivel_target latches per side so the arm keeps the elbow branch
+        # it started in; None means "latch on next solve".
+        self._prev_vel: Optional[np.ndarray] = None
+        self._swivel_target: dict[str, Optional[float]] = {
+            side: self.config.elbow_swivel_targets.get(side)
+            for side in ("left", "right")
+        }
+        # Scratch MjData for finite-difference gradients, so perturbing a
+        # configuration never touches the live one.
+        self._fd_data = mujoco.MjData(self.model)
+        # Reused MuJoCo Jacobian buffers -- these are filled on every swivel
+        # row, several times per solver iteration.
+        self._jac_buf_p = np.zeros((3, self.model.nv))
+        self._jac_buf_r = np.zeros((3, self.model.nv))
+
         self.initialized  = False
         self.fix_base     = False
         self.fix_lift     = False
@@ -377,12 +545,14 @@ class WholeBodyIK:
         mujoco.mj_forward(self.model, self.data)
         self.configuration.update(self.data.qpos)
         self.posture_task.set_target_from_configuration(self.configuration)
+        self._reset_nullspace_state()
         self.initialized = True
 
     def init_from_qpos(self, qpos: np.ndarray) -> None:
         """Initialise from an arbitrary full qpos vector."""
         self.configuration.update(qpos)
         self.posture_task.set_target_from_configuration(self.configuration)
+        self._reset_nullspace_state()
         self.initialized = True
 
     def update_configuration(self, qpos: np.ndarray) -> None:
@@ -457,27 +627,32 @@ class WholeBodyIK:
         self.left_ee_task.set_target(T_left)
         self.right_ee_task.set_target(T_right)
 
-        if lift_target is not None:
+        if self.config.refresh_posture_target:
+            # Minimum-norm null-space regularizer: reference wherever we
+            # currently are, every solve, rather than a fixed point from
+            # init -- see the field's docstring in WholeBodyIKConfig.
+            q_ref = self.configuration.q.copy()
+            if lift_target is not None:
+                q_ref[self._lift_qpos_adr] = self.clamp_lift(lift_target)
+            self.posture_task.set_target(q_ref)
+        elif lift_target is not None:
             q_ref = self.configuration.q.copy()
             q_ref[self._lift_qpos_adr] = self.clamp_lift(lift_target)
             self.posture_task.set_target(q_ref)
 
-        tasks = [
-            self.left_ee_task,
-            self.right_ee_task,
-            self.posture_task,
-        ]
+        ee_tasks = [self.left_ee_task, self.right_ee_task]
+        other_tasks = [self.posture_task]
         if self.fix_base:
-            tasks.append(self.base_fix_task)
+            other_tasks.append(self.base_fix_task)
         if self.fix_lift:
-            tasks.append(self.lift_fix_task)
+            other_tasks.append(self.lift_fix_task)
 
         l_pos = l_ori = r_pos = r_ori = np.inf
         iters = 0
         prev_base_q = self.configuration.q[self.base_qpos_adrs]
 
         for iters in range(1, self.config.max_iters + 1):
-            vel = self._solve_qp(tasks)
+            vel = self._solve_qp(ee_tasks, other_tasks)
             # Arm-only hardware mode needs exact base and lift locks. High-cost
             # damping tasks alone still permit small virtual motion when an EE
             # task competes with them, even though dispatch to the physical
@@ -489,6 +664,11 @@ class WholeBodyIK:
             if self.fix_lift:
                 vel[self.lift_dof_id] = 0.0
             self.configuration.integrate_inplace(vel, self.config.dt)
+            # Velocity actually applied this iteration (post base/lift
+            # zeroing). dls_projector's continuity objective compares the
+            # next solve() against this, so it must be what was applied,
+            # not the raw solver output.
+            self._prev_vel = vel.copy()
 
             l_err = self.left_ee_task.compute_error(self.configuration)
             r_err = self.right_ee_task.compute_error(self.configuration)
@@ -551,7 +731,26 @@ class WholeBodyIK:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _solve_qp(self, tasks: list) -> np.ndarray:
+    def _solve_qp(self, ee_tasks: list, other_tasks: list) -> np.ndarray:
+        """Dispatch to the configured redundancy-resolution strategy. See
+        WholeBodyIKConfig.redundancy_resolution for what each mode does and
+        why; all three return an nv-length velocity in the same convention
+        (v = Δq / dt), so solve()'s integration loop doesn't need to know
+        which one ran."""
+        mode = self.config.redundancy_resolution
+        if mode == "soft":
+            return self._solve_qp_soft(ee_tasks + other_tasks)
+        elif mode == "dls_projector":
+            return self._solve_qp_dls_projector(ee_tasks)
+        else:
+            raise ValueError(
+                f"Unknown redundancy_resolution {mode!r}; expected "
+                "'soft' or 'dls_projector'."
+            )
+
+    def _solve_qp_soft(self, tasks: list) -> np.ndarray:
+        """Default. Every task (EE + posture + fix) competes as a soft cost
+        in one QP -- unchanged from the solver's original behavior."""
         solver = self.config.solver
         limits = self._limits_with_collision if self.avoid_collisions else self.limits
         try:
@@ -573,6 +772,493 @@ class WholeBodyIK:
             raise RuntimeError(
                 f"All solvers failed: {[solver] + self.config.fallback_solvers}"
             )
+
+    def _solve_qp_dls_projector(self, ee_tasks: list) -> np.ndarray:
+        """Damped-least-squares pseudoinverse with an *optimised* null space.
+
+            q̇ = q̇_primary + N z,   q̇_primary = J⁺b,   J⁺ = Jᵀ(JJᵀ + λ²I)⁻¹,
+            N = I - J⁺J
+
+        The primary term tracks both EE targets. `z` is then chosen by a
+        weighted least-squares over the secondary objectives below, rather
+        than by projecting a single hand-built gradient step -- so they trade
+        off against each other properly instead of one silently winning:
+
+          * posture      -- pull toward the posture reference (as before)
+          * continuity   -- ||q̇ - q̇_prev||, damping tick-to-tick changes in
+                            null-space motion
+          * elbow swivel -- one scalar task per arm holding the elbow at a
+                            chosen angle about the shoulder->wrist axis, which
+                            is what stops elbow-up/down branch flipping
+          * manipulability (optional, gated) -- ascend log mu near singularities
+
+        Each contributes a residual that is affine in q̇, stacked into
+        `A z ≈ r` and solved as z = (AᵀA + λ_z I)⁻¹Aᵀr. AᵀA is only n×n
+        (n = free DOFs, 14 with base and lift fixed) so this is cheap. λ_z
+        (`nullspace_regularization`) is what makes it well posed: every block
+        carries N on the right, so any component of z in null(N) affects
+        nothing and is regularised to zero.
+
+        With continuity/swivel/manipulability weights at 0 and posture weight
+        1 this reduces to the previous q̇ = q̇_primary + N q̇_posture, because
+        NᵀN = N and N q̇_primary = 0 *for an exact projector*. That identity
+        needs N idempotent, which only holds as dls_damping → 0: with damping
+        the eigenvalues of J⁺J are σ²/(σ²+λ²) < 1, so N is not idempotent and
+        N q̇_primary ≠ 0. The two therefore differ slightly at the damping
+        actually in use, and this least-squares form is the more correct of
+        the two -- it minimises what it claims to minimise, where the
+        classical formula assumes an exactness the damped inverse does not
+        have. tests/test_nullspace_objectives.py pins the reduction in the
+        λ → 0 limit.
+
+        Note dim(null(J)) is 2 with both arms tracking and base/lift fixed --
+        one swivel DOF per arm -- so these objectives share very little room.
+        A strict priority hierarchy would starve everything below the first
+        level; the ordering asked for (tracking ≫ continuity/swivel/posture ≫
+        gated manipulability) is expressed through the relative weights and
+        the manipulability gate, with EE tracking kept strictly first by the
+        projector itself.
+
+        As in every mode, the solve runs over only the DOFs that are free to
+        move: fix_base / fix_lift drop the base / lift columns from J before
+        the pseudoinverse, and the result is scattered back into a full-nv
+        vector with those entries left at zero. See the git history and
+        artifacts/wholebody_logs/posture_fix_commands.md for why -- solving
+        over locked DOFs sent 77% of every step into a base that solve()
+        then zeroed, crippling convergence.
+
+        Joint/collision limits are not part of this solve; the result is
+        projected onto them afterward by `_project_onto_limits`.
+        """
+        nv = self.model.nv
+        lam2 = self.config.dls_damping ** 2
+
+        # Only the DOFs this solver actually controls: base (3), lift (1),
+        # arms (14). The model carries ~62 nv in total -- fingers, wheels,
+        # steering -- and every one of those is a zero column in the EE
+        # Jacobian, so they contribute nothing to the primary term but do
+        # land in the null space, where the secondary objectives would push
+        # them around, and they inflate every matrix here from 18x18 to
+        # 62x62. Excluding them also makes dim(null(J)) actually equal the
+        # 2 redundant arm DOFs it is reasoned about as being.
+        free = np.zeros(nv, dtype=bool)
+        free[self._ik_dof_ids] = True
+        if self.fix_base:
+            free[self.base_dof_ids] = False
+        if self.fix_lift:
+            free[self.lift_dof_id] = False
+        free_ids = np.flatnonzero(free)
+        n = free_ids.size
+
+        J_rows, b_rows = [], []
+        for task in ee_tasks:
+            J_rows.append(task.compute_jacobian(self.configuration))
+            b_rows.append(-task.gain * task.compute_error(self.configuration))
+        J = np.vstack(J_rows)[:, free_ids]
+        b = np.concatenate(b_rows)
+
+        # One SVD serves both terms, and they must NOT use the same inverse:
+        #
+        #   primary   -- damped (singularity-robust):
+        #                q̇_p = V diag(σ/(σ²+λ²)) Uᵀ b  ==  Jᵀ(JJᵀ+λ²I)⁻¹b
+        #   null space -- exact orthogonal projector onto null(J), from the
+        #                right singular vectors of the numerically-nonzero
+        #                singular values: N = I - V_r V_rᵀ
+        #
+        # Building N from the *damped* inverse instead (N = I - J⁺J with the
+        # damped J⁺) is wrong and quietly destroys EE tracking: that N is not
+        # idempotent, and in poorly-conditioned directions it approaches the
+        # identity, so the secondary term's -N q̇_p component cancels the
+        # primary motion it is supposed to leave alone. With the exact
+        # projector, N q̇_p = 0 holds identically -- q̇_p lies in range(Jᵀ),
+        # which N annihilates -- so no secondary objective can ever perturb
+        # the EE task, which is the whole point of the priority ordering.
+        U, sv, Vt = np.linalg.svd(J, full_matrices=False)
+        dq_primary = Vt.T @ ((sv / (sv ** 2 + lam2)) * (U.T @ b))
+        rank_tol = self.config.nullspace_rank_tol * (sv[0] if sv.size else 0.0)
+        V_r = Vt[sv > rank_tol].T
+        N = np.eye(n) - V_r @ V_r.T
+
+        blocks_A: list[np.ndarray] = []
+        blocks_r: list[np.ndarray] = []
+
+        def add_velocity_objective(weight: float, desired: np.ndarray) -> None:
+            """Residual for 'q̇ should be close to `desired`', weight >= 0."""
+            if weight <= 0.0:
+                return
+            w = float(np.sqrt(weight))
+            blocks_A.append(w * N)
+            blocks_r.append(w * (desired - dq_primary))
+
+        # ── Posture (unchanged objective, now weighted alongside the rest) ──
+        posture_error = self.posture_task.compute_error(self.configuration)
+        dq_posture = (
+            -self.posture_task.gain * self.posture_task.cost * posture_error
+        )[free_ids]
+        add_velocity_objective(self.config.nullspace_posture_weight, dq_posture)
+
+        # ── Velocity continuity ──────────────────────────────────────────────
+        # Units: this solve works in per-iteration displacement Δq, not
+        # velocity, so the stored velocity is scaled by dt before being
+        # compared against one. (Mixing them makes the objective 1/dt times
+        # too strong -- 30x at 30 Hz -- and drives the solve straight to the
+        # velocity limit.)
+        #
+        # Targeting q̇_prev and targeting N q̇_prev are the same thing here:
+        # the residual is N z - (q̇_prev - q̇_p), and N q̇_p = 0 identically for
+        # the exact projector above, so the primary component drops out on
+        # its own. No need to project the target first.
+        #
+        # OFF by default, on measurement. ||q̇ - q̇_prev||² is a *momentum*
+        # term, not a damping one: it resists change, which also means it
+        # perpetuates whatever null-space velocity already exists rather than
+        # letting posture bleed it off. Swept against a reversing target with
+        # an abrupt disturbance, raising it made every metric worse at every
+        # swivel weight -- e.g. at swivel 1.0, weight 0 -> 0.5 -> 2.0 took
+        # null-space jerk 0.264 -> 0.279 -> 0.292, null-space speed
+        # 0.768 -> 0.838 -> 0.928 rad/s, and elbow drift 8.2° -> 8.8° -> 11.6°.
+        # The swivel objective is the effective anchor; this is kept as a
+        # tunable because the trade-off may differ on hardware, where command
+        # smoothness matters in ways a kinematic replay does not show.
+        if self._prev_vel is not None:
+            add_velocity_objective(
+                self.config.nullspace_continuity_weight,
+                self._prev_vel[free_ids] * self.config.dt,
+            )
+
+        # ── Elbow swivel, one scalar row per arm ─────────────────────────────
+        swivel_weight = self.config.nullspace_swivel_weight
+        if swivel_weight > 0.0:
+            for side in ("left", "right"):
+                row = self._swivel_row(side, free_ids)
+                if row is None:
+                    continue
+                jac_phi, phi, offset = row
+                # Fade out as the arm straightens and phi loses meaning.
+                min_off = max(self.config.elbow_swivel_min_offset, 1e-9)
+                fade = float(np.clip(offset / min_off, 0.0, 1.0))
+                if fade <= 0.0:
+                    continue
+                if self._swivel_target[side] is None:
+                    # First solve since a reset: keep the elbow branch we are
+                    # already in rather than choosing one.
+                    self._swivel_target[side] = phi
+                err = float(np.arctan2(
+                    np.sin(phi - self._swivel_target[side]),
+                    np.cos(phi - self._swivel_target[side]),
+                ))
+                # Per-iteration Δφ, matching the Δq space of this solve.
+                dphi_desired = -self.config.elbow_swivel_gain * err
+                w = float(np.sqrt(swivel_weight * fade))
+                blocks_A.append(w * (jac_phi @ N).reshape(1, n))
+                blocks_r.append(
+                    np.array([w * (dphi_desired - jac_phi @ dq_primary)])
+                )
+
+        # ── Manipulability, gated (optional) ─────────────────────────────────
+        if (self.config.enable_manipulability
+                and self.config.manipulability_weight > 0.0):
+            dq_manip = np.zeros(nv)
+            gate_total = 0.0
+            for side in ("left", "right"):
+                grad, mu = self._manipulability_gradient(side)
+                gate = self._manipulability_gate(mu)
+                if gate <= 0.0:
+                    continue
+                norm = float(np.linalg.norm(grad))
+                if norm < 1e-12:
+                    continue
+                dof_ids = (self._left_arm_dof_ids if side == "left"
+                           else self._right_arm_dof_ids)
+                # Direction only: |d log mu / dq| is ~0.3 at home against a
+                # ~1e-3 tracking step, so using it raw would swamp everything
+                # else. manipulability_gain is then a real step size in rad.
+                dq_manip[dof_ids] = self.config.manipulability_gain * grad / norm
+                gate_total = max(gate_total, gate)
+            # Gate enters once, through the weight -- not also through the
+            # desired step, which would square it.
+            if gate_total > 0.0:
+                add_velocity_objective(
+                    self.config.manipulability_weight * gate_total,
+                    dq_manip[free_ids],
+                )
+
+        # ── Solve the stacked secondary least-squares for z ──────────────────
+        if blocks_A:
+            A = np.vstack(blocks_A)
+            r = np.concatenate(blocks_r)
+            lam_z = self.config.nullspace_regularization
+            z = np.linalg.solve(A.T @ A + lam_z * np.eye(n), A.T @ r)
+            dq_free = dq_primary + N @ z
+        else:
+            dq_free = dq_primary
+
+        dq = np.zeros(nv)
+        dq[free_ids] = dq_free
+
+        vel = dq / self.config.dt
+        return self._project_onto_limits(vel)
+
+    # ── dls_projector: null-space objective helpers ──────────────────────────
+
+    def _reset_nullspace_state(self) -> None:
+        """Drop continuity history and re-latch swivel targets.
+
+        Called from both init paths: after a reset the previous velocity is
+        meaningless, and any latched swivel angle belongs to the old pose.
+        Sides named explicitly in `config.elbow_swivel_targets` keep their
+        configured angle; the rest re-latch on the next solve.
+        """
+        self._prev_vel = None
+        self._swivel_target = {
+            side: self.config.elbow_swivel_targets.get(side)
+            for side in ("left", "right")
+        }
+
+    def set_elbow_swivel_target(
+        self, side: str, angle: Optional[float] = None
+    ) -> Optional[float]:
+        """Set (or re-latch, with angle=None) one arm's target swivel angle.
+
+        Safe to call while the control loop runs -- the next solve picks it
+        up. Returns the stored value, or None if it will re-latch.
+        """
+        if side not in ("left", "right"):
+            raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+        self._swivel_target[side] = None if angle is None else float(angle)
+        return self._swivel_target[side]
+
+    def elbow_swivel_angle(self, side: str) -> Optional[float]:
+        """Current swivel angle (rad) of one arm, or None where undefined.
+
+        None means the elbow is too close to the shoulder-wrist axis for the
+        angle to be meaningful -- see `elbow_swivel_min_offset`.
+        """
+        S, E, W = self._swivel_points(side)
+        phi, offset = self._swivel_from_points(S, E, W)
+        return None if offset < 1e-9 else phi
+
+    def _swivel_points(self, side: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        d = self.configuration.data
+        return tuple(
+            d.xpos[self.model.body(self._SWIVEL_BODIES[k].format(side=side)).id].copy()
+            for k in ("shoulder", "elbow", "wrist")
+        )
+
+    @staticmethod
+    def _swivel_scalar(
+        sx: float, sy: float, sz: float,
+        ex: float, ey: float, ez: float,
+        wx: float, wy: float, wz: float,
+    ) -> tuple[float, float]:
+        """Swivel angle and perpendicular offset, in plain floats.
+
+        Same maths as `_swivel_from_points`, written without numpy on
+        purpose: the Jacobian finite-differences this 18 times per arm per
+        solver iteration, where numpy's per-call dispatch overhead on
+        3-vectors dominated everything else (measured 74 us/call, i.e.
+        1.3 ms of a 1.6 ms swivel row -- more than the whole rest of the
+        solve). Scalar arithmetic makes the same work ~20x cheaper.
+        """
+        ax, ay, az = wx - sx, wy - sy, wz - sz
+        a_norm = math.sqrt(ax * ax + ay * ay + az * az)
+        if a_norm < 1e-9:
+            return 0.0, 0.0
+        ux, uy, uz = ax / a_norm, ay / a_norm, az / a_norm
+
+        rx, ry, rz = ex - sx, ey - sy, ez - sz
+        proj = rx * ux + ry * uy + rz * uz
+        vx, vy, vz = rx - proj * ux, ry - proj * uy, rz - proj * uz
+        offset = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if offset < 1e-9:
+            return 0.0, 0.0
+
+        # In-plane reference: world +z, or +x when the arm axis is nearly
+        # vertical. Chosen from the geometry alone, so it is continuous
+        # wherever u is.
+        if abs(uz) > 0.9:
+            rfx, rfy, rfz = 1.0, 0.0, 0.0
+        else:
+            rfx, rfy, rfz = 0.0, 0.0, 1.0
+        dot = rfx * ux + rfy * uy + rfz * uz
+        n1x, n1y, n1z = rfx - dot * ux, rfy - dot * uy, rfz - dot * uz
+        n1_norm = math.sqrt(n1x * n1x + n1y * n1y + n1z * n1z)
+        n1x, n1y, n1z = n1x / n1_norm, n1y / n1_norm, n1z / n1_norm
+        n2x = uy * n1z - uz * n1y
+        n2y = uz * n1x - ux * n1z
+        n2z = ux * n1y - uy * n1x
+        return (
+            math.atan2(vx * n2x + vy * n2y + vz * n2z,
+                       vx * n1x + vy * n1y + vz * n1z),
+            offset,
+        )
+
+    @classmethod
+    def _swivel_from_points(
+        cls, S: np.ndarray, E: np.ndarray, W: np.ndarray
+    ) -> tuple[float, float]:
+        """Swivel angle of the elbow about the shoulder->wrist axis.
+
+        Returns (angle_rad, perpendicular_offset_m). The offset is how far
+        the elbow sits off that axis: it goes to zero as the arm straightens,
+        at which point the angle is undefined and the caller should fade the
+        objective out rather than chase it.
+        """
+        return cls._swivel_scalar(S[0], S[1], S[2], E[0], E[1], E[2],
+                                  W[0], W[1], W[2])
+
+    def _swivel_row(self, side: str, free_ids: np.ndarray):
+        """One arm's swivel Jacobian row and current angle.
+
+        Returns (J_phi over free DOFs, angle, offset), or None when the angle
+        is undefined. dphi/dq is assembled by the chain rule through the three
+        point positions:  dphi/dq = sum_P (dphi/dP)^T J_P, with J_P the 3xnv
+        world-frame translational Jacobians MuJoCo gives directly, and the
+        3-vector partials finite-differenced on the cheap pure-numpy scalar
+        above (no forward kinematics in the inner loop).
+        """
+        S, E, W = self._swivel_points(side)
+        phi, offset = self._swivel_from_points(S, E, W)
+        if offset < 1e-9:
+            return None
+
+        coords = [S[0], S[1], S[2], E[0], E[1], E[2], W[0], W[1], W[2]]
+        grads = [np.zeros(3), np.zeros(3), np.zeros(3)]
+        h = 1e-6
+        two_h = 2.0 * h
+        for j in range(9):
+            base = coords[j]
+            coords[j] = base + h
+            a_hi, off_hi = self._swivel_scalar(*coords)
+            coords[j] = base - h
+            a_lo, off_lo = self._swivel_scalar(*coords)
+            coords[j] = base
+            if off_lo < 1e-9 or off_hi < 1e-9:
+                return None
+            # Wrap the difference: phi is an angle, so a perturbation
+            # straddling +-pi must not read as a ~2pi gradient.
+            d = a_hi - a_lo
+            grads[j // 3][j % 3] = math.atan2(math.sin(d), math.cos(d)) / two_h
+
+        jac_phi = np.zeros(self.model.nv)
+        jacp, jacr = self._jac_buf_p, self._jac_buf_r
+        for key, g in zip(("shoulder", "elbow", "wrist"), grads):
+            body_id = self.model.body(self._SWIVEL_BODIES[key].format(side=side)).id
+            jacp[:] = 0.0
+            mujoco.mj_jacBody(
+                self.model, self.configuration.data, jacp, jacr, body_id
+            )
+            jac_phi += g @ jacp
+        return jac_phi[free_ids], phi, offset
+
+    def _arm_jacobian(self, side: str, data) -> np.ndarray:
+        """6x7 world-frame EE Jacobian w.r.t. one arm's own joints."""
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        site = self._LEFT_EE_SITE if side == "left" else self._RIGHT_EE_SITE
+        mujoco.mj_jacSite(self.model, data, jacp, jacr, self.model.site(site).id)
+        cols = (self._left_arm_dof_ids if side == "left"
+                else self._right_arm_dof_ids)
+        return np.vstack([jacp, jacr])[:, cols]
+
+    @staticmethod
+    def _log_manipulability(J_arm: np.ndarray) -> float:
+        """sum(log sigma_i) of a 6x7 Jacobian == log sqrt(det(J J^T)).
+
+        Computed from singular values rather than a determinant: det(J J^T)
+        underflows hard near a singularity, where this objective is precisely
+        the one that has to stay meaningful.
+        """
+        sv = np.linalg.svd(J_arm, compute_uv=False)
+        sv = np.maximum(sv, 1e-12)
+        return float(np.sum(np.log(sv)))
+
+    def _manipulability_gradient(self, side: str) -> tuple[np.ndarray, float]:
+        """(d log mu / dq over that arm's 7 joints, mu) by central differences.
+
+        Costs 14 perturbed forward-kinematics + Jacobian evaluations per arm,
+        which is why enable_manipulability defaults to False.
+        """
+        qpos_adrs = (self._left_arm_qpos_adrs if side == "left"
+                     else self._right_arm_qpos_adrs)
+        h = self.config.manipulability_fd_step
+        d = self._fd_data
+        d.qpos[:] = self.configuration.q
+        mujoco.mj_kinematics(self.model, d)
+        mujoco.mj_comPos(self.model, d)
+        mu = float(np.exp(self._log_manipulability(self._arm_jacobian(side, d))))
+
+        grad = np.zeros(len(qpos_adrs))
+        for i, adr in enumerate(qpos_adrs):
+            original = float(d.qpos[adr])
+            d.qpos[adr] = original + h
+            mujoco.mj_kinematics(self.model, d)
+            mujoco.mj_comPos(self.model, d)
+            hi = self._log_manipulability(self._arm_jacobian(side, d))
+            d.qpos[adr] = original - h
+            mujoco.mj_kinematics(self.model, d)
+            mujoco.mj_comPos(self.model, d)
+            lo = self._log_manipulability(self._arm_jacobian(side, d))
+            d.qpos[adr] = original
+            grad[i] = (hi - lo) / (2.0 * h)
+        return grad, mu
+
+    def _manipulability_gate(self, mu: float) -> float:
+        """Smoothstep: 0 at mu >= gate_on, 1 at mu <= gate_full."""
+        on = self.config.manipulability_gate_on
+        full = self.config.manipulability_gate_full
+        if on <= full:
+            return 1.0 if mu <= full else 0.0
+        x = float(np.clip((on - mu) / (on - full), 0.0, 1.0))
+        return x * x * (3.0 - 2.0 * x)
+
+    def _project_onto_limits(self, vel: np.ndarray) -> np.ndarray:
+        """Clip a velocity onto the same hard joint/collision limits the
+        other two modes get for free from mink's QP, by solving the
+        closest-feasible-point QP min_Δq' ||Δq' - Δq||^2 s.t. GΔq' <= h.
+        Only dls_projector needs this -- it bypasses mink.solve_ik (and
+        therefore its limits=) entirely for the EE+posture resolution.
+
+        Note the QP is posed in Δq (configuration displacement), not
+        velocity: every mink Limit's compute_qp_inequalities bounds Δq
+        (mink's own solve_ik variable is Δq, only divided by dt at the very
+        end to return v) -- projecting `vel` directly against those (G, h)
+        would be off by a factor of dt and over-clip almost everything.
+
+        Tried special-casing ConfigurationLimit/VelocityLimit (both pure
+        per-DOF box constraints) as a closed-form np.clip to skip the QP for
+        the common case -- measured slower, not faster: daqp solves this
+        small a box QP fast enough natively that the extra numpy bookkeeping
+        (scanning G for nonzero structure, min/max reduction per DOF) costs
+        more than it saves (~0.75ms/call vs ~0.56ms/call, benchmarked at
+        home + a small offset target). Left as one QP; the real per-solve
+        cost floor is compute_qp_inequalities itself (~0.4ms, mostly
+        mj_differentiatePos), not the solve on top of it."""
+        limits = self._limits_with_collision if self.avoid_collisions else self.limits
+        G_list, h_list = [], []
+        for limit in limits:
+            ineq = limit.compute_qp_inequalities(self.configuration, self.config.dt)
+            if not ineq.inactive:
+                G_list.append(ineq.G)
+                h_list.append(ineq.h)
+        if not G_list:
+            return vel
+        G = np.vstack(G_list)
+        h = np.hstack(h_list)
+        dq = vel * self.config.dt
+        nv = vel.shape[0]
+        problem = qpsolvers.Problem(np.eye(nv), -dq, G, h)
+        for solver in [self.config.solver] + self.config.fallback_solvers:
+            try:
+                result = qpsolvers.solve_problem(problem, solver=solver)
+                if result.found:
+                    return result.x / self.config.dt
+            except Exception:
+                continue
+        raise RuntimeError(
+            "All solvers failed projecting dls_projector's velocity onto "
+            f"joint/collision limits: {[self.config.solver] + self.config.fallback_solvers}"
+        )
 
     def _build_posture_cost(self) -> np.ndarray:
         """Per-DOF posture cost vector (nv). Small epsilon avoids NaN in mink."""

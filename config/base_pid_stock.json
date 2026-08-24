@@ -1,0 +1,46 @@
+{
+  "manifest_version": 1,
+  "description": "The gains a YORv3 swerve SPARK holds in flash and reverts to on a power cycle. This is the DEFAULT set: robot/yor.py applies it at startup and writes it back on shutdown, so the base runs on it unless told otherwise. These are NOT the REV factory zeros -- they are the per-controller values recorded as 'stock' in YOR-v3-Problems-DON'T-USE/config/base_pid_manifest.json, whose status field states that 'a controller power cycle reverts every module to stock'. Writing zeros here would not restore anything; it would leave the base limp until the next power cycle. Why this is the default rather than the tuned set: the stock drive loop is P-only with no feed-forward and reaches about 49% of its setpoint, which is precisely what DRIVE_VEL_SCALE = 2.0 in robot/base_motor.py was introduced to compensate for. Running stock therefore keeps the speed axis self-consistent -- commanded m/s is roughly true m/s and BaseOdometry is honest. The commissioned set in base_pid_commissioned.json tracks its setpoint instead, which makes that same 2.0 a stale doubling; it stays opt-in until tools/measure_drive_scale.py settles it. See docs/BASE_COMMAND_LOOP_REVIEW.md finding 6. Verify this file against hardware: power-cycle the SPARKs, then `python tools/base_pid_preflight.py --verify-only`.",
+  "can_interface": "can0",
+  "pid_slot": 0,
+  "drive_command_scale": 2.0,
+  "drive_command_scale_notes": "Correct for THESE gains. The stock drive loop is P-only and reached 37-46% of setpoint across six floor runs on 2026-08-22, so 2.0 brings the commanded m/s to roughly 0.79x true. It is not exact -- a P-only loop's undershoot moves with load, voltage and speed -- which is why the fix is the commissioned gains plus a scale near 1.0, not a bigger number here.",
+  "roles": {
+    "drive": {
+      "p": 0.2,
+      "i": 0.0,
+      "d": 0.1,
+      "velocity_ff": 0.0,
+      "output_min": -1.0,
+      "output_max": 1.0,
+      "notes": "Flash-persisted stock. A P-only velocity loop: with no feed-forward it settles at roughly 49% of setpoint, which is what DRIVE_VEL_SCALE = 2.0 was compensating for. The commissioned set (p=0.35, velocity_ff=0.23) in base_pid_commissioned.json tracks instead, which is why the 2.0 is now a stale doubling."
+    },
+    "steering": {
+      "p": 2.0,
+      "i": 0.0,
+      "d": 0.01,
+      "velocity_ff": 0.0,
+      "output_min": -1.0,
+      "output_max": 1.0,
+      "notes": "Flash-persisted stock. Note the output range: the commissioned steering set clamps to +/-0.25 and restoring stock widens it back to +/-1.0. At p=2.0 that is soft enough not to matter, but a later process writing only p/i/d and not the output range would inherit full-range steering authority, which base_pid_commissioned.json explicitly records as NOT validated."
+    }
+  },
+  "modules": {
+    "FL": {
+      "drive": 1,
+      "steering": 5
+    },
+    "FR": {
+      "drive": 4,
+      "steering": 8
+    },
+    "RR": {
+      "drive": 3,
+      "steering": 7
+    },
+    "RL": {
+      "drive": 2,
+      "steering": 6
+    }
+  }
+}

@@ -101,15 +101,29 @@ from robot.wholebody_control import WholeBodyHardwareConfig   # noqa: E402
 # Agreed values
 # ─────────────────────────────────────────────────────────────────────────────
 
-NATIVE_VEL_LIMIT = 3.0     # rad/s
-NATIVE_ACC_LIMIT = 15.0    # rad/s^2
-WHOLEBODY_VEL_LIMIT = 3.0  # rad/s
+# Per joint (index 0-6 = firmware joint1-7). Velocity is 95% of each joint's
+# live firmware-reported max (queried 2026-08-20 via pyAgxArm over CAN from
+# both arms). MIT mode -- all nerolib ever uses -- does not itself enforce
+# the firmware's numbers (see robot/arm/arm.py's comment), so these are the
+# only real ceiling; the old uniform 15.0 rad/s^2 was 6-7.5x the firmware's
+# own figure with nothing to catch it, just silent tracking lag.
+# Acceleration went 95% of firmware -> 1.3x that -> p90 demand (3-file
+# estimate) -> p95 demand (3-file, outlier-filtered) -> p95 demand (full
+# sweep, all 28 recorded sessions, outlier-filtered, active now). Keep this
+# constant in sync with whichever line is active in robot/arm/arm.py, which
+# has the full history and all the commented-out fallbacks.
+NATIVE_VEL_LIMIT = [2.98, 2.98, 2.98, 2.98, 3.72, 3.72, 3.72]   # rad/s
+NATIVE_ACC_LIMIT = [4.98, 3.42, 3.57, 9.57, 5.38, 5.76, 8.99]   # rad/s^2
+WHOLEBODY_VEL_LIMIT = 3.72  # rad/s -- must be >= the highest per-joint value above
 ARM_CONTROLLER_HZ = 250.0
 
-# Commissioned construction-time gains -- matches YOR_D's legacy (non-v2) arm
-# mode, confirmed as the profile to keep for YOR-v3. The stiffer kp=15 remains
-# available through `set_firm_mode` at runtime.
-DEFAULT_KP = 8.0
+# Commissioned construction-time gains, matching YOR_D's legacy (non-v2) arm
+# mode. kd has been hand-tuned back and forth on hardware (1.0 -> 0.8 -> 1.0)
+# while chasing the arm jitter -- if this value drifts again, that's live
+# tuning, not a bug; update this constant to match rather than assume the
+# code regressed. The stiffer kp=15 remains available through
+# `set_firm_mode` at runtime.
+DEFAULT_KP = 10.0
 DEFAULT_KD = 1.0
 
 # Gravity compensation is hardcoded on in ArmNode.__init__, unconditionally,
@@ -139,10 +153,10 @@ def test_native_limits() -> None:
     for side, is_left in (("left", True), ("right", False)):
         arm = build_arm(can_port=f"can_{side}", is_left_arm=is_left)
         cfg = arm.config
-        check(f"{side}: joint_vel_max is {NATIVE_VEL_LIMIT} rad/s on all 7 joints",
-              list(cfg.joint_vel_max) == [NATIVE_VEL_LIMIT] * 7, str(cfg.joint_vel_max))
-        check(f"{side}: joint_acc_max is {NATIVE_ACC_LIMIT} rad/s^2 on all 7 joints",
-              list(cfg.joint_acc_max) == [NATIVE_ACC_LIMIT] * 7, str(cfg.joint_acc_max))
+        check(f"{side}: joint_vel_max matches the per-joint firmware-derived values",
+              list(cfg.joint_vel_max) == NATIVE_VEL_LIMIT, str(cfg.joint_vel_max))
+        check(f"{side}: joint_acc_max matches the per-joint firmware-derived values",
+              list(cfg.joint_acc_max) == NATIVE_ACC_LIMIT, str(cfg.joint_acc_max))
         check(f"{side}: native interpolation runs at {ARM_CONTROLLER_HZ:.0f} Hz",
               cfg.controller_freq_hz == ARM_CONTROLLER_HZ,
               str(cfg.controller_freq_hz))
@@ -153,13 +167,13 @@ def test_wholebody_clamp() -> None:
     cfg = WholeBodyHardwareConfig()
     check(f"arm_max_vel_rad_s is {WHOLEBODY_VEL_LIMIT} rad/s",
           cfg.arm_max_vel_rad_s == WHOLEBODY_VEL_LIMIT, str(cfg.arm_max_vel_rad_s))
-    check("the clamp does not undercut the native limit",
-          cfg.arm_max_vel_rad_s >= NATIVE_VEL_LIMIT,
-          f"{cfg.arm_max_vel_rad_s} vs native {NATIVE_VEL_LIMIT}")
+    check("the clamp does not undercut any joint's native limit",
+          cfg.arm_max_vel_rad_s >= max(NATIVE_VEL_LIMIT),
+          f"{cfg.arm_max_vel_rad_s} vs native max {max(NATIVE_VEL_LIMIT)}")
 
     lead = cfg.arm_max_vel_rad_s * cfg.arm_command_lookahead_s
-    check("command look-ahead is bounded to 300 mrad",
-          abs(lead - 0.30) < 1e-12, f"{lead*1000:.1f} mrad")
+    check("command look-ahead is bounded to 372 mrad",
+          abs(lead - 0.372) < 1e-9, f"{lead*1000:.1f} mrad")
     check("whole-body solve rate matches the 30 Hz teleop rate 1:1",
           cfg.control_hz == 30.0, f"{cfg.control_hz:.0f} Hz")
     check("arm dispatch runs decoupled from the solve loop, at 90 Hz",

@@ -1,8 +1,10 @@
 {
   "manifest_version": 1,
-  "description": "Commissioned swerve PID gains for the YORv3 base. Applied to controller RAM by tools/base_pid_preflight.py before robot/yor.py opens the motor controllers. RAM is not persistent: re-run the preflight after every SPARK power cycle.",
+  "description": "Tuned swerve PID gains for the YORv3 base, measured on the floor 2026-08-17. NOT applied by default -- config/base_pid_stock.json is. Opt in with `python robot/yor.py --base-pid-manifest config/base_pid_commissioned.json`. Two reasons it is opt-in. (1) This drive loop is feed-forward dominated and tracks its setpoint (commissioning evidence: steady error 0.000 native median at 0.25 native), so DRIVE_VEL_SCALE = 2.0 -- which exists to compensate for the stock P-only loop's ~2x undershoot -- becomes a stale doubling, and the base runs at about twice every commanded speed while BaseOdometry records half of reality. (2) Every floor run behind these numbers clamped controller output to +/-0.25 while this manifest ships the drive range at +/-1.0, so P is effectively 7x and D 5x what they were measured under; re-measure before relying on them above 0.25 output. RAM is not persistent: re-run the preflight after every SPARK power cycle. See docs/BASE_COMMAND_LOOP_REVIEW.md finding 6.",
   "can_interface": "can0",
   "pid_slot": 0,
+  "drive_command_scale": 1.068,
+  "drive_command_scale_notes": "Derived from a floor measurement on 2026-08-24, not from arithmetic alone. That run (stock gains, scale 2.0, 0.15 m/s for 5 s) drove 0.59 m by tape while the wheels reported 12.466 motor rotations. Back-solving the metres-per-motor-rotation gives 0.0473, which matches PHASE0_BASELINE's five-tape-run calibration of 0.047530598 to 0.4% and rules out swerve_odom.py's 0.049922 (5.5% high). The controllers are configured from 0.050780 (velocity_cf x 60), so a loop that tracks its setpoint perfectly needs 0.050780 / 0.047531 = 1.0684 to make a commanded m/s a true m/s. STILL PROVISIONAL in one respect: it assumes the commissioned loop tracks exactly. Re-run tools/measure_drive_scale.py --manifest config/base_pid_commissioned.json and use the number it reports.",
   "roles": {
     "drive": {
       "p": 0.35,
@@ -24,9 +26,21 @@
     }
   },
   "modules": {
-    "FL": { "drive": 1, "steering": 5 },
-    "FR": { "drive": 4, "steering": 8 },
-    "RR": { "drive": 3, "steering": 7 },
-    "RL": { "drive": 2, "steering": 6 }
+    "FL": {
+      "drive": 1,
+      "steering": 5
+    },
+    "FR": {
+      "drive": 4,
+      "steering": 8
+    },
+    "RR": {
+      "drive": 3,
+      "steering": 7
+    },
+    "RL": {
+      "drive": 2,
+      "steering": 6
+    }
   }
 }

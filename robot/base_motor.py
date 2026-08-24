@@ -16,10 +16,17 @@ from loop_rate_limiters import RateLimiter
 from sparkcan_py import SparkFlex
 
 # Optional enums if your binding exposes them (safe to ignore if not present)
+# Only the two enums this file actually uses. They used to be imported
+# alongside MotorType and SensorType, which the installed binding does not
+# export -- so the import raised, the handler set *all four* to None, and every
+# `if IdleMode ...` / `if CtrlType ...` guard below was silently dead. Idle mode
+# and control type were therefore whatever the SPARKs held in flash, unset and
+# unreported. Import only what exists, so a future missing name fails loudly
+# instead of disabling unrelated calls.
 try:
-    from sparkcan_py import CtrlType, IdleMode, MotorType, SensorType  # noqa: F401
-except Exception:
-    IdleMode = CtrlType = MotorType = SensorType = None  # type: ignore
+    from sparkcan_py import CtrlType, IdleMode
+except Exception:  # pragma: no cover - binding without the enums
+    IdleMode = CtrlType = None  # type: ignore
 
 # Pico lift (serial)
 try:
@@ -92,8 +99,32 @@ TRANS_OPPOSITE_MASK = np.array([False, False, False, False], dtype=bool)
 
 TWO_PI = 2.0 * math.pi
 
-USE_FEEDBACK_FOR_STEER = False
+# Close the steering loop on the absolute encoder rather than on the last
+# command. This was False for two reasons, both now gone: the encoder was being
+# read as degrees when it returns turns (so feedback would have been a
+# constant -- see RotationMotor.get_absolute_turns), and nobody had measured
+# whether the modules actually lag. The 2026-08-22 runs measured it: 8-11 deg
+# of error with the command parked and 23-28 deg while it slews. With this
+# False, `cos_error_scaling` compared each command against the *previous
+# command* and so collapsed to 1.0 after a single 3.1 ms tick; with it True the
+# scaling finally throttles drive speed while a module is still turning.
+USE_FEEDBACK_FOR_STEER = True
+
+# Native controller setpoint per m/s of wheel speed. Correct only for a
+# particular set of drive gains, so it is declared per manifest
+# (`drive_command_scale` in config/base_pid_*.json) and passed in; this is the
+# fallback for callers that construct Base() directly. 2.0 is the stock value:
+# the stock loop is P-only and reaches about 40% of setpoint on the floor, and
+# 2.0 is what compensates for that. See docs/BASE_COMMAND_LOOP_REVIEW.md
+# finding 6.
 DRIVE_VEL_SCALE = 2.0
+
+# Below this commanded wheel speed a module has no meaningful direction, and its
+# steering setpoint is held rather than recomputed. See
+# _vehicle_velocity_to_angle_and_speed. In m/s at the wheel: a pure spin at
+# 0.005 rad/s puts about 1 mm/s on each wheel, so this is comfortably under any
+# velocity the base is ever asked for and safely above float noise.
+ZERO_SPEED_EPS_MPS = 1e-3
 
 
 # ----------------------------
@@ -630,24 +661,56 @@ class RotationMotor:
         self.last_cmd_frac = f
         self.dev.SetPosition(float(f))
 
-    def get_position_deg(self) -> float:
+    def get_absolute_turns(self) -> float:
+        """Raw absolute-encoder reading, in TURNS.
+
+        `GetAbsoluteEncoderPosition` already returns turns (0..1), not degrees
+        -- the same fact the commissioned calibration in the previous codebase
+        records as `steer_turns_per_raw_unit: 1.0`. Everything here used to
+        divide it by 360, which collapsed every reading to nearly zero and made
+        the reported angle a constant fixed by the module offset. Confirmed
+        against the 2026-08-22 logs: the four modules reported 90.0, 0.0, -90.0
+        and -180.0 degrees with a total spread of 1 degree, while the commanded
+        angles swept the full 360.
+        """
         try:
-            return float(self.dev.GetAbsoluteEncoderPosition())
+            turns = float(self.dev.GetAbsoluteEncoderPosition())
         except Exception:
             return float("nan")
+        return turns if math.isfinite(turns) else float("nan")
+
+    def get_position_deg(self) -> float:
+        turns = self.get_absolute_turns()
+        return float("nan") if math.isnan(turns) else turns * 360.0
 
     def get_position_rad(self) -> float:
         if not USE_FEEDBACK_FOR_STEER:
             frac_no_off = (self.last_cmd_frac - self.offset) % 1.0
             return float(frac_to_rad(frac_no_off))
 
-        try:
-            deg = float(self.dev.GetAbsoluteEncoderPosition())
-            frac = (deg / 360.0) % 1.0
-            frac_no_off = (frac - self.offset) % 1.0
-            return float(frac_to_rad(frac_no_off))
-        except Exception:
-            return float(frac_to_rad(self.last_cmd_frac))
+        measured = self.get_absolute_rad()
+        if math.isnan(measured):
+            # Fall back to the last *command*, in the same offset-removed frame
+            # the measurement uses. Returning the raw fraction here (as this
+            # branch used to) would hand the caller an angle in a different
+            # frame than every other reading, off by the module offset.
+            return float(frac_to_rad((self.last_cmd_frac - self.offset) % 1.0))
+        return measured
+
+    def get_absolute_rad(self) -> float:
+        """Measured steering angle from the absolute encoder, offset removed.
+
+        Deliberately separate from `get_position_rad`, which is the *control
+        path* and returns the last commanded angle while USE_FEEDBACK_FOR_STEER
+        is False. Telemetry must not inherit that substitution: logging the
+        commanded angle as if it were measured would make every module look
+        like it tracks perfectly. NaN if the encoder frame has not arrived.
+        """
+        turns = self.get_absolute_turns()
+        if math.isnan(turns):
+            return float("nan")
+        frac_no_off = ((turns % 1.0) - self.offset) % 1.0
+        return float(frac_to_rad(frac_no_off))
 
     def get_position_counts(self) -> float:
         try:
@@ -659,9 +722,10 @@ class RotationMotor:
 class DriveMotor:
     """Drive motor driven by SparkFlex velocity setpoint (PID on controller)."""
 
-    def __init__(self, can_if: str, can_id: int):
+    def __init__(self, can_if: str, can_id: int, vel_scale: float = DRIVE_VEL_SCALE):
         self.dev = SparkFlex(can_if, can_id)
         self.can_id = int(can_id)
+        self.vel_scale = float(vel_scale)
 
         if IdleMode and hasattr(self.dev, "SetIdleMode"):
             try:
@@ -686,7 +750,7 @@ class DriveMotor:
         self.dev.Heartbeat()
 
     def set_velocity_mps(self, v_mps: float) -> None:
-        self.dev.SetVelocity(float(v_mps * DRIVE_VEL_SCALE))
+        self.dev.SetVelocity(float(v_mps * self.vel_scale))
 
     def get_velocity_raw(self) -> float:
         try:
@@ -709,29 +773,28 @@ class Base:
         self,
         max_vel=np.array((1.0, 1.0, 1.57)),
         max_accel=np.array((1.0, 1.0, 1.57)),
+        drive_vel_scale: float = DRIVE_VEL_SCALE,
     ):
         self.max_vel = max_vel
         self.max_accel = max_accel
+        # Travels with the PID manifest, because it is only correct for a
+        # particular set of drive gains -- see the DRIVE_VEL_SCALE comment.
+        self.drive_vel_scale = float(drive_vel_scale)
 
-        self.C = np.array(
-            [
-                [1, 0, WIDTH],
-                [1, 0, -WIDTH],
-                [1, 0, -WIDTH],
-                [1, 0, WIDTH],
-                [0, 1, LENGTH],
-                [0, 1, LENGTH],
-                [0, 1, -LENGTH],
-                [0, 1, -LENGTH],
-            ]
-        )
+        # NOTE: there used to be a forward-kinematics matrix `self.C` and an
+        # `_angle_and_speed_to_vehicle_velocity` here. Both were dead, and the
+        # matrix had the wrong sign on the omega->vx coupling: round-tripping a
+        # pure spin of +1.0 rad/s came back as -0.316. The correct forward
+        # model, with geometry calibrated against measured motion rather than
+        # CAD, is robot/nav/odometry/swerve_odom.py -- use that.
 
         self.rotation_motors = [
             RotationMotor(drivetrain_can, CAN_IDS_ROT[i], ROTATION_OFFSETS[i])
             for i in range(NUM_SWERVES)
         ]
         self.drive_motors = [
-            DriveMotor(drivetrain_can, CAN_IDS_DRIVE[i]) for i in range(NUM_SWERVES)
+            DriveMotor(drivetrain_can, CAN_IDS_DRIVE[i], self.drive_vel_scale)
+            for i in range(NUM_SWERVES)
         ]
 
         self._pico_lift = PicoLift()
@@ -740,6 +803,14 @@ class Base:
         self.drive_vel = np.zeros(NUM_SWERVES)
         self.x = np.zeros(3)
         self.dx = np.zeros(3)
+
+        # What the control loop last asked each module for, alongside the
+        # measured state above. Written only by control_loop; read by
+        # swerve_telemetry from other threads, which is safe because every
+        # write replaces the whole array rather than mutating it in place.
+        self.steer_cmd = np.zeros(NUM_SWERVES)
+        self.drive_cmd = np.zeros(NUM_SWERVES)
+        self._motors_enabled = False
 
         self._command_queue: Queue[dict[str, Any]] = Queue(3)
         self.base_target = np.zeros(3)
@@ -750,6 +821,7 @@ class Base:
         self.control_loop_running = False
 
         self._last_loop_time = time.monotonic()
+        self._loop_dt = CONTROL_PERIOD
 
         # --- S-curve profiling state (kept; now optional per-command) ---
         self._smooth_active = False  # whether to apply smoothing for the *current* command
@@ -773,6 +845,80 @@ class Base:
         """
         return {motor.can_id: motor.dev
                 for motor in (*self.rotation_motors, *self.drive_motors)}
+
+    def swerve_configuration(self) -> dict:
+        """What the controllers report about how they are configured.
+
+        None of this is set by this file except idle mode and control type, and
+        those two only started being set once the enum import above was fixed.
+        Conversion factors in particular are configured out-of-band through the
+        REV Hardware Client and live in SPARK flash, which is why
+        DRIVE_VEL_SCALE reads as a magic number: it is one half of a unit
+        conversion whose other half is not in this repository.
+
+        Printing it at startup is the cheapest way to stop that being invisible.
+        `velocity_cf` is the number that decides whether `set_velocity_mps`
+        speaks true m/s:
+
+            metres per motor rotation   0.049922  (calibrated, swerve_odom.py)
+            => velocity_cf for true m/s 0.00083203
+            => the same via DIAMETER    0.00166407  (exactly 2x -- see
+               docs/BASE_COMMAND_LOOP_REVIEW.md finding 6)
+
+        Reads are parameter round-trips, not cached status frames, so this is
+        a startup call -- not something to put in a control loop.
+        """
+        def read(device, name):
+            getter = getattr(device, name, None)
+            if getter is None:
+                return None
+            try:
+                return getter()
+            except Exception:
+                return None
+
+        report: dict[str, dict] = {}
+        for role, motors, ids in (("drive", self.drive_motors, CAN_IDS_DRIVE),
+                                  ("steering", self.rotation_motors, CAN_IDS_ROT)):
+            for module, motor in zip(MODULE_ORDER, motors):
+                report[f"{module} {role}"] = {
+                    "can_id": motor.can_id,
+                    "idle_mode": read(motor.dev, "GetIdleModeRaw"),
+                    "ctrl_type": read(motor.dev, "GetCtrlType"),
+                    "velocity_cf": read(motor.dev, "GetVelocityConversionFactor"),
+                    "position_cf": read(motor.dev, "GetPositionConversionFactor"),
+                }
+        return report
+
+    def swerve_telemetry(self) -> dict:
+        """One snapshot of what the four modules were asked for and report back.
+
+        Everything here is cheap: the commanded arrays are already in memory,
+        and the two Get* calls read a cached periodic-status frame under a
+        mutex rather than putting a request on the bus (SparkBase::GetVelocity
+        and GetAbsoluteEncoderPosition read period2_/period5_). So this is safe
+        to call from the 30 Hz whole-body loop without adding CAN traffic.
+
+        Module order is MODULE_ORDER: FL, FR, RR, RL.
+
+        `v_target` is the velocity the loop was last handed; `v_profiled` is
+        what the S-curve profiler had actually reached when smoothing is on.
+        The two diverge for the length of a segment, and that gap is the
+        profiler's contribution -- worth logging separately from the command,
+        because tuning the base against `v_target` alone attributes the
+        profiler's lag to the wheels.
+        """
+        return {
+            "steer_cmd_rad": np.asarray(self.steer_cmd, dtype=float).copy(),
+            "steer_meas_rad": np.array(
+                [m.get_absolute_rad() for m in self.rotation_motors], dtype=float),
+            "drive_cmd_mps": np.asarray(self.drive_cmd, dtype=float).copy(),
+            "drive_meas_raw": np.array(
+                [m.get_velocity_raw() for m in self.drive_motors], dtype=float),
+            "v_target": np.asarray(self.base_target, dtype=float).copy(),
+            "v_profiled": np.asarray(self._v_prof, dtype=float).copy(),
+            "motors_enabled": bool(self._motors_enabled),
+        }
 
     # --- Lift controls ---
     def lift_up(self) -> None:
@@ -1118,12 +1264,17 @@ class Base:
 
             self._update_state()
 
+            self._motors_enabled = not disable_motors
+
             if disable_motors:
                 for d in self.drive_motors:
                     d.set_velocity_mps(0.0)
+                # Steering setpoints are deliberately left standing: a disabled
+                # base should stop driving, not re-aim its wheels.
+                self.drive_cmd = np.zeros(NUM_SWERVES)
 
             else:
-                dt = 1.0 / CONTROL_FREQ
+                dt = self._loop_dt
                 v_cmd = self.base_target
 
                 if self._smooth_active:
@@ -1150,12 +1301,20 @@ class Base:
                 for i, dm in enumerate(self.drive_motors):
                     dm.set_velocity_mps(float(wheel_speeds[i]))
 
+                self.steer_cmd = wheel_angles.copy()
+                self.drive_cmd = wheel_speeds.copy()
+
             rate_limiter.sleep()
 
     # -------------- helpers --------------
     def _update_state(self) -> None:
         now = time.monotonic()
-        _dt = now - self._last_loop_time
+        # Real elapsed time, not the nominal period: the S-curve profiler
+        # integrates with this, and on a loaded Pi the loop does not always
+        # hit CONTROL_FREQ. Clamped because a pathological gap (a debugger
+        # pause, a long GC) should finish the ramp, not overshoot past it.
+        self._loop_dt = float(min(max(now - self._last_loop_time, 0.0),
+                                  10.0 * CONTROL_PERIOD))
         self._last_loop_time = now
 
         for i, rm in enumerate(self.rotation_motors):
@@ -1163,12 +1322,6 @@ class Base:
 
         for i, dm in enumerate(self.drive_motors):
             self.drive_vel[i] = dm.get_velocity_raw()
-
-    def _angle_and_speed_to_vehicle_velocity(
-        self, wheel_speeds: np.ndarray, wheel_angles: np.ndarray
-    ) -> np.ndarray:
-        vx, vy = wheel_speeds * np.cos(wheel_angles), wheel_speeds * np.sin(wheel_angles)
-        return np.linalg.lstsq(self.C, np.concatenate((vx, vy)), rcond=None)[0]
 
     def _start_scurve_segment(self, v_target: np.ndarray):
         v_target = np.asarray(v_target, dtype=float)
@@ -1227,6 +1380,15 @@ class Base:
         wheel_speeds = np.hypot(vx_w, vy_w)
         wheel_angles = np.arctan2(vy_w, vx_w)
 
+        # A module being asked for no speed has no direction to point in:
+        # arctan2(0, 0) is 0, so without this a stop command would re-aim all
+        # four modules to straight-ahead. That is not a corner case here --
+        # whole-body base velocity is emergent and crosses the dispatch
+        # deadband constantly, so every pause would cost a full re-aim out and
+        # back (90 degrees each, stopping from a forward drive). Hold the last
+        # commanded angle instead and let only the drive setpoint go to zero.
+        moving = wheel_speeds > ZERO_SPEED_EPS_MPS
+
         error = diff_angle(wheel_angles, self.steer_pos)
         wheel_angles = np.where(
             np.abs(error) > np.pi / 2, diff_angle(wheel_angles, np.pi), wheel_angles
@@ -1236,13 +1398,12 @@ class Base:
         if cos_error_scaling:
             wheel_speeds *= np.cos(diff_angle(wheel_angles, self.steer_pos))
 
-        return wheel_speeds, wheel_angles
+        # Applied last, so the flip and the cosine above cannot reintroduce a
+        # direction for a module that was never asked to move.
+        wheel_angles = np.where(moving, wheel_angles, self.steer_pos)
+        wheel_speeds = np.where(moving, wheel_speeds, 0.0)
 
-    def _map_steer_angles(self, wheel_angles: np.ndarray) -> np.ndarray:
-        ang = wheel_angles.copy()
-        ang[TRANS_OPPOSITE_MASK] = ang[TRANS_OPPOSITE_MASK] + math.pi
-        ang = ang[ROT_DIAG_SWAP_PERM]
-        return wrap_pi(ang)
+        return wheel_speeds, wheel_angles
 
     def _enqueue_command(self, cmd: dict) -> None:
         if self._command_queue is None:

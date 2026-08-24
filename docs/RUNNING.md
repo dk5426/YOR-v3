@@ -261,7 +261,7 @@ nerolib, the PicoLift and the swerve base instead of writing `qpos`.
 python robot/yor.py
 ```
 `init()` starts by bringing the swerve controllers to the commissioned PID
-gains in [config/base_pid_manifest.json](../config/base_pid_manifest.json)
+gains in [config/base_pid_stock.json](../config/base_pid_stock.json)
 itself — no separate step. It writes through the SparkFlex objects
 `robot/base_motor.py` has already opened, before the base control loop starts,
 so only one set of device handles ever touches the bus. Each controller is read
@@ -469,7 +469,7 @@ Four things about this are worth knowing:
 ### Swerve PID preflight
 
 The commissioned gains live in
-[config/base_pid_manifest.json](../config/base_pid_manifest.json):
+[config/base_pid_stock.json](../config/base_pid_stock.json):
 
 | Motor role | Kp | Ki | Kd | Velocity FF | Output range |
 | --- | ---: | ---: | ---: | ---: | ---: |

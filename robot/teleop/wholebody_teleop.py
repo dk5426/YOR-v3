@@ -320,8 +320,12 @@ class OculusSource(InputSource):
 
     def __init__(self, host: str, port: int = 5555, pose_filter: bool = True,
                  filter_min_cutoff: float = 3.0, filter_beta: float = 8.0,
-                 yaw_correction_deg: float = 270.0):
+                 yaw_correction_deg: float = 270.0, legacy_oculus_app: bool = False):
         self.host, self.port = host, port
+        # v0.1 (com.GRAIL.YORTeleop) sends Left|Right; v0.2
+        # (com.GRAIL.Yor_Teleop) sends Head|Left|Right. Gated explicitly
+        # rather than auto-detected -- see parse_controller_state.
+        self._legacy_oculus_app = bool(legacy_oculus_app)
         self._filters = {
             side: PoseFilter(min_cutoff=filter_min_cutoff,
                              rot_min_cutoff=filter_min_cutoff,
@@ -330,9 +334,29 @@ class OculusSource(InputSource):
         } if pose_filter else {}
         self._last_glitch_report = 0.0
         self._reported_drops = 0
-        # controller frame → robot frame
+        # controller frame → robot frame (translation only, see H_rot below)
         self.H = mink.SE3.from_rotation(mink.SO3.from_matrix(
             np.array([[0, -1, 0], [0, 0, 1], [-1, 0, 0]])
+        ))
+        # Rotation delta gets its own conjugation matrix -- it used to reuse
+        # H above, which is tuned for translation axes and happens to be a
+        # forward 3-cycle permutation (ctrl X->robot Y, Y->Z, Z->X). Reusing
+        # it for rotation carried that same permutation into orientation,
+        # so pitching the controller rolled the EE, yawing it pitched the
+        # EE, and rolling it yawed the EE -- confirmed both on left and
+        # right arms via extra/diagnose_*_teleop_axes.py calibration runs
+        # (see extra/*_teleop_axes_2026*.json). H_rot is the inverse
+        # 3-cycle (ctrl X->EE Z, Y->X, Z->Y), which cancels it out. Row
+        # signs on Y and Z were then flipped after a live left-arm
+        # recheck: pitch (X row) came back correct as first written, but
+        # yaw (Y row) came out mirrored (commanded yaw_left read as yaw
+        # right); flipping only that row would make the matrix a
+        # reflection (det -1, rejected by mink.SO3), so the Z (roll) row
+        # flips with it to keep det = +1. Roll's own sign wasn't
+        # separately confirmed live -- if it now reads backward, that's
+        # the row to revisit.
+        self.H_rot = mink.SE3.from_rotation(mink.SO3.from_matrix(
+            np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
         ))
         # The Quest tracking space is fixed, but its planar axes are rotated
         # relative to the robot as it sits in the room.  Keep this calibration
@@ -363,6 +387,11 @@ class OculusSource(InputSource):
     def stop(self) -> None:
         self._stop.set()
 
+    # Bound on how many backlogged messages _worker will discard in one go.
+    # Real backlogs are a handful of packets (a brief GIL stall); this is
+    # just a safety cap against looping forever if a publisher ever floods.
+    _MAX_DRAIN = 64
+
     def _worker(self) -> None:
         ctx = self._zmq.Context()
         sock = ctx.socket(self._zmq.SUB)
@@ -372,26 +401,55 @@ class OculusSource(InputSource):
         while not self._stop.is_set():
             try:
                 _, message = sock.recv_multipart()
-                cs = self._parse(message.decode())
-                poses = self._filtered(cs)
-                with self._latest_lock:
-                    self._latest = (cs, poses)
             except self._zmq.ZMQError:
-                pass  # timeout — loop and re-check stop flag
+                continue  # timeout — loop and re-check stop flag
+
+            # If the receive thread fell behind for a moment (GIL contention
+            # with the main loop's RPC calls, OS scheduling, ...), ZMQ has
+            # queued whatever the headset sent meanwhile. Draining to the
+            # newest one here -- rather than filtering every queued message
+            # -- is what actually fixes the burst: processing a backlog one
+            # message at a time feeds the 1-euro filter a run of samples
+            # whose *local* receive times are compressed into microseconds
+            # while the real positions moved over the true, much longer
+            # gap. That looks like an impossible hand speed and gets
+            # rejected as a glitch -- which is what produced the "in
+            # brakes" stutter, not a bug in the filter's own math (a replay
+            # of a raw capture through PoseFilter with correct timestamps
+            # shows zero false rejections). Only the freshest pose is ever
+            # useful for teleop anyway; the stale intermediate ones are
+            # simply discarded, not fed through the filter as fake motion.
+            for _ in range(self._MAX_DRAIN):
+                try:
+                    _, message = sock.recv_multipart(flags=self._zmq.NOBLOCK)
+                except self._zmq.ZMQError:
+                    break
+
+            # Timestamp the sample now, once we actually have the freshest
+            # one in hand -- not cs.created_timestamp (time.time() inside
+            # parse_controller_state), and monotonic so it can't jump
+            # backwards on a system clock adjustment.
+            recv_time = time.monotonic()
+            cs = self._parse(message.decode(), legacy=self._legacy_oculus_app)
+            poses = self._filtered(cs, recv_time)
+            with self._latest_lock:
+                self._latest = (cs, poses)
         sock.close()
         ctx.destroy()
 
-    def _filtered(self, cs) -> dict[str, mink.SE3]:
+    def _filtered(self, cs, recv_time: float) -> dict[str, mink.SE3]:
         """Smooth this sample's controller poses (identity if filtering is off).
 
-        Runs on the receive thread so the filters see every message the headset
-        sends, not just the ones the 30 Hz teleop loop happens to pick up.
+        Runs on the receive thread, timestamped with `recv_time` (the actual
+        local arrival time of the freshest queued message) rather than
+        `cs.created_timestamp`, which the filter's glitch gate is sensitive to
+        -- see the backlog-draining comment in _worker for why.
         """
         poses = {"left": cs.left_SE3, "right": cs.right_SE3}
         if not self._filters:
             return poses
         for side, filt in self._filters.items():
-            poses[side] = filt(poses[side], cs.created_timestamp)
+            poses[side] = filt(poses[side], recv_time)
 
         # Report dropouts, but at most every couple of seconds and only when
         # the count has actually moved — this runs at ~72 Hz.
@@ -420,7 +478,7 @@ class OculusSource(InputSource):
                    X_Ctarget: mink.SE3) -> mink.SE3:
         """Controller delta → EE target (translate + rotate decomposed)."""
         X_Cdelta = X_Cinit.inverse().multiply(X_Ctarget)
-        X_Rdelta = self.H.inverse() @ X_Cdelta @ self.H
+        X_Rdelta = self.H_rot.inverse() @ X_Cdelta @ self.H_rot
 
         # Translation belongs to the fixed Quest tracking frame.  Taking it
         # from X_Cdelta would express it in the controller's local frame at
@@ -620,6 +678,11 @@ def main() -> None:
                              "while moving, passes more jitter")
     parser.add_argument("--oculus-yaw-correction", type=float, default=270.0,
                         help="CCW Quest-to-robot XY correction in degrees")
+    parser.add_argument("--legacy-oculus-app", action="store_true",
+                        help="parse the v0.1 Quest app's packets "
+                             "(com.GRAIL.YORTeleop, Left|Right) instead of "
+                             "v0.2's (com.GRAIL.Yor_Teleop, Head|Left|Right) "
+                             "-- default is v0.2")
     parser.add_argument("--step", type=float, default=0.02,
                         help="keyboard nudge step in metres")
     args = parser.parse_args()
@@ -635,7 +698,8 @@ def main() -> None:
                               pose_filter=not args.no_pose_filter,
                               filter_min_cutoff=args.filter_min_cutoff,
                               filter_beta=args.filter_beta,
-                              yaw_correction_deg=args.oculus_yaw_correction)
+                              yaw_correction_deg=args.oculus_yaw_correction,
+                              legacy_oculus_app=args.legacy_oculus_app)
 
     print(f"[teleop] target = {args.target}")
     WholeBodyTeleop(source, host=args.host, port=port, rate_hz=args.rate).run()

@@ -18,6 +18,7 @@
 import sys
 import argparse
 import functools
+import json
 import threading
 import time
 import numpy as np
@@ -34,8 +35,13 @@ if str(_ROOT) not in sys.path:
 
 from robot.arm.arm import ArmNode
 from robot.base import BaseController
+from robot.base_motor import DRIVE_VEL_SCALE as _DRIVE_VEL_SCALE
 from robot.wholebody_control import WholeBodyController, WholeBodyHardwareConfig
-from tools.base_pid_preflight import DEFAULT_MANIFEST, sync_from_manifest
+from robot.arm.wholebody_ik import WholeBodyIKConfig
+from tools.base_pid_preflight import (
+    COMMISSIONED_MANIFEST, DEFAULT_MANIFEST, STOCK_MANIFEST, drive_command_scale,
+    sync_from_manifest,
+)
 from commlink import RPCServer
 from nerolib import FirmwareVersion
 
@@ -76,12 +82,29 @@ class YOR():
         no_arms: bool = False,
         wholebody: bool = True,
         wholebody_config: Optional[WholeBodyHardwareConfig] = None,
+        ik_config: Optional[WholeBodyIKConfig] = None,
         flash_base_pid: bool = True,
         base_pid_manifest: Optional[Path] = None,
+        restore_base_pid: bool = True,
+        base_pid_stock_manifest: Optional[Path] = None,
     ):
         self._initialized = False
         self._flash_base_pid = bool(flash_base_pid)
         self._base_pid_manifest = Path(base_pid_manifest) if base_pid_manifest else DEFAULT_MANIFEST
+        self._restore_base_pid = bool(restore_base_pid)
+        self._base_pid_provenance = "unknown"
+        self._base_pid_stock_manifest = (
+            Path(base_pid_stock_manifest) if base_pid_stock_manifest
+            else STOCK_MANIFEST
+        )
+
+        # The command scale is only correct for one set of drive gains, so it
+        # comes from the same manifest the gains do -- picking a manifest picks
+        # both, and they cannot drift apart. See docs/BASE_COMMAND_LOOP_REVIEW.md
+        # finding 6 for why that matters.
+        self._drive_vel_scale, scale_note = drive_command_scale(
+            self._base_pid_manifest, _DRIVE_VEL_SCALE)
+        print(f"[YOR] base: drive command scale {scale_note}")
 
         self.slam_sub = None
         self._reset_nav = False
@@ -104,6 +127,7 @@ class YOR():
             # S-curve profiling (base_motor.py CONTROL_FREQ = 324 = 108 * 3),
             # which has no reason to be retuned here.
             relay_hz=108,
+            drive_vel_scale=self._drive_vel_scale,
         )
         self.base = self.base_controller.base
         self.no_arms = no_arms
@@ -112,6 +136,7 @@ class YOR():
         self.wholebody: Optional[WholeBodyController] = None
         self._wholebody_requested = wholebody and not no_arms
         self._wholebody_config = wholebody_config
+        self._ik_config = ik_config
         self._homing_lock = threading.Lock()
 
         if not self.no_arms:
@@ -142,6 +167,7 @@ class YOR():
         # restores stock gains and that one module then steers and drives
         # unlike its three neighbours.
         self._sync_base_pid_gains()
+        self._report_base_configuration()
 
         # Actively hold the chassis still throughout startup homing.
         print("[YOR] base: locked at zero velocity for startup homing")
@@ -209,12 +235,18 @@ class YOR():
         self._initialized = True
 
         if self._wholebody_requested:
+            # Stamp the gain set into the config before the controller builds
+            # its trajectory recorder, so every log says what it was driving on.
+            if self._wholebody_config is None:
+                self._wholebody_config = WholeBodyHardwareConfig()
+            self._wholebody_config.base_pid_provenance = self._base_pid_provenance
             self.wholebody = WholeBodyController(
                 left_arm=self.left_arm,
                 right_arm=self.right_arm,
                 base=self.base,
                 base_controller=self.base_controller,
                 config=self._wholebody_config,
+                ik_config=self._ik_config,
             )
             if not self.wholebody.config.enable_base_motion:
                 self.wholebody.toggle_fix_base(True)
@@ -223,7 +255,12 @@ class YOR():
             self.wholebody.start()
 
     def _sync_base_pid_gains(self) -> None:
-        """Bring the swerve controllers to config/base_pid_manifest.json.
+        """Bring the swerve controllers to the selected PID manifest.
+
+        Defaults to config/base_pid_stock.json -- the gains the controllers
+        hold in flash, and the ones DRIVE_VEL_SCALE = 2.0 is correct for. The
+        tuned set is config/base_pid_commissioned.json, opt-in via
+        --base-pid-manifest; see that file's description for why.
 
         Runs through the SparkFlex objects base_motor.py already opened, and
         before base.start_control(): no second set of device handles touches
@@ -239,6 +276,9 @@ class YOR():
         """
         if not self._flash_base_pid:
             print("[YOR] base PID sync skipped (flash_base_pid=False)")
+            self._base_pid_provenance = (
+                f"not flashed (controllers hold whatever was there), "
+                f"scale={self._drive_vel_scale:g}")
             return
 
         print("[YOR] base PID: syncing swerve gains")
@@ -249,6 +289,7 @@ class YOR():
             log=lambda line: print(f"[YOR] base PID: {line}"),
         )
         print(f"[YOR] base PID: {time.time() - started:.1f}s")
+        self._base_pid_provenance = self._describe_pid_manifest(self._base_pid_manifest, ok)
 
         if not ok:
             for problem in problems:
@@ -258,6 +299,127 @@ class YOR():
                 "control loop was not started. Fix the CAN bus or the manifest, or "
                 "construct YOR with flash_base_pid=False to start without it."
             )
+
+    def _describe_pid_manifest(self, path: Path, ok: bool) -> str:
+        """One line naming the gains this run is actually driving on.
+
+        The gain set changes what every speed number in the log means -- the
+        stock drive loop reaches about 40% of its setpoint on the floor while
+        the commissioned one tracks -- so the file name alone is not enough.
+        The drive p/ff pair identifies the set unambiguously.
+        """
+        try:
+            roles = json.loads(Path(path).read_text())["roles"]
+            drive, steer = roles["drive"], roles["steering"]
+            gains = (f"drive p={drive['p']:g} ff={drive['velocity_ff']:g}, "
+                     f"steer p={steer['p']:g} out=+/-{steer['output_max']:g}")
+        except Exception:
+            gains = "gains unreadable"
+        return (f"{Path(path).name} [{gains}, scale={self._drive_vel_scale:g}]"
+                + ("" if ok else " SYNC FAILED"))
+
+    def _report_base_configuration(self) -> None:
+        """Print what the swerve controllers say about their own setup.
+
+        Idle mode, control type and the two conversion factors all live in
+        SPARK flash, set out-of-band through the REV Hardware Client. Nothing
+        in this repository chose them and nothing recorded them, which is
+        exactly why `DRIVE_VEL_SCALE = 2.0` reads as a magic number -- it is
+        one half of a unit conversion whose other half is not in git.
+
+        `velocity_cf` is the one that decides whether `set_velocity_mps` is
+        speaking true m/s: 0.00083 means yes, 0.00166 means the controllers
+        believe twice the real speed. See docs/BASE_COMMAND_LOOP_REVIEW.md
+        finding 6. Diagnostic only -- nothing here changes behaviour.
+        """
+        report = getattr(self.base, "swerve_configuration", None)
+        if report is None:
+            return
+        try:
+            config = report()
+        except Exception as exc:
+            print(f"[YOR] base config: unavailable ({exc!r})")
+            return
+
+        def summarise(key):
+            values = {c[key] for c in config.values()}
+            only = values.pop() if len(values) == 1 else None
+            return f"{only}" if only is not None else "MIXED " + str(sorted(
+                (name, c[key]) for name, c in config.items()))
+
+        print(f"[YOR] base config: idle_mode={summarise('idle_mode')}"
+              f" ctrl_type={summarise('ctrl_type')}")
+        print(f"[YOR] base config: velocity_cf={summarise('velocity_cf')}"
+              f" position_cf={summarise('position_cf')}"
+              f" (drive_command_scale={self._drive_vel_scale})")
+
+    def _restore_base_pid_gains(self) -> None:
+        """Write the SPARK stock gains back on the way out.
+
+        The commissioned gains live in controller RAM, which outlives this
+        process: whatever opens the bus next — joystick.py, a nav run, a bare
+        base_motor.py — inherits them silently, and the manifest's own notes
+        record that some of them (the +/-0.25 steering output clamp in
+        particular) are specific to this configuration. Restoring stock on the
+        way out means gains are only ever in effect while the process that
+        asked for them is running.
+
+        Three things make this safe to do here and not elsewhere:
+
+        * It only runs if `_sync_base_pid_gains` actually wrote. If the node
+          started with `--no-flash-base-pid` it changed nothing, and undoing
+          a change nobody made would clobber someone else's commissioning.
+        * The control loop has to be stopped first. Changing gains underneath
+          a live velocity setpoint is a step change in the plant, not a
+          configuration edit; the guard below stops the loop rather than
+          trusting the caller to have done it.
+        * It goes through the same validated, read-back sync as startup, so a
+          write the controller ignored is reported rather than assumed.
+
+        Never raises. A failure here cannot be allowed to skip the arm drop
+        that follows it in the shutdown sequence.
+        """
+        if not self._restore_base_pid:
+            return
+        if not self._flash_base_pid:
+            print("[YOR] base PID: restore skipped (gains were never flashed)")
+            return
+        try:
+            same = (self._base_pid_manifest.resolve()
+                    == self._base_pid_stock_manifest.resolve())
+        except Exception:
+            same = False
+        if same:
+            # Startup applied the stock manifest, so there is nothing to undo.
+            # Saying so beats printing "restoring stock" over eight no-op writes.
+            print("[YOR] base PID: restore not needed (started on the stock manifest)")
+            return
+
+        try:
+            if self.base.control_loop_running:
+                # Gains must not change under a live setpoint.
+                self.base.set_target_base_velocity(np.zeros(3), smooth=False)
+                self.base.stop_control()
+
+            print("[YOR] base PID: restoring stock swerve gains")
+            started = time.time()
+            ok, problems = sync_from_manifest(
+                self.base.swerve_devices(),
+                manifest_path=self._base_pid_stock_manifest,
+                log=lambda line: print(f"[YOR] base PID: {line}"),
+            )
+            print(f"[YOR] base PID: {time.time() - started:.1f}s")
+            if not ok:
+                for problem in problems:
+                    print(f"[YOR] base PID: {problem}")
+                print(
+                    f"[YOR] base PID: {len(problems)} controller(s) still hold the "
+                    "commissioned gains. Power-cycle the SPARKs, or run "
+                    "`python tools/base_pid_preflight.py "
+                    "--manifest config/base_pid_stock.json`."
+                )
+        except Exception as exc:
+            print(f"[YOR] base PID: restore failed ({exc!r}); shutdown continues")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Base — direct control (joystick, nav). Suspends whole-body base authority.
@@ -608,6 +770,7 @@ class YOR():
                     base=self.base,
                     base_controller=self.base_controller,
                     config=runtime_config,
+                    ik_config=self._ik_config,
                 )
                 self.wholebody.toggle_fix_base(previous_fix_base)
                 self.wholebody.ik.toggle_fix_lift(previous_fix_lift)
@@ -773,6 +936,7 @@ class YOR():
                 base=self.base,
                 base_controller=self.base_controller,
                 config=self._wholebody_config,
+                ik_config=self._ik_config,
             )
             if not self.wholebody.config.enable_base_motion:
                 self.wholebody.toggle_fix_base(True)
@@ -887,7 +1051,19 @@ def main():
              "which after a SPARK power cycle are the stock ones")
     parser.add_argument(
         "--base-pid-manifest", type=Path, default=None, metavar="PATH",
-        help=f"PID manifest to sync from (default: {DEFAULT_MANIFEST})")
+        help=f"PID manifest to sync at startup (default: {DEFAULT_MANIFEST.name}, "
+             f"the gains the controllers hold in flash and that DRIVE_VEL_SCALE=2.0 "
+             f"is correct for). The tuned floor-measured set is "
+             f"{COMMISSIONED_MANIFEST.name}; see its description before using it.")
+    parser.add_argument(
+        "--restore-base-pid", action=argparse.BooleanOptionalAction, default=True,
+        help="on shutdown, write the SPARK stock gains back over the commissioned "
+             "ones, so nothing that opens the bus afterwards inherits them. Has no "
+             "effect if the gains were never flashed (--no-flash-base-pid).")
+    parser.add_argument(
+        "--base-pid-stock-manifest", type=Path, default=None, metavar="PATH",
+        help=f"stock-gain manifest restored on shutdown (default: {STOCK_MANIFEST.name}). "
+             f"The restore is skipped when startup already applied it.")
     parser.add_argument(
         "--no-arms", action="store_true",
         help="skip both arm controllers and their startup joint homing")
@@ -897,25 +1073,201 @@ def main():
     parser.add_argument(
         "--no-lift-motion", action="store_true",
         help="keep the whole-body IK lift fixed and disable lift dispatch")
+    parser.add_argument(
+        "--no-console-log", action="store_true",
+        help="don't mirror console output to artifacts/wholebody_logs/ "
+             "(mirroring is on by default)")
+    parser.add_argument(
+        "--no-trajectory-log", action="store_true",
+        help="don't record per-tick joint/EE trajectories to "
+             "artifacts/wholebody_logs/trajectories/ (recording is on by "
+             "default -- this is the raw data null-space-projection work "
+             "will need later, not just a debugging aid)")
+    parser.add_argument(
+        "--posture-stiffen-joint7", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="raise the posture cost on *_arm_joint7 by "
+             "--posture-joint7-scale (default: on). Carried over from before "
+             "the null-space projector existed, when it was the only lever "
+             "against joint7 wobble; it has never been A/B'd against "
+             "--redundancy-resolution dls_projector, which addresses the same "
+             "problem structurally. Try --no-posture-stiffen-joint7 if the "
+             "elbow-swivel objective seems short of authority -- both compete "
+             "for the same 2 null-space DOFs.")
+    parser.add_argument(
+        "--posture-refresh-target", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="keep the posture task's reference tracking the current "
+             "configuration every solve instead of freezing it at startup "
+             "(default: on; see refresh_posture_target in "
+             "robot/arm/wholebody_ik.py). Off leaves the reference to go "
+             "stale over a session, which measurably degraded long reaches.")
+    parser.add_argument(
+        "--posture-joint7-scale", type=float, default=3.0,
+        help="only with --posture-stiffen-joint7: multiplier on "
+             "arm_posture_cost for *_arm_joint7 (default: %(default)s, i.e. "
+             "3x stiffer -- see the measured-response table in "
+             "WholeBodyIKConfig.arm_posture_cost_overrides's docstring for "
+             "what other multipliers do)")
+    parser.add_argument(
+        "--redundancy-resolution", choices=("soft", "dls_projector"),
+        default="dls_projector",
+        help="how the null space is resolved (default: %(default)s, the "
+             "configuration validated on hardware 2026-08-22). 'soft' is the "
+             "original behaviour -- EE tasks and posture as competing soft "
+             "costs in one QP -- kept as a baseline and still what the sim "
+             "node and IK demo use. It cannot fix the elbow branch-flipping: "
+             "we pushed the EE:posture weight ratio to ~100,000:1 and the "
+             "problem neither shrank nor moved, which is what established "
+             "that it is structural. 'dls_projector' resolves the redundancy "
+             "properly -- damped-least-squares pseudoinverse for the EE task "
+             "plus an exact null-space projector for posture, elbow swivel "
+             "and the optional objectives -- and measured 2.2 vs 5.3 elbow "
+             "flips per 1000 ticks against 'soft' on hardware. See "
+             "artifacts/wholebody_logs/posture_fix_commands.md.")
+    parser.add_argument(
+        "--dls-damping", type=float, default=0.05,
+        help="only with --redundancy-resolution dls_projector: Tikhonov/DLS "
+             "damping λ for the pseudoinverse J⁺=Jᵀ(JJᵀ+λ²I)⁻¹ (default: "
+             "%(default)s). Larger = more robust near singularities, at the "
+             "cost of looser EE tracking there; 0.01-0.1 is the usual range.")
+    parser.add_argument(
+        "--nullspace-swivel-weight", type=float, default=1.0,
+        help="only with --redundancy-resolution dls_projector: weight on the "
+             "elbow-swivel objective, which holds each arm's elbow at a fixed "
+             "angle about its shoulder->wrist axis instead of letting the "
+             "solver pick whichever elbow branch is locally cheapest. This is "
+             "the direct fix for the elbow branch-flipping documented in "
+             "artifacts/wholebody_logs/posture_fix_commands.md. Measured elbow "
+             "drift over a reversing target with an abrupt disturbance: 0 -> "
+             "26.9deg, 1.0 -> 8.2deg, 5.0 -> 1.9deg, EE tracking unchanged. "
+             "0 disables (default: %(default)s)")
+    parser.add_argument(
+        "--elbow-swivel-gain", type=float, default=1.0,
+        help="only with --redundancy-resolution dls_projector: proportional "
+             "gain pulling each elbow back to its target swivel angle "
+             "(default: %(default)s)")
+    parser.add_argument(
+        "--elbow-swivel-target", type=float, default=None, metavar="RAD",
+        help="only with --redundancy-resolution dls_projector: hold both "
+             "elbows at this swivel angle in radians. Omit (the default) to "
+             "latch each arm's angle from its pose at startup, which keeps "
+             "the elbow branch the arm homes into rather than choosing one.")
+    parser.add_argument(
+        "--nullspace-continuity-weight", type=float, default=0.0,
+        help="only with --redundancy-resolution dls_projector: weight on "
+             "||qdot - qdot_prev||. Defaults to 0 because it measured "
+             "counterproductive -- it resists *change*, which also means it "
+             "perpetuates existing null-space motion instead of letting "
+             "posture bleed it off (raising it worsened null-space jerk, "
+             "null-space speed and elbow drift at every swivel weight). Kept "
+             "tunable in case hardware command-smoothness behaves differently "
+             "from a kinematic replay (default: %(default)s)")
+    parser.add_argument(
+        "--enable-manipulability", action="store_true",
+        help="only with --redundancy-resolution dls_projector: add a gated "
+             "manipulability-maximisation objective, pushing each arm away "
+             "from singular configurations. Costs roughly 19 ms extra per "
+             "solve (finite-differenced gradient, 14 perturbed Jacobians per "
+             "arm per iteration), which does NOT fit the 30 Hz budget -- "
+             "treat as a diagnostic, not a production setting.")
+    parser.add_argument(
+        "--manipulability-weight", type=float, default=0.5,
+        help="only with --enable-manipulability (default: %(default)s)")
+    parser.add_argument(
+        "--manipulability-gain", type=float, default=0.02,
+        help="only with --enable-manipulability: step size in radians per "
+             "iteration along the normalised ascent direction "
+             "(default: %(default)s)")
     args = parser.parse_args()
+
+    if not args.no_console_log:
+        from robot.utils.console_log import start_console_log
+        start_console_log("yor", _ROOT / "artifacts" / "wholebody_logs")
 
     wholebody_config = WholeBodyHardwareConfig(
         enable_base_motion=not args.no_base_motion,
         enable_lift_motion=not args.no_lift_motion,
+        record_trajectories=not args.no_trajectory_log,
     )
+
+    # Same base tuning WholeBodyController would build internally (see its
+    # __init__ -- passing any ik_config here bypasses that block entirely,
+    # so it has to be reproduced rather than dropped).
+    ik_config = WholeBodyIKConfig(
+        dt=1.0 / wholebody_config.control_hz,
+        solver="pyqpmad",
+        max_iters=10,
+        base_posture_cost=1e-1,
+        lift_posture_cost=1e-4,
+        arm_posture_cost=1e-3,
+        refresh_posture_target=args.posture_refresh_target,
+        arm_posture_cost_overrides=(
+            {
+                "left_arm_joint7": 1e-3 * args.posture_joint7_scale,
+                "right_arm_joint7": 1e-3 * args.posture_joint7_scale,
+            }
+            if args.posture_stiffen_joint7
+            else {}
+        ),
+        redundancy_resolution=args.redundancy_resolution,
+        dls_damping=args.dls_damping,
+        nullspace_swivel_weight=args.nullspace_swivel_weight,
+        elbow_swivel_gain=args.elbow_swivel_gain,
+        elbow_swivel_targets=(
+            {} if args.elbow_swivel_target is None
+            else {"left": args.elbow_swivel_target,
+                  "right": args.elbow_swivel_target}
+        ),
+        nullspace_continuity_weight=args.nullspace_continuity_weight,
+        enable_manipulability=args.enable_manipulability,
+        manipulability_weight=args.manipulability_weight,
+        manipulability_gain=args.manipulability_gain,
+    )
+    print(
+        f"[yor] posture-fix: stiffen_joint7={args.posture_stiffen_joint7}"
+        + (f" (scale={args.posture_joint7_scale:g}x)" if args.posture_stiffen_joint7 else "")
+        + f", refresh_target={args.posture_refresh_target}"
+        + f", redundancy_resolution={args.redundancy_resolution}"
+        + (f" (dls_damping={args.dls_damping:g})" if args.redundancy_resolution == "dls_projector" else "")
+    )
+    if args.redundancy_resolution == "dls_projector":
+        print(
+            f"[yor] null-space: swivel_weight={args.nullspace_swivel_weight:g}"
+            + f" (gain={args.elbow_swivel_gain:g}, target="
+            + ("latched-from-pose" if args.elbow_swivel_target is None
+               else f"{args.elbow_swivel_target:g} rad") + ")"
+            + f", continuity_weight={args.nullspace_continuity_weight:g}"
+            + f", manipulability={args.enable_manipulability}"
+            + (f" (weight={args.manipulability_weight:g},"
+               f" gain={args.manipulability_gain:g})"
+               if args.enable_manipulability else "")
+        )
 
     yor = YOR(
         no_arms=args.no_arms,
         wholebody_config=wholebody_config,
+        ik_config=ik_config,
         flash_base_pid=args.flash_base_pid,
         base_pid_manifest=args.base_pid_manifest,
+        restore_base_pid=args.restore_base_pid,
+        base_pid_stock_manifest=args.base_pid_stock_manifest,
     )
-    yor.init()
-    server = RPCServer(yor, port=YOR_PORT, threaded=True)
-
+    server = None
     shutdown_started = False
 
     def graceful_shutdown():
+        """Bring the robot down in order, and get all the way to the end.
+
+        Registered *before* init(), because init() raises for a living — a
+        failed lift home, a failed arm home, a failed PID sync — and the
+        controllers are already open and possibly already written by then.
+        Everything here therefore has to tolerate a robot that was only
+        half-started: `server` is None until the RPC layer exists, and each
+        hardware step runs independently, because a failure in one must not
+        skip the ones after it. The base PID restore in particular sits
+        behind two steps that both touch hardware.
+        """
         nonlocal shutdown_started
         if shutdown_started:
             return
@@ -923,26 +1275,42 @@ def main():
 
         print("\nRPC Server stopping...")
 
+        def attempt(label, action):
+            try:
+                action()
+            except Exception as exc:
+                print(f"[YOR] shutdown: {label} failed ({exc!r}); continuing")
+
         if yor.wholebody is not None:
-            yor.wholebody.stop()
+            attempt("whole-body stop", yor.wholebody.stop)
 
         # Stop hardware workers before RPC teardown/interpreter shutdown so
         # PicoLift cannot keep reconnecting after Ctrl-C.
-        yor.base.stop_control()
-        yor.base._pico_lift._shutdown()
+        attempt("base control loop stop", yor.base.stop_control)
 
-        server.stop()
+        # Then hand the swerve controllers back in stock condition, while the
+        # device handles are still open and nothing is commanding a wheel.
+        # Never raises on its own; see YOR._restore_base_pid_gains.
+        yor._restore_base_pid_gains()
+
+        attempt("lift serial shutdown", yor.base._pico_lift._shutdown)
+
+        if server is not None:
+            attempt("RPC server stop", server.stop)
 
         if not yor.no_arms:
             if yor.left_arm is not None:
                 input("\n[YOR] Press ENTER to drop LEFT arm...")
-                yor.left_arm.stop()
+                attempt("left arm stop", yor.left_arm.stop)
 
             if yor.right_arm is not None:
                 input("\n[YOR] Press ENTER to drop RIGHT arm...")
-                yor.right_arm.stop()
+                attempt("right arm stop", yor.right_arm.stop)
 
     atexit.register(graceful_shutdown)
+
+    yor.init()
+    server = RPCServer(yor, port=YOR_PORT, threaded=True)
     server.start()
     try:
         while True:

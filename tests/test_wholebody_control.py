@@ -10,6 +10,7 @@ without CAN, serial or a robot. Nothing here touches nerolib or sparkcan_py.
 
 from __future__ import annotations
 
+import math
 import sys
 import time
 from pathlib import Path
@@ -97,6 +98,9 @@ def build(**cfg_kwargs):
     left = FakeArm([0.0, 1.32, -1.71, 1.31, 0.0, 0.0, 0.0])
     right = FakeArm([0.0, 1.32, 1.71, 1.31, 0.0, 0.0, 0.0])
     base = FakeBase()
+    # Headless tests have no business writing real files into
+    # artifacts/wholebody_logs/trajectories/ -- that's for live robot runs.
+    cfg_kwargs.setdefault("record_trajectories", False)
     config = WholeBodyHardwareConfig(**cfg_kwargs)
     wbc = WholeBodyController(left, right, base, config=config)
     wbc.init()
@@ -346,8 +350,16 @@ def test_manual_override():
     wbc, left, right, base = build(manual_override_timeout_s=60.0)
     import mink
     T_l, _ = wbc.forward_kinematics()
+    # 0.6 m: out of arm-only reach, so the base is genuinely recruited (which
+    # is what the "base yields" check needs), but still reachable once it
+    # moves. Deliberately NOT the 1.5 m used before: that is unreachable
+    # outright, so the arm ends up pinned against its joint limits and this
+    # test then measures saturation behaviour rather than authority handover.
+    # dls_projector settles when saturated (correctly -- it drives 7 joints
+    # to their limits and stops), where soft keeps twitching above the 0.05
+    # rad dispatch deadband, so the old target passed only by accident.
     wbc.set_left_ee_target(mink.SE3.from_rotation_and_translation(
-        T_l.rotation(), T_l.translation() + np.array([0.0, -1.5, 0.0])))
+        T_l.rotation(), T_l.translation() + np.array([0.0, -0.6, 0.0])))
 
     wbc.notify_manual_base_command()
     base.velocity_commands.clear()
@@ -404,7 +416,13 @@ def test_axis_map_and_odometry():
     print("\nbase frame conventions")
     m = BaseAxisMap()
     cmd = m.to_command(forward=1.0, lateral=2.0, yaw_rate=3.0)
-    check("axis map places forward/lateral/yaw", np.allclose(cmd, [2.0, 1.0, 3.0]), str(cmd))
+    # [forward, left, yaw]. This assertion used to read [2.0, 1.0, 3.0] and so
+    # locked in the crossed mapping that made the base strafe when the solver
+    # asked it to drive forward. See BaseAxisMap's docstring for the three
+    # independent confirmations of this order, and
+    # tests/test_base_kinematics.py::test_axis_map_is_not_crossed for the
+    # end-to-end check through the wheel kinematics.
+    check("axis map places forward/lateral/yaw", np.allclose(cmd, [1.0, 2.0, 3.0]), str(cmd))
 
     wbc, *_ = build()
     # The robot faces -Y, so world -Y velocity must read as pure forward.
@@ -440,6 +458,170 @@ def test_state_snapshot():
         for k in state), str({k: type(v).__name__ for k, v in state.items()}))
 
 
+def test_posture_fix_gates():
+    print("\nposture-fix gates (--posture-fix none/stiffen-joint7/refresh-target)")
+    from robot.arm.wholebody_ik import WholeBodyIKConfig
+    import mink
+
+    def build_with(ik_config):
+        left = FakeArm([0.0, 1.32, -1.71, 1.31, 0.0, 0.0, 0.0])
+        right = FakeArm([0.0, 1.32, 1.71, 1.31, 0.0, 0.0, 0.0])
+        base = FakeBase()
+        wbc = WholeBodyController(
+            left, right, base,
+            config=WholeBodyHardwareConfig(record_trajectories=False),
+            ik_config=ik_config,
+        )
+        wbc.init()
+        return wbc
+
+    def move_away_from_home(wbc):
+        T_l, _ = wbc.forward_kinematics()
+        target = mink.SE3.from_rotation_and_translation(
+            T_l.rotation(), T_l.translation() + np.array([0.0, -0.15, 0.05]))
+        wbc.set_left_ee_target(target)
+        for _ in range(100):
+            wbc._step()
+
+    # "none": legacy behavior unchanged -- posture target frozen at init,
+    # so once the arm has moved away (with lift_target never set, matching
+    # an arms-only session), the posture task's error grows.
+    base_ik_cfg = dict(
+        dt=1.0 / 30.0, solver="pyqpmad", max_iters=10,
+        base_posture_cost=1e-1, lift_posture_cost=1e-4, arm_posture_cost=1e-3,
+    )
+    wbc = build_with(WholeBodyIKConfig(**base_ik_cfg, refresh_posture_target=False))
+    move_away_from_home(wbc)
+    stale_err = wbc.ik.posture_task.compute_error(wbc.ik.configuration)
+    check("posture-fix=none: frozen target leaves a real posture error "
+          "after moving away with no lift_target ever set",
+          float(np.linalg.norm(stale_err)) > 0.05,
+          f"|err|={float(np.linalg.norm(stale_err)):.4f}")
+
+    # "refresh-target": posture reference tracks current configuration at
+    # the start of every solve (not a fixed point from startup), so it can
+    # never accumulate more error than roughly one solve's own convergence
+    # motion -- unlike "none", which keeps compounding against an
+    # increasingly stale reference for the whole session. Not exactly zero:
+    # the reference is captured before that solve's max_iters QP loop moves
+    # the arm further, so a residual proportional to one tick's motion
+    # remains -- the claim is "far smaller than frozen", not "zero".
+    wbc = build_with(WholeBodyIKConfig(**base_ik_cfg, refresh_posture_target=True))
+    move_away_from_home(wbc)
+    fresh_err = wbc.ik.posture_task.compute_error(wbc.ik.configuration)
+    fresh_norm, stale_norm = float(np.linalg.norm(fresh_err)), float(np.linalg.norm(stale_err))
+    check("posture-fix=refresh-target: posture error stays far smaller "
+          "than the frozen-target case after the same move",
+          fresh_norm < 0.05 and fresh_norm < stale_norm / 10.0,
+          f"refresh |err|={fresh_norm:.4f} vs none |err|={stale_norm:.4f}")
+
+    # "stiffen-joint7": the override reaches the actual posture cost vector
+    # mink solves against, without touching sibling joints.
+    wbc = build_with(WholeBodyIKConfig(
+        **base_ik_cfg,
+        arm_posture_cost_overrides={"left_arm_joint7": 1e-2, "right_arm_joint7": 1e-2},
+    ))
+    cost = wbc.ik._build_posture_cost()
+    j7_cost = cost[wbc.ik.model.joint("left_arm_joint7").dofadr][0]
+    j6_cost = cost[wbc.ik.model.joint("left_arm_joint6").dofadr][0]
+    check("posture-fix=stiffen-joint7: joint7 cost raised 10x",
+          abs(j7_cost - 1e-2) < 1e-12, f"joint7 cost={j7_cost}")
+    check("posture-fix=stiffen-joint7: sibling joint6 cost untouched",
+          abs(j6_cost - 1e-3) < 1e-12, f"joint6 cost={j6_cost}")
+
+
+def test_trajectory_log():
+    """One solve tick must log the solve *and* what it dispatched.
+
+    The ordering is the part worth pinning: the recorder used to run before
+    dispatch, so a row's base and lift columns would describe the previous
+    tick. Tuning a controller against data offset by one cycle from the
+    command that produced it is worse than not logging it at all.
+    """
+    print("\ntrajectory log")
+    import csv
+    import tempfile
+    from robot.wholebody_control import _TrajectoryRecorder
+
+    wbc, left, right, base = build(enable_base_motion=True)
+    T_l, T_r = wbc.forward_kinematics()
+    goal = T_l.translation() + np.array([0.0, -1.0, 0.0])   # far: recruits the base
+    import mink
+    wbc.set_left_ee_target(mink.SE3.from_rotation_and_translation(T_l.rotation(), goal))
+    wbc.set_lift_target(0.5)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "traj.csv"
+        wbc._trajectory_recorder = _TrajectoryRecorder(path, wbc.ik.config, wbc.config)
+        for _ in range(5):
+            wbc._step()
+        wbc._trajectory_recorder.close()
+
+        rows = list(csv.reader(path.read_text().splitlines()))
+
+    config_rows = [r for r in rows if r and r[0].startswith("#")]
+    header = rows[len(config_rows)]
+    data = [dict(zip(header, r)) for r in rows[len(config_rows) + 1:]]
+
+    check("both config lines are stamped", len(config_rows) == 2, str(len(config_rows)))
+    check("the base/lift knobs are recorded",
+          any("lift_kp" in cell for cell in config_rows[1])
+          and any("base_vel_deadband" in cell for cell in config_rows[1]))
+    # Which gains were on the controllers changes what every speed number in
+    # the log means. The 2026-08-22 runs had to have theirs inferred from the
+    # drive tracking ratio; this stops that recurring.
+    # The gain set carries its own command scale (see base_pid_*.json
+    # drive_command_scale), so the provenance string covers both.
+    check("the swerve gain set and the base limits are recorded",
+          any("base_pid=" in cell for cell in config_rows[1])
+          and any("base_heading_rate_limit=" in cell for cell in config_rows[1]),
+          str(config_rows[1][-3:]))
+    check("one row per solve tick", len(data) == 5, str(len(data)))
+    check("every row is the full width",
+          all(len(r) == len(header) for r in rows[len(config_rows) + 1:]))
+
+    last = data[-1]
+    check("the base command it actually sent is logged",
+          last["base_active"] == "True"
+          and np.isclose(float(last["base_sent_0"]), base.velocity_commands[-1][0])
+          and np.isclose(float(last["base_sent_1"]), base.velocity_commands[-1][1]),
+          f"{last['base_sent_0']},{last['base_sent_1']} vs {base.velocity_commands[-1]}")
+    check("the solver's unclamped request is logged alongside it",
+          all(math.isfinite(float(last[k]))
+              for k in ("base_req_vx", "base_req_vy", "base_req_wz")))
+    check("the lift goal and measurement are logged",
+          last["lift_active"] == "True"
+          and abs(float(last["lift_goal"]) - 0.5) < 1e-9
+          and abs(float(last["lift_meas"]) - base.lift_height) < 0.05,
+          f"goal={last['lift_goal']} meas={last['lift_meas']}")
+
+    # FakeBase has no swerve_telemetry, so the module columns must degrade to
+    # nan rather than raising or recording a module that is really at zero.
+    check("a base without module telemetry logs nan, not zero",
+          last["steer_meas_FL"] == "nan" and last["swerve_enabled"] == "False")
+
+    base.swerve_telemetry = lambda: {
+        "motors_enabled": True,
+        "v_target": np.zeros(3), "v_profiled": np.zeros(3),
+        "steer_cmd_rad": np.array([0.1, 0.2, 0.3, 0.4]),
+        "steer_meas_rad": np.array([0.11, 0.19, 0.31, 0.39]),
+        "drive_cmd_mps": np.full(4, 0.25), "drive_meas_raw": np.full(4, 0.24),
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "traj2.csv"
+        wbc._trajectory_recorder = _TrajectoryRecorder(path, wbc.ik.config, wbc.config)
+        wbc._step()
+        wbc._trajectory_recorder.close()
+        rows = list(csv.reader(path.read_text().splitlines()))
+    row = dict(zip(rows[2], rows[3]))
+    check("module commanded/measured pairs are logged when available",
+          abs(float(row["steer_cmd_FL"]) - 0.1) < 1e-9
+          and abs(float(row["steer_meas_FL"]) - 0.11) < 1e-9
+          and abs(float(row["drive_cmd_RL"]) - 0.25) < 1e-9
+          and abs(float(row["drive_meas_RL"]) - 0.24) < 1e-9,
+          str({k: row[k] for k in ("steer_cmd_FL", "steer_meas_FL")}))
+
+
 def main() -> int:
     for test in (
         test_init,
@@ -454,6 +636,8 @@ def main() -> int:
         test_emergency_stop_resume,
         test_axis_map_and_odometry,
         test_state_snapshot,
+        test_posture_fix_gates,
+        test_trajectory_log,
     ):
         test()
 

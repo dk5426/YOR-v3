@@ -60,10 +60,12 @@ Three things are worth knowing before running this on the robot:
 
 from __future__ import annotations
 
+import csv
 import math
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -72,6 +74,16 @@ import mink
 from loop_rate_limiters import RateLimiter
 
 from robot.arm.wholebody_ik import WholeBodyIK, WholeBodyIKConfig
+
+# Column labels for the four swerve modules in the trajectory log. Taken from
+# base_motor so the log can never disagree with the order Base.swerve_telemetry
+# packs its arrays in. The fallback keeps this file importable without
+# sparkcan_py (headless test runs, sim-only checkouts) -- it is the same
+# literal base_motor defines, and the import is what keeps the two honest.
+try:
+    from robot.base_motor import MODULE_ORDER as _MODULE_LABELS, NUM_SWERVES as _NUM_SWERVES
+except Exception:  # pragma: no cover - only when the CAN stack is absent
+    _MODULE_LABELS, _NUM_SWERVES = ("FL", "FR", "RR", "RL"), 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,18 +98,34 @@ class BaseAxisMap:
     effectors sit at y ≈ −0.25 m, and the left arm is at +X. So, in the base's
     own frame, forward = −y_model and left = +x_model.
 
-    ``Base`` takes a 3-vector whose first element is the lateral component and
-    whose second is the forward one — that is the ordering the working path
-    follower in robot/base.py uses (``[pid(d_left), pid(d_forward), omega]``).
-    The signs have *not* been verified against the physical robot; drive it
-    with robot/teleop/joystick.py first and flip whichever sign is wrong.
+    ``Base`` takes a 3-vector that is ``[forward, left, yaw]``. **This was
+    wrong here until 2026-08-22**: the indices were crossed, so the solver's
+    forward command went into the element the wheels treat as sideways, and a
+    whole-body reach that needed the base to drive forward strafed instead.
+
+    Three independent confirmations of the order:
+
+    * ``robot/base_motor.py`` builds each wheel vector as
+      ``atan2(target[1], target[0])``, so element 0 points the modules at 0
+      degrees and element 1 at +90. Verified against the 2026-08-22 logs:
+      commanded module angle matched ``atan2(target_1, target_0)`` to 0.00
+      degrees on all four modules across 158 low-yaw ticks.
+    * The previous codebase measured which of those is physically which, with
+      two on-blocks probes: modules at 0 degrees is forward, +90 is left.
+    * ``robot/teleop/joystick.py`` sends ``[vx, vy, w]`` with ``vx`` from the
+      stick's *vertical* axis — i.e. it has always used element 0 as forward,
+      and the joystick has always driven correctly. Only this map disagreed.
+
+    The signs follow from the same evidence: +element 0 is forward, +element 1
+    is left, and ``_world_to_body`` already returns ``lateral`` as +left. The
+    yaw sign is the one value still unverified against the physical robot.
     """
 
-    lateral_index: int = 0
-    forward_index: int = 1
+    forward_index: int = 0
+    lateral_index: int = 1
     yaw_index: int = 2
-    lateral_sign: float = +1.0
     forward_sign: float = +1.0
+    lateral_sign: float = +1.0
     yaw_sign: float = +1.0
 
     def to_command(self, forward: float, lateral: float, yaw_rate: float) -> np.ndarray:
@@ -152,16 +180,27 @@ class WholeBodyHardwareConfig:
     # Hard cap used to derive that maximum look-ahead distance, independent of
     # the solver's own velocity limit.
     #
-    # This matches `joint_vel_max` in robot/arm/arm.py (3.0 rad/s). A smaller
-    # number here would silently override the commissioned native limit — the
-    # arms would never reach the speed the controller is configured for, and
-    # the discrepancy would only show up as sluggish whole-body tracking.
-    arm_max_vel_rad_s: float = 3.0
+    # `joint_vel_max` in robot/arm/arm.py is per-joint now (2.98 rad/s on
+    # joints 1-4, 3.72 on the wrist joints 5-7 -- 95% of each joint's live
+    # firmware-reported max), not a single number. This clamp stays a single
+    # scalar (it's a looser outer bound, not a per-joint match -- the
+    # per-joint ceiling is arm.py's job), but it has to be at least the
+    # highest of those, or it would silently override the wrist joints'
+    # native limit -- they'd never reach the speed the controller is
+    # configured for, and the discrepancy would only show up as sluggish
+    # whole-body tracking on those joints specifically.
+    arm_max_vel_rad_s: float = 3.72
     # Open-loop arm planning: seed from the encoders once at startup, then
     # advance IK from its previous commanded solution without reading arm
     # feedback each cycle. Nerolib's low-level motor PD remains closed-loop,
     # but the WBC model can drift from the physical arms if tracking is poor.
     use_measured_arm_state: bool = False
+    # Record raw per-solve-tick joint/EE trajectories to
+    # artifacts/wholebody_logs/trajectories/ for offline analysis -- the data
+    # a real null-space projection (rather than the current soft posture
+    # cost) will need to be designed against later. On by default; see
+    # _TrajectoryRecorder.
+    record_trajectories: bool = True
 
     # ── Lift ────────────────────────────────────────────────────────────────
     enable_lift_motion: bool = True
@@ -206,12 +245,48 @@ class WholeBodyHardwareConfig:
     # when the arms and lift together cannot reach the target. Nothing sends
     # the base an explicit drive command on this path.
     enable_base_motion: bool = True
-    base_max_lin_vel: float = 0.25   # m/s, per axis after mapping
+    # Applied to the linear velocity as a *vector*, not per axis. Per-axis
+    # limits skew the commanded direction toward whichever axis saturates
+    # first; the same reasoning is already written down for the SLAM
+    # correction in BaseOdometry.apply_correction.
+    base_max_lin_vel: float = 0.25   # m/s, magnitude of (forward, lateral)
     base_max_ang_vel: float = 0.60   # rad/s
     # Velocities below this are sent as zero, so solver noise doesn't leave the
-    # swerve modules humming at a standstill.
-    base_vel_deadband: float = 0.02
+    # swerve modules humming at a standstill. Also applied to the linear
+    # velocity as a vector: deadbanding forward and lateral independently
+    # rotated the command, so a 0.053 m/s request 21 degrees off the forward
+    # axis went out as pure forward -- direction wrong, not just magnitude, and
+    # the odometry then integrated the distorted version.
+    # Raised from 0.02 on 2026-08-22. The commanded heading whirls when the
+    # velocity vector is short -- atan2 of a small vector is ill-conditioned --
+    # and the measured module-travel demand ran to a median 552 deg/s in the
+    # 0.02-0.04 band against hardware that peaks near 300. The base spent
+    # 25-41% of its moving ticks in that regime. This keeps it out.
+    base_vel_deadband: float = 0.04        # m/s
+    # Yaw gets its own, in its own units. This was the same scalar as the
+    # linear deadband, which silently meant "0.02 rad/s" as well as
+    # "0.02 m/s". Same default, so behaviour is unchanged until it is tuned.
+    base_yaw_deadband: float = 0.02        # rad/s
+    # Ceiling on how fast the *direction* of the base command may turn, which
+    # is a hardware limit rather than a preference: the swerve modules peak at
+    # 265-353 deg/s of slew, and in the 2026-08-22 runs 27-44% of moving ticks
+    # asked for more than that -- p99 was about ten times the limit. A module
+    # that cannot reach its commanded angle drives the chassis somewhere other
+    # than where the solver asked, so this bounds the ask to something the
+    # hardware can actually serve. 200 deg/s leaves margin under the slowest
+    # measured module. Set to 0 to disable.
+    #
+    # Only the translation direction is limited. Yaw is a scalar and does not
+    # have the ill-conditioning problem, though it does move the module angles
+    # through the rotation term -- that part is not bounded here.
+    base_heading_rate_limit: float = 3.49   # rad/s (200 deg/s)
     base_axis_map: BaseAxisMap = field(default_factory=BaseAxisMap)
+    # Which swerve PID gains were actually on the controllers for this run.
+    # Set by robot/yor.py after the startup sync, and stamped into the
+    # trajectory log. Nothing reads it at runtime: it exists because the two
+    # 2026-08-22 runs had to have their gain set *inferred* from the drive
+    # tracking ratio, which is a bad way to find out what an experiment was.
+    base_pid_provenance: str = "unknown"
 
     # ── Manual override ─────────────────────────────────────────────────────
     # Direct base / lift commands (joystick, nav, RPC) suspend the whole-body
@@ -578,6 +653,388 @@ class SlamPoseListener:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Loop timing diagnostics
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _LoopTimingMonitor:
+    """Tracks a loop's actual wall-clock cadence and reports it periodically.
+
+    Unit tests can only verify that the interpolation *math* is right --
+    nothing about GIL contention, other threads on the box, or how long a
+    CAN write actually takes shows up in a headless test. This answers the
+    question a passing test can't: is this loop actually landing anywhere
+    close to its target rate in real time, or is it running behind and
+    bursty. Call `tick()` once per loop iteration; it prints a summary at
+    most every `report_every_s` seconds once it has samples.
+    """
+
+    def __init__(self, name: str, target_hz: float, report_every_s: float = 5.0,
+                 window: int = 500):
+        self.name = name
+        self.target_dt = 1.0 / float(target_hz)
+        self.report_every_s = float(report_every_s)
+        self._intervals: list[float] = []
+        self._window = int(window)
+        self._last_t: Optional[float] = None
+        self._last_report = 0.0
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        if self._last_t is not None:
+            self._intervals.append(now - self._last_t)
+            if len(self._intervals) > self._window:
+                self._intervals.pop(0)
+        self._last_t = now
+
+        if now - self._last_report < self.report_every_s or len(self._intervals) < 10:
+            return
+        self._last_report = now
+        arr = np.asarray(self._intervals)
+        mean_dt, max_dt = float(arr.mean()), float(arr.max())
+        jitter_ms = float(arr.std()) * 1000.0
+        over_2x = int(np.sum(arr > 2.0 * self.target_dt))
+        print(
+            f"[wholebody] {self.name} loop: {1.0/mean_dt:5.1f} Hz actual "
+            f"(target {1.0/self.target_dt:.0f} Hz), jitter {jitter_ms:5.2f} ms std, "
+            f"worst gap {max_dt*1000:6.2f} ms, {over_2x}/{len(arr)} ticks "
+            f">2x target period"
+        )
+
+
+class _CommandJitterMonitor:
+    """Tracks how much a stream of *commanded* joint vectors moves tick to
+    tick, to answer the question _LoopTimingMonitor can't: are the numbers
+    we're sending to nerolib themselves smooth, or is there noise in the
+    software before it ever reaches the motors?
+
+    This is the split that tells "our commands are noisy" apart from "the
+    commands are clean and the arm just isn't damped/tuned for this":
+    smooth, monotonic deltas with a near-zero reversal rate reaching the
+    motor but a physically jittery arm points at gains/mechanical tuning,
+    not software; a high reversal rate or erratic delta magnitude here means
+    the software is the one injecting the noise, upstream of any tuning.
+
+    Call `sample(q)` with each new commanded joint vector (7,); it prints a
+    per-joint summary at most every `report_every_s` seconds.
+    """
+
+    # Deltas smaller than this are treated as "holding still" and excluded
+    # from the reversal count, so quantization/float noise while parked
+    # doesn't get counted as the arm reversing direction.
+    _STILL_EPS_RAD = 1e-4
+
+    def __init__(self, name: str, report_every_s: float = 5.0, window: int = 500):
+        self.name = name
+        self.report_every_s = float(report_every_s)
+        self._window = int(window)
+        self._deltas: list[np.ndarray] = []
+        self._prev: Optional[np.ndarray] = None
+        self._last_report = 0.0
+
+    def sample(self, q) -> None:
+        q = np.asarray(q, dtype=float)
+        if self._prev is not None:
+            self._deltas.append(q - self._prev)
+            if len(self._deltas) > self._window:
+                self._deltas.pop(0)
+        self._prev = q.copy()
+
+        now = time.monotonic()
+        if now - self._last_report < self.report_every_s or len(self._deltas) < 10:
+            return
+        self._last_report = now
+
+        d = np.asarray(self._deltas)  # (N, 7)
+        moving = np.abs(d) > self._STILL_EPS_RAD
+        # Sign-reversal rate per joint: of the ticks where *both* this step
+        # and the previous one were real motion (not noise-floor holding),
+        # what fraction flipped direction.
+        sign = np.sign(d)
+        both_moving = moving[1:] & moving[:-1]
+        flipped = (sign[1:] != sign[:-1]) & both_moving
+        denom = both_moving.sum(axis=0)
+        reversal_rate = np.divide(
+            flipped.sum(axis=0), denom, out=np.zeros(7), where=denom > 0
+        )
+        worst = int(np.argmax(reversal_rate))
+        abs_d = np.abs(d)
+        print(
+            f"[wholebody] {self.name} command deltas: "
+            f"mean|Δq| {abs_d.mean()*1000:.2f} mrad, max {abs_d.max()*1000:.1f} mrad, "
+            f"worst-reversal joint {worst} (flips {reversal_rate[worst]*100:4.1f}% "
+            f"of {int(denom[worst])} moving ticks, "
+            f"|Δq| std {abs_d[:, worst].std()*1000:.2f} mrad)"
+        )
+
+
+class _NullSpaceMonitor:
+    """Correlates one joint's tick-to-tick motion with how much the
+    end-effector actually moved on the same ticks, to tell null-space wobble
+    (the joint moves, the EE doesn't) apart from genuine required motion
+    (both move together). `_CommandJitterMonitor` repeatedly flags joint
+    index 6 (`*_arm_joint7`, the wrist joint furthest from the base and
+    least load-bearing for EE tracking -- the "cheapest" DOF for a redundant
+    solve to let wander) as the worst-reversal joint on both arms; this
+    checks that directly against the solve's own forward kinematics rather
+    than inferring it.
+
+    Call `sample(q, T_ee)` once per solve with the *raw* solved arm_q (7,)
+    and the resulting mink.SE3 EE pose -- both from the same `solve()` call,
+    before any deadband/lookahead clamping, since the question is whether
+    the solve itself is noisy, not whether dispatch is. Prints a summary at
+    most every `report_every_s` seconds.
+    """
+
+    JOINT_INDEX = 6  # arm_joint7
+
+    def __init__(self, name: str, report_every_s: float = 5.0, window: int = 500):
+        self.name = name
+        self.report_every_s = float(report_every_s)
+        self._window = int(window)
+        self._dq: list[float] = []
+        self._ee_pos_mm: list[float] = []
+        self._ee_ori_deg: list[float] = []
+        self._prev_q: Optional[np.ndarray] = None
+        self._prev_T = None
+        self._last_report = 0.0
+
+    def sample(self, q, T_ee) -> None:
+        q = np.asarray(q, dtype=float)
+        if self._prev_q is not None:
+            dq = abs(float(q[self.JOINT_INDEX] - self._prev_q[self.JOINT_INDEX]))
+            dp = float(np.linalg.norm(
+                T_ee.translation() - self._prev_T.translation()
+            )) * 1000.0
+            d_rot = self._prev_T.rotation().inverse() @ T_ee.rotation()
+            dori = float(np.linalg.norm(d_rot.log())) * (180.0 / np.pi)
+            self._dq.append(dq)
+            self._ee_pos_mm.append(dp)
+            self._ee_ori_deg.append(dori)
+            if len(self._dq) > self._window:
+                self._dq.pop(0)
+                self._ee_pos_mm.pop(0)
+                self._ee_ori_deg.pop(0)
+        self._prev_q, self._prev_T = q.copy(), T_ee
+
+        now = time.monotonic()
+        if now - self._last_report < self.report_every_s or len(self._dq) < 10:
+            return
+        self._last_report = now
+
+        dq = np.asarray(self._dq)
+        dp = np.asarray(self._ee_pos_mm)
+        dori = np.asarray(self._ee_ori_deg)
+        moving = dq > 1e-4
+        n_moving = int(moving.sum())
+        if n_moving == 0:
+            print(f"[wholebody] {self.name}: joint7 held still over "
+                  f"{len(dq)} ticks, nothing to correlate")
+            return
+        ee_pos_on_move = float(dp[moving].mean())
+        ee_ori_on_move = float(dori[moving].mean())
+        verdict = (
+            "looks like null-space wobble (EE barely moves)"
+            if ee_pos_on_move < 0.5 and ee_ori_on_move < 0.3
+            else "EE is moving too -- not pure null-space"
+        )
+        print(
+            f"[wholebody] {self.name}: joint7 moved on {n_moving}/{len(dq)} ticks "
+            f"(mean {float(dq[moving].mean())*1000:.2f} mrad); EE moved "
+            f"{ee_pos_on_move:.3f} mm / {ee_ori_on_move:.3f} deg on those same "
+            f"ticks (overall mean {float(dp.mean()):.3f} mm) -- {verdict}"
+        )
+
+
+class _TrajectoryRecorder:
+    """Appends raw per-solve-tick data for every subsystem to a CSV.
+
+    The summary monitors above (_LoopTimingMonitor, _CommandJitterMonitor,
+    _NullSpaceMonitor) print aggregate stats every few seconds -- useful for
+    watching a live session, but not enough to tune anything against
+    afterwards. This records the raw per-tick numbers instead. One row per
+    solve tick (~30 Hz), written line-buffered.
+
+    Three groups of columns, in the order the data flows:
+
+    * **Arms and solver** -- both arms' solved joint vectors, target and
+      achieved EE pose, solver iteration count and convergence flag. This is
+      what the null-space work was designed against.
+    * **Base** -- the solver's raw world-frame velocity request, the body-frame
+      triple left after clamping and the deadband, the vector actually handed
+      to the relay, and then the four modules' commanded *and measured* steer
+      angles and drive velocities. Commanded-vs-measured is the whole point:
+      `robot/base_motor.py` runs the steering open-loop
+      (USE_FEEDBACK_FOR_STEER is False), so nothing in the control path ever
+      compares the two, and a module that is not reaching its commanded angle
+      is currently invisible.
+    * **Lift** -- the clamped goal actually servoed to, the measured height,
+      the velocity the PD asked for, the PD's own filtered velocity estimate,
+      and the feedback age it acted on. Enough to fit lift_kp / lift_kd
+      offline rather than by feel.
+
+    Sampling caveat: this runs at the solve rate, so it sees the base at 30 Hz
+    while the swerve loop runs at 324 Hz and the SPARKs stream status at 50 Hz.
+    That resolves module slew (hundreds of ms) and PID settling fine; it does
+    not resolve anything at the swerve loop's own rate.
+    """
+
+    def __init__(self, path: Path, ik_config, hw_config=None) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Line-buffered: a crash or Ctrl-C loses at most the in-flight row,
+        # not the whole session.
+        self._file = path.open("w", newline="", encoding="utf-8", buffering=1)
+        self._writer = csv.writer(self._file)
+        self._writer.writerow([
+            f"# refresh_posture_target={ik_config.refresh_posture_target}",
+            f"arm_posture_cost={ik_config.arm_posture_cost}",
+            f"arm_posture_cost_overrides={dict(ik_config.arm_posture_cost_overrides)}",
+            f"ee_position_cost={ik_config.ee_position_cost}",
+            f"ee_orientation_cost={ik_config.ee_orientation_cost}",
+            f"redundancy_resolution={ik_config.redundancy_resolution}",
+            f"dls_damping={ik_config.dls_damping}",
+            f"nullspace_swivel_weight={ik_config.nullspace_swivel_weight}",
+            f"elbow_swivel_gain={ik_config.elbow_swivel_gain}",
+            f"elbow_swivel_targets={dict(ik_config.elbow_swivel_targets)}",
+            f"nullspace_continuity_weight={ik_config.nullspace_continuity_weight}",
+            f"nullspace_posture_weight={ik_config.nullspace_posture_weight}",
+            f"enable_manipulability={ik_config.enable_manipulability}",
+            f"manipulability_weight={ik_config.manipulability_weight}",
+        ])
+        # Second config line: the base and lift knobs. Separate row because
+        # these are what a base/lift tuning session varies, and a run is
+        # uninterpretable without knowing which values produced it.
+        if hw_config is not None:
+            self._writer.writerow([
+                f"# control_hz={hw_config.control_hz}",
+                f"enable_base_motion={hw_config.enable_base_motion}",
+                f"base_max_lin_vel={hw_config.base_max_lin_vel}",
+                f"base_max_ang_vel={hw_config.base_max_ang_vel}",
+                f"base_vel_deadband={hw_config.base_vel_deadband}",
+                f"enable_lift_motion={hw_config.enable_lift_motion}",
+                f"lift_kp={hw_config.lift_kp}",
+                f"lift_kd={hw_config.lift_kd}",
+                f"lift_derivative_tau={hw_config.lift_derivative_tau}",
+                f"lift_velocity_deadband_m={hw_config.lift_velocity_deadband_m}",
+                f"lift_max_velocity_m_s={hw_config.lift_max_velocity_m_s}",
+                f"lift_feedback_max_age_s={hw_config.lift_feedback_max_age_s}",
+                f"use_measured_lift={hw_config.use_measured_lift}",
+                f"use_measured_arm_state={hw_config.use_measured_arm_state}",
+                f"base_pid={getattr(hw_config, 'base_pid_provenance', 'unknown')}",
+                f"base_heading_rate_limit={hw_config.base_heading_rate_limit}",
+                f"base_yaw_deadband={hw_config.base_yaw_deadband}",
+            ])
+
+        header = ["t"]
+        header += [f"left_q{i}" for i in range(7)]
+        header += [f"right_q{i}" for i in range(7)]
+        # wxyz_xyz: quaternion (w,x,y,z) then translation (x,y,z), matching
+        # mink.SE3.wxyz_xyz and the convention already used by get_state().
+        header += [f"left_target_ee_{i}" for i in range(7)]
+        header += [f"right_target_ee_{i}" for i in range(7)]
+        header += [f"left_actual_ee_{i}" for i in range(7)]
+        header += [f"right_actual_ee_{i}" for i in range(7)]
+        header += ["lift_q", "base_x", "base_y", "base_yaw", "iters", "solved"]
+
+        # ── Base ────────────────────────────────────────────────────────────
+        # req_*: the solver's own world-frame velocity, before any clamping.
+        # body_*: after per-axis clamp and deadband, in the chassis frame.
+        # sent_*: the 3-vector handed to Base.set_target_base_velocity, in the
+        #         axis order BaseAxisMap produces (not forward/lateral/yaw).
+        header += ["base_active",
+                   "base_req_vx", "base_req_vy", "base_req_wz",
+                   "base_body_fwd", "base_body_lat", "base_body_yaw",
+                   "base_sent_0", "base_sent_1", "base_sent_2"]
+        # What Base itself was holding, so a mismatch against base_sent_*
+        # localises to the relay or to a manual override stealing the base.
+        header += ["swerve_enabled",
+                   "swerve_target_0", "swerve_target_1", "swerve_target_2",
+                   "swerve_prof_0", "swerve_prof_1", "swerve_prof_2"]
+        # Per module, in MODULE_ORDER (FL, FR, RR, RL).
+        header += [f"steer_cmd_{m}" for m in _MODULE_LABELS]
+        header += [f"steer_meas_{m}" for m in _MODULE_LABELS]
+        header += [f"drive_cmd_{m}" for m in _MODULE_LABELS]
+        header += [f"drive_meas_{m}" for m in _MODULE_LABELS]
+
+        # ── Lift ────────────────────────────────────────────────────────────
+        header += ["lift_active", "lift_mode", "lift_goal", "lift_meas",
+                   "lift_cmd_vel", "lift_vel_est", "lift_age", "lift_blocked"]
+
+        self._writer.writerow(header)
+        self._t0 = time.monotonic()
+        self.path = path
+
+    @staticmethod
+    def _f(value) -> str:
+        """Format one float, keeping a missing reading missing.
+
+        None and NaN both become "nan" rather than 0.0. A dropped CAN frame
+        must not read back later as a module sitting at zero.
+        """
+        if value is None:
+            return "nan"
+        value = float(value)
+        return "nan" if not math.isfinite(value) else f"{value:.6f}"
+
+    def _vec(self, values, n: int) -> list:
+        if values is None:
+            return ["nan"] * n
+        arr = np.asarray(values, dtype=float).ravel()
+        return [self._f(arr[i]) if i < arr.size else "nan" for i in range(n)]
+
+    def record(
+        self, left_q, right_q, T_l_target, T_r_target, T_l_actual, T_r_actual,
+        lift_q: float, base_xytheta, iters: int, solved: bool,
+        base=None, swerve=None, lift=None,
+    ) -> None:
+        row = [time.monotonic() - self._t0]
+        row += [f"{v:.6f}" for v in np.asarray(left_q, dtype=float)]
+        row += [f"{v:.6f}" for v in np.asarray(right_q, dtype=float)]
+        row += [f"{v:.6f}" for v in T_l_target.wxyz_xyz]
+        row += [f"{v:.6f}" for v in T_r_target.wxyz_xyz]
+        row += [f"{v:.6f}" for v in T_l_actual.wxyz_xyz]
+        row += [f"{v:.6f}" for v in T_r_actual.wxyz_xyz]
+        base_xytheta = np.asarray(base_xytheta, dtype=float)
+        row += [
+            f"{float(lift_q):.6f}",
+            f"{base_xytheta[0]:.6f}", f"{base_xytheta[1]:.6f}", f"{base_xytheta[2]:.6f}",
+            str(int(iters)), str(bool(solved)),
+        ]
+
+        base = base or {}
+        row += [str(bool(base.get("active", False)))]
+        row += self._vec(base.get("req"), 3)
+        row += self._vec(base.get("body"), 3)
+        row += self._vec(base.get("sent"), 3)
+
+        swerve = swerve or {}
+        row += [str(bool(swerve.get("motors_enabled", False)))]
+        row += self._vec(swerve.get("v_target"), 3)
+        row += self._vec(swerve.get("v_profiled"), 3)
+        for key in ("steer_cmd_rad", "steer_meas_rad", "drive_cmd_mps", "drive_meas_raw"):
+            row += self._vec(swerve.get(key), _NUM_SWERVES)
+
+        lift = lift or {}
+        row += [
+            str(bool(lift.get("active", False))),
+            str(lift.get("mode", "off")),
+            self._f(lift.get("goal")),
+            self._f(lift.get("meas")),
+            self._f(lift.get("cmd_vel")),
+            self._f(lift.get("vel_est")),
+            self._f(lift.get("age")),
+            str(bool(lift.get("blocked", False))),
+        ]
+
+        self._writer.writerow(row)
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Controller
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -662,6 +1119,15 @@ class WholeBodyController:
 
         self._last_base_velocity = np.zeros(3)   # world frame, as commanded
         self._last_base_command = np.zeros(3)    # what Base was actually sent
+        # Per-tick dispatch telemetry for _TrajectoryRecorder. Written by the
+        # dispatch methods, read once at the end of the same _step, so a logged
+        # row always describes the tick that produced it rather than the
+        # previous one.
+        self._base_dispatch: dict = {}
+        # Reference for the heading rate limiter; None until the base first
+        # moves, then frozen across stops. See _limit_heading_rate.
+        self._base_heading: Optional[float] = None
+        self._lift_dispatch: dict = {}
         # The hardware sync already reads both arms once per control tick. Keep
         # those samples for dispatch instead of making two more blocking CAN
         # reads after solving.
@@ -705,6 +1171,39 @@ class WholeBodyController:
         self._arm_thread: Optional[threading.Thread] = None
         self._running = False
         self.initialized = False
+        self._solve_timing = _LoopTimingMonitor("solve (30 Hz)", self.config.control_hz)
+        self._arm_dispatch_timing = _LoopTimingMonitor(
+            "arm dispatch (90 Hz)", self.config.arm_dispatch_hz
+        )
+        # Goal-level jitter is the whole-body solve's own output (per 30 Hz
+        # tick, before interpolation); dispatch-level is what actually reaches
+        # nerolib (per 90 Hz sub-step). Comparing the two localizes noise: if
+        # goal-level is already jittery, look at the solve / EE target; if
+        # goal-level is clean but dispatch-level isn't, look at the
+        # interpolation; if both are clean and the arm still shakes, that's
+        # gains/mechanical tuning, not software.
+        self._goal_jitter = {
+            "left": _CommandJitterMonitor("left goal (30 Hz)"),
+            "right": _CommandJitterMonitor("right goal (30 Hz)"),
+        }
+        self._dispatch_jitter = {
+            "left": _CommandJitterMonitor("left dispatch (90 Hz)"),
+            "right": _CommandJitterMonitor("right dispatch (90 Hz)"),
+        }
+        self._nullspace_monitor = {
+            "left": _NullSpaceMonitor("left arm"),
+            "right": _NullSpaceMonitor("right arm"),
+        }
+        self._trajectory_recorder: Optional[_TrajectoryRecorder] = None
+        if self.config.record_trajectories:
+            traj_dir = (
+                Path(__file__).resolve().parent.parent
+                / "artifacts" / "wholebody_logs" / "trajectories"
+            )
+            traj_path = traj_dir / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            self._trajectory_recorder = _TrajectoryRecorder(
+                traj_path, self.ik.config, self.config)
+            print(f"[wholebody] recording trajectories to {traj_path}")
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -783,6 +1282,9 @@ class WholeBodyController:
         if self.slam_pose is not None:
             self.slam_pose.stop()
             self.slam_pose = None
+        if self._trajectory_recorder is not None:
+            self._trajectory_recorder.close()
+            self._trajectory_recorder = None
 
     def emergency_stop(self) -> None:
         """Stop the loop and freeze every actuator where it stands."""
@@ -809,6 +1311,9 @@ class WholeBodyController:
                 arm.set_joint_target(arm.get_joint_positions(), preview_time=0.0)
             except Exception as exc:  # a stop path must never raise
                 print(f"[wholebody] e-stop: arm hold failed: {exc}")
+        if self._trajectory_recorder is not None:
+            self._trajectory_recorder.close()
+            self._trajectory_recorder = None
 
     # ── Target API (mirrors robot/yor_mujoco.py so one client drives both) ───
 
@@ -966,6 +1471,7 @@ class WholeBodyController:
     def _control_loop(self) -> None:
         rate = RateLimiter(self.config.control_hz, warn=False)
         while self._running:
+            self._solve_timing.tick()
             try:
                 self._step()
             except Exception as exc:
@@ -992,11 +1498,52 @@ class WholeBodyController:
         self._last_solve_ok = bool(result.solved)
         self._solve_error = None
 
+        # Raw solve output, before any deadband/lookahead clamping -- see
+        # _NullSpaceMonitor for why this has to be the solve's own numbers,
+        # not what dispatch ends up sending.
+        T_l_actual, T_r_actual = self.ik.forward_kinematics()
+        self._nullspace_monitor["left"].sample(result.left_arm_q, T_l_actual)
+        self._nullspace_monitor["right"].sample(result.right_arm_q, T_r_actual)
+
+        # A subsystem that is switched off still gets a row, marked inactive,
+        # rather than carrying the last active tick's numbers forward.
+        self._base_dispatch = {"active": False, "req": result.base_velocity}
+        self._lift_dispatch = {"active": False, "mode": "off"}
+
         if self.config.enable_arm_motion:
             self._dispatch_arms(result)
         if self.config.enable_lift_motion:
             self._dispatch_lift(result)
         self._dispatch_base(result)
+
+        # Recorded last, so base and lift dispatch have run and the row holds
+        # the solve *and* what it turned into on this same tick.
+        if self._trajectory_recorder is not None:
+            self._trajectory_recorder.record(
+                result.left_arm_q, result.right_arm_q,
+                T_l, T_r, T_l_actual, T_r_actual,
+                result.lift_q, result.base_position,
+                result.iters, result.solved,
+                base=self._base_dispatch,
+                swerve=self._swerve_telemetry(),
+                lift=self._lift_dispatch,
+            )
+
+    def _swerve_telemetry(self) -> Optional[dict]:
+        """Module-level commanded/measured state, or None if unavailable.
+
+        Optional on purpose: `Base` is stubbed in tests and older checkouts
+        predate `swerve_telemetry`, and neither should stop a run from being
+        logged. A missing snapshot records as NaN, which is honest; a raised
+        exception here would kill the control tick.
+        """
+        getter = getattr(self.base, "swerve_telemetry", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
 
     # ── Measurement ──────────────────────────────────────────────────────────
 
@@ -1106,6 +1653,7 @@ class WholeBodyController:
                 -max_lead,
                 max_lead,
             )
+            self._goal_jitter[side].sample(q_safe)
             # Stage the goal for the arm-dispatch thread rather than sending it
             # to nerolib directly -- see _arm_dispatch_tick for why (YOR_D-style
             # sub-step interpolation at a higher, decoupled rate).
@@ -1159,6 +1707,7 @@ class WholeBodyController:
             q_cmd = start + alpha * (goal - start)
             self._arm_seg_step[side] = step + 1
             self._arm_seg_current[side] = q_cmd
+            self._dispatch_jitter[side].sample(q_cmd)
             try:
                 arm.set_joint_target(q_cmd, preview_time=self.config.arm_preview_time)
             except Exception as exc:
@@ -1167,6 +1716,7 @@ class WholeBodyController:
     def _arm_dispatch_loop(self) -> None:
         rate = RateLimiter(self.config.arm_dispatch_hz, warn=False)
         while self._running:
+            self._arm_dispatch_timing.tick()
             try:
                 self._arm_dispatch_tick()
             except Exception as exc:
@@ -1184,6 +1734,8 @@ class WholeBodyController:
             self._lift_cmd_velocity = 0.0
             self._lift_driving_since = None
             self._lift_feedback_blocked = False
+            self._lift_dispatch = {"active": False, "mode": "override",
+                                   "meas": self._measured_lift()}
             return
 
         # An explicit lift_target is an operator instruction, so it is what the
@@ -1202,7 +1754,14 @@ class WholeBodyController:
             self.lift_target if self.lift_target is not None else result.lift_q
         )
 
-        if self._lift_velocity_available():
+        velocity_mode = self._lift_velocity_available()
+        self._lift_dispatch = {
+            "active": True,
+            "mode": "velocity" if velocity_mode else "bang_bang",
+            "goal": goal,
+            "blocked": self._lift_feedback_blocked,
+        }
+        if velocity_mode:
             self._dispatch_lift_velocity(goal)
         else:
             self._dispatch_lift_bang_bang(goal)
@@ -1254,12 +1813,14 @@ class WholeBodyController:
 
     def _dispatch_lift_velocity(self, goal: float) -> None:
         height = self._measured_lift()
+        self._lift_dispatch["meas"] = height
         if height is None or self._lift_position_known() is False:
             self._refuse_lift("height is unknown")
             return
 
         now = time.monotonic()
         age = self._lift_feedback_age()
+        self._lift_dispatch["age"] = age
         fresh = age is not None and age <= self.config.lift_feedback_max_age_s
 
         if fresh:
@@ -1282,6 +1843,11 @@ class WholeBodyController:
                 return
 
         velocity = self.lift_pd.update(goal, height, now)
+        # The PD's own filtered measurement derivative, alongside the velocity
+        # it asked for. Fitting lift_kd offline needs the same estimate the
+        # controller used, not one recomputed from logged heights.
+        self._lift_dispatch["vel_est"] = self.lift_pd.filtered_velocity
+        self._lift_dispatch["cmd_vel"] = velocity
         self._send_lift_velocity(velocity)
 
     def _send_lift_velocity(self, velocity: float) -> None:
@@ -1313,6 +1879,8 @@ class WholeBodyController:
         if not self._lift_feedback_blocked:
             print(f"[wholebody] lift held: {reason}")
         self._lift_feedback_blocked = True
+        self._lift_dispatch["blocked"] = True
+        self._lift_dispatch["cmd_vel"] = 0.0
 
         self.lift_pd.reset()
         self._lift_driving_since = None
@@ -1348,6 +1916,7 @@ class WholeBodyController:
 
     def _dispatch_lift_bang_bang(self, goal: float) -> None:
         height = self._measured_lift()
+        self._lift_dispatch["meas"] = height
         if height is None:
             return  # no feedback → refuse to drive a bang-bang actuator
 
@@ -1358,6 +1927,7 @@ class WholeBodyController:
             command = "up" if error > 0 else "down"
 
         # Only send on change: PicoLift talks over serial and repeats are waste.
+        self._lift_dispatch["mode"] = f"bang_{command}"
         if command == self._last_lift_command:
             return
         self._last_lift_command = command
@@ -1376,17 +1946,36 @@ class WholeBodyController:
                 self._halt_base()
             with self._lock:
                 self._last_base_velocity = np.zeros(3)
+            self._base_dispatch = {
+                "active": False,
+                "req": np.asarray(result.base_velocity, dtype=float),
+                "body": np.zeros(3),
+                "sent": np.zeros(3),
+            }
             return
 
         v_world = np.asarray(result.base_velocity, dtype=float)
         forward, lateral, yaw_rate = self._world_to_body(v_world)
 
-        forward = self._clamp(forward, self.config.base_max_lin_vel)
-        lateral = self._clamp(lateral, self.config.base_max_lin_vel)
-        yaw_rate = self._clamp(yaw_rate, self.config.base_max_ang_vel)
+        forward, lateral = self._limit_linear(forward, lateral)
+        forward, lateral = self._limit_heading_rate(forward, lateral)
+        yaw_rate = self._clamp(yaw_rate, self.config.base_max_ang_vel,
+                               self.config.base_yaw_deadband)
 
         command = self.config.base_axis_map.to_command(forward, lateral, yaw_rate)
         self._send_base_command(command)
+
+        # `req` is the solver's unclamped world-frame ask, `body` is what
+        # survived the clamp and the deadband, `sent` is what left this file.
+        # Logging all three separates "the solver wanted little" from "the
+        # deadband ate it" from "the clamp capped it" -- three very different
+        # base-tuning problems that look identical at the wheels.
+        self._base_dispatch = {
+            "active": True,
+            "req": v_world.copy(),
+            "body": np.array([forward, lateral, yaw_rate], dtype=float),
+            "sent": command.copy(),
+        }
 
         # Odometry integrates what was *commanded* after clamping, so the
         # model's base pose cannot run ahead of what the wheels were asked for.
@@ -1427,8 +2016,86 @@ class WholeBodyController:
         c, s = math.cos(theta), math.sin(theta)
         return np.array([c * vx_body - s * vy_body, s * vx_body + c * vy_body, yaw_rate])
 
-    def _clamp(self, value: float, limit: float) -> float:
-        if abs(value) < self.config.base_vel_deadband:
+    def _limit_linear(self, forward: float, lateral: float) -> tuple[float, float]:
+        """Deadband and clamp the linear velocity without rotating it.
+
+        Both operations act on the magnitude of (forward, lateral) and rescale
+        the pair, so the direction the solver asked for is the direction the
+        wheels get. Doing either per axis does not merely scale the command, it
+        turns it: dropping the smaller component of a diagonal leaves a
+        pure-axis motion, and clamping one axis first skews the rest.
+
+        That mattered more than it looks. `_dispatch_base` integrates the
+        result into `BaseOdometry`, so a distortion that always points at an
+        axis is a systematic bias in the pose the IK plans against -- it
+        accumulates rather than averaging out.
+        """
+        speed = math.hypot(forward, lateral)
+        if speed < self.config.base_vel_deadband:
+            return 0.0, 0.0
+        limit = self.config.base_max_lin_vel
+        if speed > limit:
+            scale = limit / speed
+            forward, lateral = forward * scale, lateral * scale
+        return float(forward), float(lateral)
+
+    def _limit_heading_rate(self, forward: float, lateral: float) -> tuple[float, float]:
+        """Bound how fast the commanded direction may turn, keeping its speed.
+
+        The swerve modules slew at 265-353 deg/s. The solver has no idea that
+        exists, and because `atan2` of a short vector is ill-conditioned it
+        asked for a median 552 deg/s whenever the base was creeping. A module
+        that never reaches its commanded angle sends the chassis somewhere the
+        solver did not ask for, so the ask has to be bounded to something the
+        hardware can serve.
+
+        Magnitude is preserved, only the direction is rate-limited: the point
+        is to stop the base whirling, not to slow it down. Throttling speed
+        while a module is still turning is a separate mechanism and belongs at
+        the wheel, where the measured angle is (`cos_error_scaling` in
+        base_motor.py, which needs USE_FEEDBACK_FOR_STEER to do anything).
+
+        Reversal is accounted for. A swerve module serves a 180 deg direction
+        change by flipping the drive and not turning at all, so a heading
+        change beyond 90 deg is measured against the *reversed* previous
+        heading -- otherwise this would rate-limit a move the hardware makes
+        instantly.
+
+        While the base is stopped the reference heading is frozen rather than
+        reset, so the next motion is limited from where the modules actually
+        are, not from zero.
+        """
+        limit = self.config.base_heading_rate_limit
+        speed = math.hypot(forward, lateral)
+        if limit <= 0.0 or speed <= 0.0:
+            return forward, lateral            # disabled, or nothing to aim
+
+        heading = math.atan2(lateral, forward)
+        if self._base_heading is None:
+            self._base_heading = heading
+            return forward, lateral
+
+        reference = self._base_heading
+        delta = _wrap_pi(heading - reference)
+        if abs(delta) > math.pi / 2:
+            # The modules would flip rather than turn the long way; measure the
+            # real travel against the reversed reference.
+            reference = _wrap_pi(reference + math.pi)
+            delta = _wrap_pi(heading - reference)
+
+        max_step = limit * self.dt
+        if abs(delta) > max_step:
+            heading = _wrap_pi(reference + math.copysign(max_step, delta))
+            forward, lateral = speed * math.cos(heading), speed * math.sin(heading)
+
+        self._base_heading = heading
+        return float(forward), float(lateral)
+
+    def _clamp(self, value: float, limit: float,
+               deadband: Optional[float] = None) -> float:
+        if deadband is None:
+            deadband = self.config.base_vel_deadband
+        if abs(value) < deadband:
             return 0.0
         return float(np.clip(value, -limit, limit))
 

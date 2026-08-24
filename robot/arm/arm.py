@@ -38,7 +38,7 @@ class ArmNode:
         is_left_arm: bool = True,
         dynamixel_gripper: bool = False,
         native_gripper: bool = False,
-        default_kp: Optional[float | list[float]] = 8.0,
+        default_kp: Optional[float | list[float]] = 10.0,
         default_kd: Optional[float | list[float]] = 1.0,
         gravity_comp_scale: float = 1.0,
         firmware_version=None,
@@ -74,8 +74,59 @@ class ArmNode:
             
             self.config.home_position = self.home_position
             
-            self.config.joint_vel_max = [3.0] * 7
-            self.config.joint_acc_max = [15.0] * 7
+            # Live-queried from both arms' firmware over CAN
+            # (pyAgxArm get_joint_angle_vel_limits / get_joint_acc_limits),
+            # 2026-08-20: joints 1-4 report max_vel=3.14 rad/s, joints 5-7
+            # (wrist) report 3.92 rad/s; joints 1-2 report max_acc=2.0
+            # rad/s^2, joints 3-7 report 2.5. Set to 95% of each, per joint,
+            # rather than the firmware number exactly, leaving headroom for
+            # Ruckig/discretization to occasionally nudge over the nominal
+            # target. Note MIT mode (all nerolib ever uses) does not actually
+            # enforce these firmware values -- they belong to the onboard
+            # JOINT/CPV trajectory mode nerolib never engages; MIT mode's own
+            # bounds check is only the raw CAN wire-encoding range (position
+            # +-12.5 rad, velocity +-45 rad/s, see nero_interface.h), and it
+            # checks nothing for acceleration at all. So these are a
+            # deliberate software ceiling, not something the firmware would
+            # otherwise cap for us: the previous joint_acc_max=15.0 was
+            # 6-7.5x the firmware's own reported figure, silently asking for
+            # more torque than these joints can produce, without triggering
+            # any error -- just tracking lag.
+            #
+            # 2026-08-20 follow-up: the 95%-of-firmware acceleration above
+            # fixed jitter completely on hardware but felt laggy (slow to
+            # ramp up / change direction). Raised 1.3x (below) fixed some of
+            # that but hardware testing still showed lag -- ~10-32% of
+            # samples in real teleop sessions demanded more acceleration
+            # than that ceiling allowed (measured by differentiating
+            # recorded WBC trajectories; see
+            # artifacts/wholebody_logs/trajectories/). Progression since,
+            # each superseding the last (all measured the same way -- the
+            # per-joint Nth-percentile of real demand from recorded
+            # sessions; see that directory for the raw data):
+            #   1.3x accel                                    -> some lag
+            #   p90 demand, 1 file/session x 3 sessions        -> less lag
+            #   p95 demand, 1 file/session x 3 sessions        -> outlier-
+            #     event filtering (high-accel + near-zero-EE-motion ticks,
+            #     the "elbow up/down flip" check) barely changed this
+            #     estimate (<5%), so those rare (~0.1-0.3% of samples)
+            #     events aren't what's driving the high joint 3/6 numbers
+            #   p95 demand, ALL 28 recorded files pooled (117k samples/
+            #     joint), outlier-filtered -- below, active now. More
+            #     robust than the 3-file estimates above (e.g. joint 3 came
+            #     down from 10.03 to 7.73 once more sessions were included).
+            # All of these remain well above the firmware's own reported
+            # achievable accel (2.0-2.5 rad/s^2) on several joints, so any
+            # of them may reintroduce the original jitter -- if so, revert
+            # to whichever earlier line was last confirmed jitter-free.
+            self.config.joint_vel_max = [2.98, 2.98, 2.98, 2.98, 3.72, 3.72, 3.72]
+            # Previous (1.3x of 95%-of-firmware; smooth, still some lag):
+            # self.config.joint_acc_max = [2.47, 2.47, 3.09, 3.09, 3.09, 3.09, 3.09]
+            # Previous (p90 demand, 3-file estimate; better, still lag):
+            # self.config.joint_acc_max = [4.2, 2.6, 2.6, 7.1, 4.1, 4.8, 7.8]
+            # Previous (p95 demand, 3-file estimate, outliers removed):
+            self.config.joint_acc_max = [4.98, 3.42, 3.57, 9.57, 5.38, 5.76, 8.99]
+            # self.config.joint_acc_max = [4.60, 3.86, 5.05, 7.73, 6.33, 6.33, 8.41]
             
             if default_kp is not None:
                 if isinstance(default_kp, (int, float)):

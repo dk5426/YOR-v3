@@ -478,6 +478,9 @@ class YORMujoco:
 
 
 if __name__ == "__main__":
+    from robot.utils.console_log import start_console_log
+    start_console_log("yor_mujoco", _REPO / "artifacts" / "wholebody_logs")
+
     yor_mujoco = YORMujoco()
     yor_mujoco.start_control()
 

@@ -103,6 +103,7 @@ class JoystickNode:
     def control_loop(self):
         rate = RateLimiter(60, name="joystick")
         last_target_velocity = np.zeros(3, dtype=float)
+        last_sent_velocity = np.zeros(3, dtype=float)
         display_counter = 0  # Counter to control display frequency
 
         while True:
@@ -150,9 +151,19 @@ class JoystickNode:
                 target_velocity = (1 - self.vel_alpha) * target_velocity + self.vel_alpha * last_target_velocity
                 last_target_velocity = target_velocity
 
-                # Send to Base (SparkFlex swerve)
+                # Send to Base (SparkFlex swerve).
+                #
+                # The zero has to be *sent*, not merely not-sent. Releasing the
+                # stick decays this EMA, and simply falling silent below the
+                # threshold left the last above-threshold value standing --
+                # which BaseController's 108 Hz relay then re-sent forever,
+                # about 10 mm/s of creep that nothing ever cleared.
                 if np.linalg.norm(target_velocity, ord=1) > 1e-2:
                     self.yor.set_base_velocity(target_velocity)
+                elif np.any(last_sent_velocity):
+                    last_target_velocity = np.zeros(3, dtype=float)
+                    self.yor.set_base_velocity(last_target_velocity)
+                last_sent_velocity = last_target_velocity
 
                 # D-pad up/down controls lift via Pico serial
                 num_hats = self.joystick.get_numhats()

@@ -1,0 +1,46 @@
+{
+  "manifest_version": 1,
+  "description": "Commissioned DRIVE gains with the ORIGINAL (flash-stock) STEERING gains. Requested on 2026-08-24 to avoid the commissioned steering set's +/-0.25 output clamp. Apply with `python robot/yor.py --base-pid-manifest config/base_pid_hybrid.json`. The drive half is the point: it is feed-forward dominated and measured at 99% of setpoint on 2026-08-24, against 35-44% for the stock P-only loop, so it carries the same drive_command_scale as base_pid_commissioned.json. The steering half is a deliberate trade and is NOT free -- see steering.notes. Read it before concluding anything from a run on this manifest.",
+  "can_interface": "can0",
+  "pid_slot": 0,
+  "drive_command_scale": 1.068,
+  "drive_command_scale_notes": "Same as base_pid_commissioned.json, because the scale depends only on the drive gains and those are identical. Still provisional at 1.068: the 2026-08-24 measurement that would have pinned it was contaminated by a curved run (5.8% wheel-speed spread, RL slowest), which biases the recommendation high. Re-measure once the modules are matched.",
+  "roles": {
+    "drive": {
+      "p": 0.35,
+      "i": 0.0,
+      "d": 0.0,
+      "velocity_ff": 0.23,
+      "output_min": -1.0,
+      "output_max": 1.0,
+      "notes": "Feed-forward dominated rather than a conventional PD loop. Kd is deliberately zero: a tested value of 10 caused an audibly harsh 100 Hz torque ripple and rough deceleration during floor testing."
+    },
+    "steering": {
+      "p": 2.0,
+      "i": 0.0,
+      "d": 0.01,
+      "velocity_ff": 0.0,
+      "output_min": -1.0,
+      "output_max": 1.0,
+      "notes": "Flash-stock steering, kept deliberately to avoid the commissioned set's +/-0.25 output clamp. What that clamp costs and buys, since SPARK position error is in ROTATIONS: at 90 deg of error stock puts out 0.500 duty against the commissioned 0.250, so stock is 2x stronger -- but only above 45 deg, where the two cross. Below that commissioned is stronger, and by 4.5 deg it is 10x stronger (0.250 vs 0.025). That asymmetry showed up in the logs: with these stock gains loaded, the 2026-08-22 runs measured median steering error 11-19 deg, p90 57-69 deg, with 34-49% of moving ticks beyond 20 deg. The commissioned set's own commissioning measured a 0.168 deg stall error, which is the absolute encoder's 2-LSB floor. A module that sits 15 deg off its commanded angle drives the chassis 15 deg off course, so this is a direct accuracy cost. Note also that the clamp is no longer the binding constraint it was: modules slew at 265-353 deg/s under it, and WholeBodyHardwareConfig.base_heading_rate_limit now caps demand at 200 deg/s, leaving 1.3-1.8x headroom. If the steering feels slow on this manifest, the ceiling is more likely base_heading_rate_limit than the output clamp."
+    }
+  },
+  "modules": {
+    "FL": {
+      "drive": 1,
+      "steering": 5
+    },
+    "FR": {
+      "drive": 4,
+      "steering": 8
+    },
+    "RR": {
+      "drive": 3,
+      "steering": 7
+    },
+    "RL": {
+      "drive": 2,
+      "steering": 6
+    }
+  }
+}

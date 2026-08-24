@@ -3,6 +3,7 @@ import threading
 import time
 
 import numpy as np
+from typing import Optional
 from scipy.spatial.transform import Rotation as R
 
 from commlink import Subscriber
@@ -225,6 +226,7 @@ class BaseController:
         k_theta: float = 2.1,
         ki_theta: float = 0.01,
         kd_theta: float = 0.2,
+        drive_vel_scale: Optional[float] = None,
         pos_tol: float = 0.05,   # comfortably above SLAM pose noise
         theta_tol: float = 0.03,
     ):
@@ -252,7 +254,11 @@ class BaseController:
                                       warn=False)
 
         self.yor = yor
-        self.base = Base(max_vel=base_max_vel, max_accel=base_max_accel)
+        # drive_vel_scale travels with the PID manifest (robot/yor.py reads it
+        # from the manifest); None keeps base_motor's built-in default.
+        self.base = Base(max_vel=base_max_vel, max_accel=base_max_accel,
+                         **({} if drive_vel_scale is None
+                            else {"drive_vel_scale": float(drive_vel_scale)}))
         self.slam_sub = None
 
         self.pos_tol = pos_tol
