@@ -21,3 +21,4 @@ maps/*
 # Upstream source drop the Odin SLAM stack was ported from — kept locally for
 # reference, not part of this repo.
 neer_odin_v2-main/
+.claude/

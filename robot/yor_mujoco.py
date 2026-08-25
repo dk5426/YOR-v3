@@ -116,6 +116,15 @@ class YORMujoco:
             self.base_fixed = self.ik.toggle_fix_base(fixed)
             return self.base_fixed
 
+    def relatch_elbow_swivel(self, side: Optional[str] = None) -> bool:
+        """Accept the elbow branch the arm(s) are currently in (API parity
+        with the hardware node -- clears the latched swivel target so the
+        next solve re-latches from the live pose)."""
+        sides = ("left", "right") if side is None else (str(side),)
+        for s in sides:
+            self.ik.set_elbow_swivel_target(s, None)
+        return True
+
     def get_left_ee_pose(self) -> mink.SE3:
         T_l, _ = self.ik.forward_kinematics()
         return T_l

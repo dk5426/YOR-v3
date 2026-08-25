@@ -130,6 +130,12 @@ class TeleopCommand:
 class InputSource:
     """Base class for teleop input backends."""
 
+    # [T1] Set by WholeBodyTeleop before the loop starts: a zero-argument
+    # callable returning the server's get_state() dict (or None on failure).
+    # Lets a source re-anchor its bookkeeping to the robot's *actual* pose
+    # at meaningful moments (OculusSource uses it on clutch engage).
+    state_refresh = None
+
     def start(self) -> None:  # acquire device
         pass
 
@@ -328,8 +334,16 @@ class OculusSource(InputSource):
 
     def __init__(self, host: str, port: int = 5555, pose_filter: bool = True,
                  filter_min_cutoff: float = 3.0, filter_beta: float = 8.0,
-                 yaw_correction_deg: float = 270.0, legacy_oculus_app: bool = False):
+                 yaw_correction_deg: float = 270.0, legacy_oculus_app: bool = False,
+                 clutch_reseed: bool = False):
         self.host, self.port = host, port
+        # [T1] On engage, re-anchor the clutch to the robot's *actual* EE
+        # pose (one get_state() RPC) instead of the client's wound-up local
+        # target. Without this, streaming into a constraint banks the
+        # blocked distance in the client's bookkeeping, and the next engage
+        # starts from a target the robot never reached -- controls feel
+        # dead until the operator has unwound the phantom offset by hand.
+        self._clutch_reseed = bool(clutch_reseed)
         # v0.1 (com.GRAIL.YORTeleop) sends Left|Right; v0.2
         # (com.GRAIL.Yor_Teleop) sends Head|Left|Right. Gated explicitly
         # rather than auto-detected -- see parse_controller_state.
@@ -528,6 +542,19 @@ class OculusSource(InputSource):
             if self._debounced(f"{side}_engage", engage_btn):
                 self._engaged[side] = not self._engaged[side]
                 if self._engaged[side]:
+                    # [T1] Anchor to the robot's actual EE pose, not the
+                    # client's local target -- see __init__. Falls back to
+                    # the local target if the RPC fails, which is exactly
+                    # the pre-gate behaviour.
+                    if self._clutch_reseed and self.state_refresh is not None:
+                        srv = self.state_refresh()
+                        key = f"{side}_ee_wxyz_xyz"
+                        if srv and srv.get(key) is not None:
+                            setattr(state, tgt_attr,
+                                    mink.SE3(np.array(srv[key])))
+                        else:
+                            print(f"[oculus] {side} clutch reseed failed -- "
+                                  "using local target")
                     self._clutch[side] = (ctrl_T, getattr(state, tgt_attr))
                 else:
                     self._gripper_sent[side] = None
@@ -595,6 +622,15 @@ class WholeBodyTeleop:
         print(f"[teleop] synced: lift={self.state.lift_target:.3f} m, "
               f"fix_base={self.state.fix_base}, "
               f"collisions={self.state.collision_avoidance}")
+
+    def _server_state(self) -> Optional[dict]:
+        """One get_state() RPC, or None on any failure (never raises)."""
+        try:
+            srv = self.yor.get_state()
+            return srv or None
+        except Exception as exc:
+            print(f"\n[teleop] get_state failed: {exc}")
+            return None
 
     def _dispatch(self, cmd: TeleopCommand) -> None:
         st = self.state
@@ -673,6 +709,10 @@ class WholeBodyTeleop:
         rate = RateLimiter(self.rate_hz, warn=False)
         dt = 1.0 / self.rate_hz
         last_hud = 0.0
+        # [T1] Give the source a way to read the server's live state (used
+        # by OculusSource's clutch reseed). Same thread as _dispatch, so the
+        # RPC client is never shared across threads.
+        self.source.state_refresh = self._server_state
         self.source.start()
         try:
             while True:
@@ -716,6 +756,12 @@ def main() -> None:
                         help="Quest headset IP (oculus input only)")
     parser.add_argument("--no-pose-filter", action="store_true",
                         help="stream raw Quest poses (skip 1€ filtering)")
+    parser.add_argument("--clutch-reseed", action="store_true",
+                        help="[T1] on engage, anchor the clutch to the robot's "
+                             "actual EE pose (one get_state RPC) instead of the "
+                             "client's local target -- clears any wind-up banked "
+                             "while streaming into a constraint (oculus input "
+                             "only; default: off = current behaviour)")
     parser.add_argument("--filter-min-cutoff", type=float, default=3.0,
                         help="1€ cutoff (Hz) at rest — lower = smoother, laggier")
     parser.add_argument("--filter-beta", type=float, default=8.0,
@@ -744,7 +790,8 @@ def main() -> None:
                               filter_min_cutoff=args.filter_min_cutoff,
                               filter_beta=args.filter_beta,
                               yaw_correction_deg=args.oculus_yaw_correction,
-                              legacy_oculus_app=args.legacy_oculus_app)
+                              legacy_oculus_app=args.legacy_oculus_app,
+                              clutch_reseed=args.clutch_reseed)
 
     print(f"[teleop] target = {args.target}")
     WholeBodyTeleop(source, host=args.host, port=port, rate_hz=args.rate).run()

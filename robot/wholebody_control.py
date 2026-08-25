@@ -461,6 +461,23 @@ class WholeBodyHardwareConfig:
     # tracking ratio, which is a bad way to find out what an experiment was.
     base_pid_provenance: str = "unknown"
 
+    # ── Target leash (gated, [S2]) ──────────────────────────────────────────
+    # Cap how far an EE target may sit from the solver's current EE pose:
+    # a target beyond the leash is pulled back onto the leash sphere (and
+    # cone, for orientation) each tick, and the *stored* target is replaced
+    # by the leashed one so the excess is forgotten rather than banked.
+    # This kills clutch wind-up at the server: streaming past a constraint
+    # no longer accumulates metres of pending error that the arm then
+    # replays at full speed when the constraint releases -- the target is
+    # never allowed further ahead than the leash. Also bounds the
+    # per-iteration errors the solver races on, which is what dragged arms
+    # through singular regions on a re-engage jump. 0 disables (current
+    # behaviour). Sizing: at 30 Hz a leash of 0.15 m still permits
+    # 0.15 m / 33 ms of *new* lead per tick, far above any real hand
+    # speed, so tracking latency is unaffected -- only wind-up is.
+    target_leash_m: float = 0.0
+    target_leash_rad: float = 0.0
+
     # ── Manual override ─────────────────────────────────────────────────────
     # Direct base / lift commands (joystick, nav, RPC) suspend the whole-body
     # loop's authority over that subsystem for this long after the last one,
@@ -1079,6 +1096,15 @@ class _TrajectoryRecorder:
             f"base_weight_gate_full={ik_config.base_weight_gate_full}",
             f"base_recenter_gain={ik_config.base_recenter_gain}",
             f"base_recenter_max_vel={ik_config.base_recenter_max_vel}",
+            # Gated experiments -- a run is uninterpretable without these.
+            f"nullspace_home_gain={getattr(ik_config, 'nullspace_home_gain', 0.0)}",
+            f"nullspace_home_weight={getattr(ik_config, 'nullspace_home_weight', 1.0)}",
+            f"constrained_primary={getattr(ik_config, 'constrained_primary', False)}",
+            f"dls_task_weighting={getattr(ik_config, 'dls_task_weighting', False)}",
+            f"dls_adaptive_damping_sigma={getattr(ik_config, 'dls_adaptive_damping_sigma', 0.0)}",
+            f"dls_damping_max={getattr(ik_config, 'dls_damping_max', 0.0)}",
+            f"swivel_parallel_ref={getattr(ik_config, 'swivel_parallel_ref', False)}",
+            f"swivel_relatch_err_rad={getattr(ik_config, 'swivel_relatch_err_rad', 0.0)}",
         ])
         # Second config line: the base and lift knobs. Separate row because
         # these are what a base/lift tuning session varies, and a run is
@@ -1115,6 +1141,9 @@ class _TrajectoryRecorder:
                 f"base_pose_deadband_m={hw_config.base_pose_deadband_m}",
                 f"base_pose_yaw_deadband_rad={hw_config.base_pose_yaw_deadband_rad}",
                 f"base_pose_derivative_tau={hw_config.base_pose_derivative_tau}",
+                f"arm_joint_deadband_rad={hw_config.arm_joint_deadband_rad}",
+                f"target_leash_m={getattr(hw_config, 'target_leash_m', 0.0)}",
+                f"target_leash_rad={getattr(hw_config, 'target_leash_rad', 0.0)}",
             ])
 
         header = ["t"]
@@ -1163,6 +1192,19 @@ class _TrajectoryRecorder:
         header += ["lift_active", "lift_mode", "lift_goal", "lift_meas",
                    "lift_cmd_vel", "lift_vel_est", "lift_age", "lift_blocked"]
 
+        # ── Solver diagnostics ([S7]) ────────────────────────────────────────
+        # Per-arm conditioning and swivel state plus the number of active
+        # collision-constraint rows this tick. NaN when the solver did not
+        # produce a value (diagnostics disabled, swivel faded out, or soft
+        # mode, which never counts constraint rows). These are the columns
+        # that turn "the arm got stuck" into a mechanism: sigma_min ->
+        # singularity, manip -> reach, swivel_err -> fought branch,
+        # collision_rows -> constraint contact.
+        header += ["l_sigma_min", "r_sigma_min", "l_manip", "r_manip",
+                   "l_swivel", "l_swivel_tgt", "l_swivel_err",
+                   "r_swivel", "r_swivel_tgt", "r_swivel_err",
+                   "collision_rows"]
+
         self._writer.writerow(header)
         self._t0 = time.monotonic()
         self.path = path
@@ -1188,7 +1230,7 @@ class _TrajectoryRecorder:
     def record(
         self, left_q, right_q, T_l_target, T_r_target, T_l_actual, T_r_actual,
         lift_q: float, base_xytheta, iters: int, solved: bool,
-        base=None, swerve=None, lift=None,
+        base=None, swerve=None, lift=None, solver_diag=None,
     ) -> None:
         row = [time.monotonic() - self._t0]
         row += [f"{v:.6f}" for v in np.asarray(left_q, dtype=float)]
@@ -1230,6 +1272,13 @@ class _TrajectoryRecorder:
             self._f(lift.get("age")),
             str(bool(lift.get("blocked", False))),
         ]
+
+        diag = solver_diag or {}
+        row += [self._f(diag.get(key)) for key in (
+            "left_sigma_min", "right_sigma_min", "left_manip", "right_manip",
+            "left_swivel", "left_swivel_target", "left_swivel_err",
+            "right_swivel", "right_swivel_target", "right_swivel_err",
+            "collision_rows")]
 
         self._writer.writerow(row)
 
@@ -1633,6 +1682,19 @@ class WholeBodyController:
             self._halt_base()
         return self.config.enable_base_motion
 
+    def relatch_elbow_swivel(self, side: Optional[str] = None) -> bool:
+        """[S5c] Accept the elbow branch each arm is currently in.
+
+        Clears the latched swivel target(s); the next solve re-latches from
+        the live pose. The cheap "fix my elbow" recovery -- until now the
+        only way out of a fought branch was a full homing cycle.
+        """
+        sides = ("left", "right") if side is None else (str(side),)
+        for s in sides:
+            self.ik.set_elbow_swivel_target(s, None)
+        print(f"[wholebody] elbow swivel re-latch requested: {', '.join(sides)}")
+        return True
+
     # ── Manual-override hooks ────────────────────────────────────────────────
 
     def notify_manual_base_command(self) -> None:
@@ -1786,6 +1848,7 @@ class WholeBodyController:
 
         self._correct_base_from_slam()
         self._sync_from_hardware()
+        T_l, T_r = self._leash_targets(T_l, T_r)
         result = self.ik.solve(T_l, T_r, lift_target=lift_tgt)
         self._last_solve_ok = bool(result.solved)
         self._solve_error = None
@@ -1820,7 +1883,52 @@ class WholeBodyController:
                 base=self._base_dispatch,
                 swerve=self._swerve_telemetry(),
                 lift=self._lift_dispatch,
+                solver_diag=getattr(self.ik, "diagnostics", None),
             )
+
+    def _leash_targets(self, T_l: mink.SE3, T_r: mink.SE3) -> tuple[mink.SE3, mink.SE3]:
+        """[S2] Pull each EE target back onto the leash around the current pose.
+
+        Translation is clamped to `target_leash_m` of the solver's own FK
+        (the pose the solve actually starts from), orientation to
+        `target_leash_rad` along the geodesic. The leashed pose replaces the
+        stored target under the lock, so wind-up is *forgotten*, not merely
+        rate-limited -- when the operator stops pushing into a constraint,
+        the pending error is the leash length, not the accumulated stream.
+        A concurrent RPC write can lose at most one 30 Hz tick to the
+        write-back (its own next tick overwrites again). No-op when both
+        gates are 0.
+        """
+        leash_m = float(self.config.target_leash_m)
+        leash_rad = float(self.config.target_leash_rad)
+        if leash_m <= 0.0 and leash_rad <= 0.0:
+            return T_l, T_r
+
+        T_l_fk, T_r_fk = self.ik.forward_kinematics()
+        out: list[mink.SE3] = []
+        changed = False
+        for T_tgt, T_fk in ((T_l, T_l_fk), (T_r, T_r_fk)):
+            p_new = T_tgt.translation()
+            if leash_m > 0.0:
+                d = p_new - T_fk.translation()
+                dist = float(np.linalg.norm(d))
+                if dist > leash_m:
+                    p_new = T_fk.translation() + d * (leash_m / dist)
+                    changed = True
+            R_new = T_tgt.rotation()
+            if leash_rad > 0.0:
+                aa = (T_fk.rotation().inverse() @ R_new).log()
+                ang = float(np.linalg.norm(aa))
+                if ang > leash_rad:
+                    R_new = T_fk.rotation() @ mink.SO3.exp(aa * (leash_rad / ang))
+                    changed = True
+            out.append(mink.SE3.from_rotation_and_translation(R_new, p_new))
+
+        if changed:
+            with self._lock:
+                self.left_ee_target = out[0]
+                self.right_ee_target = out[1]
+        return out[0], out[1]
 
     def _swerve_telemetry(self) -> Optional[dict]:
         """Module-level commanded/measured state, or None if unavailable.

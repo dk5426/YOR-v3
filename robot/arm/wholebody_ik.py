@@ -56,6 +56,7 @@ Usage (real hardware):
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
@@ -414,6 +415,78 @@ class WholeBodyIKConfig:
     # Range (m) at which the constraint switches on. Larger = earlier, costlier.
     collision_detect_distance: float = 0.06
 
+    # ── Gated experiments (2026-08-25 wave) ──────────────────────────────────
+    # Every field in this block defaults to "off" / current behaviour, so a
+    # config built without touching them reproduces the pre-gate solver
+    # exactly. Each is wired to a yor.py flag; see docs/GATED_CHANGES.md.
+
+    # [S1] Null-space home attractor: a weak, always-on pull of the ARM
+    # joints toward the home-keyframe posture, applied purely in the null
+    # space (the same pattern as base_recenter_*, so it cannot perturb EE
+    # tracking by construction). This is the restoring force the solver
+    # otherwise lacks: with refresh_posture_target=True the posture task is
+    # a velocity regulariser only -- its reference is wherever the arm
+    # already is -- so a contorted configuration is as much an equilibrium
+    # as a comfortable one. The desire is min(gain * error, max_vel) per
+    # joint, self-attenuating near home, applied on the first solver
+    # iteration only (like base recentering). gain = 0 disables.
+    nullspace_home_gain: float = 0.0       # 1/s: rad/s of desire per rad of error
+    nullspace_home_max_vel: float = 0.3    # rad/s per-joint cap on the desire
+    nullspace_home_weight: float = 1.0     # weight in the secondary stack
+
+    # [S3] Constraint-aware primary: solve the primary EE step as a QP
+    # subject to the same joint/collision inequalities the post-projection
+    # uses, instead of computing an unconstrained damped step and clipping
+    # it afterwards. The difference is rerouting: when arm folding is
+    # blocked by the collision buffer, the clip mostly zeroes the motion,
+    # while the constrained QP trades it into base/lift motion that still
+    # serves the EE task. Falls back to the unconstrained step + clip on
+    # any QP failure, so it can never make the solve less robust than the
+    # gate-off behaviour. Costs roughly one extra small QP per iteration.
+    constrained_primary: bool = False
+
+    # [S4a] Apply the FrameTask cost weighting (ee_position_cost /
+    # ee_orientation_cost, as row scaling on J and b -- mink's own
+    # _weighted_residual convention) inside the dls_projector stack. Off,
+    # those two knobs are silently ignored in dls mode and position metres
+    # weigh the same as orientation radians.
+    dls_task_weighting: bool = False
+
+    # [S4b] Adaptive damping: when the smallest singular value of the
+    # (weighted) task Jacobian falls below this threshold, lambda ramps
+    # smoothly from dls_damping up to dls_damping_max at sigma = 0.
+    # Keeps tracking crisp in well-conditioned poses and only softens near
+    # singularity, instead of paying the flat lambda everywhere. 0 = off.
+    dls_adaptive_damping_sigma: float = 0.0
+    dls_damping_max: float = 0.2
+
+    # [S5a] Parallel-transported swivel reference: the elbow swivel angle
+    # needs an in-plane reference vector, and the default construction
+    # switches discontinuously between world +z and world +x when the
+    # shoulder->wrist axis passes |u_z| = 0.9 (~64 deg from horizontal) --
+    # the measured angle then jumps while the latched target does not, and
+    # the objective yanks the elbow. This gate replaces it with a per-side
+    # reference vector that is rotated along with the axis (parallel
+    # transport), which is continuous everywhere. Slow reference drift over
+    # closed axis loops (sphere holonomy) is possible; the re-latch policy
+    # below is the backstop.
+    swivel_parallel_ref: bool = False
+
+    # [S5b] Swivel re-latch policy: if the swivel error stays above this
+    # threshold for swivel_relatch_after_s continuously, accept the branch
+    # the arm is actually in (re-latch the target to the measured angle)
+    # instead of fighting it across a region it may not be able to cross.
+    # 0 = off (current behaviour: fight forever, recover only by homing).
+    swivel_relatch_err_rad: float = 0.0
+    swivel_relatch_after_s: float = 1.0
+
+    # [S7] Per-solve diagnostics (sigma_min / manipulability per arm, swivel
+    # angle/target/error per side, active collision-constraint rows),
+    # published as WholeBodyIK.diagnostics and recorded by the trajectory
+    # CSV. Cheap (two 6x7 SVDs per solve). On by default; the gate exists
+    # so a latency-critical run can shed even that.
+    record_solver_diagnostics: bool = True
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Result
@@ -628,6 +701,27 @@ class WholeBodyIK:
             side: self.config.elbow_swivel_targets.get(side)
             for side in ("left", "right")
         }
+        # [S5a] Parallel-transported swivel reference, per side: the in-plane
+        # reference vector and the shoulder->wrist axis it was last valid
+        # for. None = seed from the discrete convention on next use.
+        self._swivel_ref: dict[str, Optional[np.ndarray]] = {"left": None, "right": None}
+        self._swivel_u_prev: dict[str, Optional[np.ndarray]] = {"left": None, "right": None}
+        # [S5b] When each side's swivel error first exceeded the re-latch
+        # threshold (monotonic time), or None while below it.
+        self._swivel_err_since: dict[str, Optional[float]] = {"left": None, "right": None}
+        # [S1] Home-keyframe arm posture (14 values, left 1-7 then right
+        # 1-7), latched by init_from_keyframe/init_from_qpos.
+        self._home_arm_q: Optional[np.ndarray] = None
+        self._arm_qpos_adrs_all = np.concatenate(
+            [self._left_arm_qpos_adrs, self._right_arm_qpos_adrs])
+        self._arm_dof_ids_arr = np.asarray(self.arm_dof_ids)
+        # [S7] Published per-solve diagnostics; {} when disabled or before
+        # the first solve. `_last_swivel` is written by the swivel objective
+        # (phi, target, err); `_last_ineq_collision_rows` by
+        # _limit_inequalities.
+        self.diagnostics: dict = {}
+        self._last_swivel: dict[str, tuple] = {}
+        self._last_ineq_collision_rows = 0
         # Scratch MjData for finite-difference gradients, so perturbing a
         # configuration never touches the live one.
         self._fd_data = mujoco.MjData(self.model)
@@ -652,6 +746,7 @@ class WholeBodyIK:
         self.posture_task.set_target_from_configuration(self.configuration)
         self._reset_nullspace_state()
         self._latch_recenter_offset()
+        self._latch_home_arm_posture()
         self.initialized = True
 
     def init_from_qpos(self, qpos: np.ndarray) -> None:
@@ -660,7 +755,18 @@ class WholeBodyIK:
         self.posture_task.set_target_from_configuration(self.configuration)
         self._reset_nullspace_state()
         self._latch_recenter_offset()
+        self._latch_home_arm_posture()
         self.initialized = True
+
+    def _latch_home_arm_posture(self) -> None:
+        """Record the arm posture the [S1] home attractor pulls toward.
+
+        Latched at init like the recenter offset: on hardware both init
+        paths run right after the arms physically home, so this is the
+        known-comfortable configuration -- exactly what "recover from a
+        weird pose" should mean.
+        """
+        self._home_arm_q = self.configuration.q[self._arm_qpos_adrs_all].copy()
 
     def _latch_recenter_offset(self) -> None:
         """Record where the hands naturally sit relative to the chassis.
@@ -774,6 +880,10 @@ class WholeBodyIK:
         l_pos = l_ori = r_pos = r_ori = np.inf
         iters = 0
         prev_base_q = self.configuration.q[self.base_qpos_adrs]
+        # [S7] Stale swivel numbers must not outlive the tick that made
+        # them: a faded-out swivel objective leaves no sample, and that
+        # absence is itself the datum (arm straight / objective off).
+        self._last_swivel = {}
 
         for iters in range(1, self.config.max_iters + 1):
             self._first_iteration = iters == 1
@@ -824,6 +934,27 @@ class WholeBodyIK:
                   l_ori <= self.config.ori_threshold and
                   r_pos <= self.config.pos_threshold and
                   r_ori <= self.config.ori_threshold)
+
+        # [S7] Per-solve diagnostics: enough to attribute a "stuck" event to
+        # its mechanism offline -- singularity (sigma_min), reach limit
+        # (manipulability), a fought swivel branch (swivel_err), or an
+        # active constraint (collision_rows). Costs two 6x7 SVDs.
+        if self.config.record_solver_diagnostics:
+            data = self.configuration.data
+            diag: dict = {"collision_rows": int(self._last_ineq_collision_rows)}
+            for side in ("left", "right"):
+                J_arm = self._arm_jacobian(side, data)
+                svals = np.linalg.svd(J_arm, compute_uv=False)
+                diag[f"{side}_sigma_min"] = float(svals[-1])
+                diag[f"{side}_manip"] = float(
+                    np.exp(self._log_manipulability(J_arm)))
+                swv = self._last_swivel.get(side)
+                diag[f"{side}_swivel"] = None if swv is None else float(swv[0])
+                diag[f"{side}_swivel_target"] = None if swv is None else float(swv[1])
+                diag[f"{side}_swivel_err"] = None if swv is None else float(swv[2])
+            self.diagnostics = diag
+        else:
+            self.diagnostics = {}
 
         return WholeBodyIKResult(
             q=q.copy(),
@@ -958,7 +1089,6 @@ class WholeBodyIK:
         projected onto them afterward by `_project_onto_limits`.
         """
         nv = self.model.nv
-        lam2 = self.config.dls_damping ** 2
 
         # Only the DOFs this solver actually controls: base (3), lift (1),
         # arms (14). The model carries ~62 nv in total -- fingers, wheels,
@@ -979,8 +1109,19 @@ class WholeBodyIK:
 
         J_rows, b_rows = [], []
         for task in ee_tasks:
-            J_rows.append(task.compute_jacobian(self.configuration))
-            b_rows.append(-task.gain * task.compute_error(self.configuration))
+            Jt = task.compute_jacobian(self.configuration)
+            bt = -task.gain * task.compute_error(self.configuration)
+            if self.config.dls_task_weighting:
+                # [S4a] The same row scaling mink's _weighted_residual applies
+                # in "soft" mode: task.cost is [position_cost x3,
+                # orientation_cost x3], so this is what makes
+                # ee_position_cost / ee_orientation_cost mean something in
+                # dls mode. Note it rescales the whole stack relative to
+                # lambda, so A/B it with the damping in mind.
+                Jt = task.cost[:, None] * Jt
+                bt = task.cost * bt
+            J_rows.append(Jt)
+            b_rows.append(bt)
         J = np.vstack(J_rows)[:, free_ids]
         b = np.concatenate(b_rows)
 
@@ -1040,8 +1181,46 @@ class WholeBodyIK:
             Jw = J / weight                 # J @ diag(1/weight)
             Uw, svw, Vtw = np.linalg.svd(Jw, full_matrices=False)
 
+        lam2 = self.config.dls_damping ** 2
+        sig_thresh = float(self.config.dls_adaptive_damping_sigma)
+        if sig_thresh > 0.0 and svw.size:
+            # [S4b] Ramp lambda^2 from dls_damping^2 (sigma_min >= threshold)
+            # up to dls_damping_max^2 (sigma_min -> 0), smoothstepped so the
+            # damping itself does not step. svw is sorted descending.
+            x = float(np.clip(1.0 - svw[-1] / sig_thresh, 0.0, 1.0))
+            gate = x * x * (3.0 - 2.0 * x)
+            lam2 = lam2 + gate * (self.config.dls_damping_max ** 2 - lam2)
+
         y = Vtw.T @ ((svw / (svw ** 2 + lam2)) * (Uw.T @ b))
         dq_primary = y / weight
+
+        # [S3] Constraint-aware primary: replace the unconstrained damped
+        # step with the minimiser of the *same* objective,
+        #     min ||J dq - b||^2 + lam2 ||W dq||^2   s.t.  G dq <= h,
+        # so that when a direction is blocked (collision buffer, joint
+        # limit) the optimiser reroutes through whatever free DOFs still
+        # serve the task -- base and lift included -- instead of the
+        # post-hoc clip zeroing the motion. With no constraint rows active
+        # the QP minimiser IS the damped step above, so the gate only
+        # changes behaviour near limits. Any failure falls back to the
+        # already-computed unconstrained step.
+        ineq_cache = None
+        if self.config.constrained_primary:
+            ineq_cache = self._limit_inequalities()
+            if ineq_cache is not None:
+                G_full, h_ineq = ineq_cache
+                P = J.T @ J + lam2 * np.diag(weight ** 2)
+                q_lin = -(J.T @ b)
+                problem = qpsolvers.Problem(P, q_lin, G_full[:, free_ids], h_ineq)
+                for solver in [self.config.solver] + self.config.fallback_solvers:
+                    try:
+                        res = qpsolvers.solve_problem(problem, solver=solver)
+                        if res.found:
+                            dq_primary = res.x
+                            break
+                    except Exception:
+                        continue
+
         rank_tol = self.config.nullspace_rank_tol * (sv[0] if sv.size else 0.0)
         V_r = Vt[sv > rank_tol].T
         N = np.eye(n) - V_r @ V_r.T
@@ -1147,6 +1326,32 @@ class WholeBodyIK:
                     blocks_r.append(
                         w * (dq_recenter[order] - dq_primary[slots]))
 
+        # ── [S1] Arm home attractor, always on when gated in ─────────────────
+        # The recovery force refresh_posture_target=True removed: among all
+        # solutions that serve the end effectors equally, prefer the one
+        # that moves the ARM joints toward the home posture. Null-space
+        # only, so it cannot perturb EE tracking; proportional to the
+        # error and capped per joint, so it is self-attenuating near home
+        # and bounded far from it. First iteration only, like every
+        # velocity-shaped term. Interplay to know about: the achieved creep
+        # is a weighted fraction of the desire (it trades against the
+        # min-norm posture term), and it must exceed the arm dispatch
+        # deadband (arm_joint_deadband_rad) to reach the hardware at all --
+        # pair this gate with the 0.005 deadband when testing.
+        hgain = float(self.config.nullspace_home_gain)
+        if hgain > 0.0 and self._first_iteration and self._home_arm_q is not None:
+            err_home = self._home_arm_q - self.configuration.q[self._arm_qpos_adrs_all]
+            cap = float(self.config.nullspace_home_max_vel)
+            v_home = np.clip(hgain * err_home, -cap, cap)
+            dq_home_full = np.zeros(nv)
+            dq_home_full[self._arm_dof_ids_arr] = v_home * self.config.dt
+            slots = np.flatnonzero(np.isin(free_ids, self._arm_dof_ids_arr))
+            if slots.size:
+                w = float(np.sqrt(self.config.nullspace_home_weight))
+                blocks_A.append(w * N[slots, :])
+                blocks_r.append(
+                    w * (dq_home_full[free_ids[slots]] - dq_primary[slots]))
+
         # ── Posture (unchanged objective, now weighted alongside the rest) ──
         posture_error = self.posture_task.compute_error(self.configuration)
         dq_posture = (
@@ -1204,6 +1409,30 @@ class WholeBodyIK:
                     np.sin(phi - self._swivel_target[side]),
                     np.cos(phi - self._swivel_target[side]),
                 ))
+                # [S5b] Re-latch on a persistently lost branch: fighting a
+                # near-pi error through a region the constraints may not
+                # allow crossing is how the arm wedges. Accepting the
+                # branch it actually reached is the recovery. Timed on the
+                # first iteration only, so the dwell is wall-clock, not
+                # iteration count.
+                relatch = float(self.config.swivel_relatch_err_rad)
+                if relatch > 0.0 and self._first_iteration:
+                    if abs(err) > relatch:
+                        now = time.monotonic()
+                        since = self._swivel_err_since[side]
+                        if since is None:
+                            self._swivel_err_since[side] = now
+                        elif now - since >= self.config.swivel_relatch_after_s:
+                            print(f"[wholebody-ik] {side} elbow swivel "
+                                  f"re-latched: err {err:+.2f} rad held "
+                                  f"{now - since:.1f} s, accepting the "
+                                  f"current branch ({phi:+.2f} rad)")
+                            self._swivel_target[side] = phi
+                            self._swivel_err_since[side] = None
+                            err = 0.0
+                    else:
+                        self._swivel_err_since[side] = None
+                self._last_swivel[side] = (phi, self._swivel_target[side], err)
                 # Per-iteration Δφ, matching the Δq space of this solve.
                 dphi_desired = -self.config.elbow_swivel_gain * err
                 w = float(np.sqrt(swivel_weight * fade))
@@ -1254,7 +1483,10 @@ class WholeBodyIK:
         dq[free_ids] = dq_free
 
         vel = dq / self.config.dt
-        return self._project_onto_limits(vel)
+        # Reuse the constraint rows the [S3] primary already built this
+        # iteration (the configuration has not changed since), instead of
+        # paying compute_qp_inequalities twice.
+        return self._project_onto_limits(vel, ineq=ineq_cache)
 
     # ── dls_projector: null-space objective helpers ──────────────────────────
 
@@ -1273,6 +1505,10 @@ class WholeBodyIK:
             side: self.config.elbow_swivel_targets.get(side)
             for side in ("left", "right")
         }
+        self._swivel_ref = {"left": None, "right": None}
+        self._swivel_u_prev = {"left": None, "right": None}
+        self._swivel_err_since = {"left": None, "right": None}
+        self._last_swivel = {}
 
     def set_elbow_swivel_target(
         self, side: str, angle: Optional[float] = None
@@ -1294,7 +1530,13 @@ class WholeBodyIK:
         angle to be meaningful -- see `elbow_swivel_min_offset`.
         """
         S, E, W = self._swivel_points(side)
-        phi, offset = self._swivel_from_points(S, E, W)
+        # Read-only: use the transported reference if one is live, without
+        # advancing the transport (that is _swivel_row's job).
+        ref = None
+        if self.config.swivel_parallel_ref and self._swivel_ref[side] is not None:
+            r = self._swivel_ref[side]
+            ref = (float(r[0]), float(r[1]), float(r[2]))
+        phi, offset = self._swivel_from_points(S, E, W, ref=ref)
         return None if offset < 1e-9 else phi
 
     def _swivel_points(self, side: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1309,6 +1551,7 @@ class WholeBodyIK:
         sx: float, sy: float, sz: float,
         ex: float, ey: float, ez: float,
         wx: float, wy: float, wz: float,
+        ref: Optional[tuple[float, float, float]] = None,
     ) -> tuple[float, float]:
         """Swivel angle and perpendicular offset, in plain floats.
 
@@ -1333,15 +1576,21 @@ class WholeBodyIK:
             return 0.0, 0.0
 
         # In-plane reference: world +z, or +x when the arm axis is nearly
-        # vertical. Chosen from the geometry alone, so it is continuous
-        # wherever u is.
-        if abs(uz) > 0.9:
+        # vertical -- NOTE this switch is a step, not continuous: crossing
+        # |u_z| = 0.9 jumps the measured angle (see swivel_parallel_ref for
+        # the gated fix). A caller may pass `ref` to supply its own
+        # (continuous) reference vector instead.
+        if ref is not None:
+            rfx, rfy, rfz = ref
+        elif abs(uz) > 0.9:
             rfx, rfy, rfz = 1.0, 0.0, 0.0
         else:
             rfx, rfy, rfz = 0.0, 0.0, 1.0
         dot = rfx * ux + rfy * uy + rfz * uz
         n1x, n1y, n1z = rfx - dot * ux, rfy - dot * uy, rfz - dot * uz
         n1_norm = math.sqrt(n1x * n1x + n1y * n1y + n1z * n1z)
+        if n1_norm < 1e-9:
+            return 0.0, 0.0  # reference parallel to the axis: undefined
         n1x, n1y, n1z = n1x / n1_norm, n1y / n1_norm, n1z / n1_norm
         n2x = uy * n1z - uz * n1y
         n2y = uz * n1x - ux * n1z
@@ -1354,7 +1603,8 @@ class WholeBodyIK:
 
     @classmethod
     def _swivel_from_points(
-        cls, S: np.ndarray, E: np.ndarray, W: np.ndarray
+        cls, S: np.ndarray, E: np.ndarray, W: np.ndarray,
+        ref: Optional[tuple[float, float, float]] = None,
     ) -> tuple[float, float]:
         """Swivel angle of the elbow about the shoulder->wrist axis.
 
@@ -1364,7 +1614,51 @@ class WholeBodyIK:
         objective out rather than chase it.
         """
         return cls._swivel_scalar(S[0], S[1], S[2], E[0], E[1], E[2],
-                                  W[0], W[1], W[2])
+                                  W[0], W[1], W[2], ref=ref)
+
+    def _swivel_reference(self, side: str, u: np.ndarray) -> Optional[np.ndarray]:
+        """[S5a] Continuous in-plane reference vector for one arm's swivel.
+
+        Parallel-transports a stored per-side reference along changes of the
+        shoulder->wrist axis `u`: rotate it by the minimal rotation taking
+        the previous axis onto the current one, re-orthonormalise, store.
+        Continuous everywhere, unlike the fixed z/x convention it replaces
+        (which steps at |u_z| = 0.9). Path-dependent by nature (transport
+        around a closed axis loop picks up the enclosed solid angle), which
+        is slow drift the [S5b] re-latch policy bounds. Returns None when no
+        usable reference exists this call.
+        """
+        ref = self._swivel_ref[side]
+        u_prev = self._swivel_u_prev[side]
+        if ref is None or u_prev is None:
+            # Seed with the discrete convention, so the angle (and any
+            # target latched from it) agrees with gate-off at the moment of
+            # enabling.
+            ref = (np.array([1.0, 0.0, 0.0]) if abs(u[2]) > 0.9
+                   else np.array([0.0, 0.0, 1.0]))
+        else:
+            c = float(np.dot(u_prev, u))
+            k = np.cross(u_prev, u)
+            s2 = float(np.dot(k, k))
+            if c < -0.999999:
+                # Axis flipped ~180 deg in one step: no continuous
+                # transport exists. Re-seed rather than guess.
+                ref = (np.array([1.0, 0.0, 0.0]) if abs(u[2]) > 0.9
+                       else np.array([0.0, 0.0, 1.0]))
+            elif s2 > 1e-16:
+                # Rodrigues rotation taking u_prev onto u, with
+                # k = u_prev x u (|k| = sin theta, c = cos theta).
+                ref = (ref * c + np.cross(k, ref)
+                       + k * (float(np.dot(k, ref)) * (1.0 - c) / s2))
+            # else: axes identical, transport is the identity.
+        ref = ref - float(np.dot(ref, u)) * u
+        nrm = float(np.linalg.norm(ref))
+        if nrm < 1e-9:
+            return None
+        ref = ref / nrm
+        self._swivel_ref[side] = ref
+        self._swivel_u_prev[side] = np.asarray(u, dtype=float).copy()
+        return ref
 
     def _swivel_row(self, side: str, free_ids: np.ndarray):
         """One arm's swivel Jacobian row and current angle.
@@ -1375,9 +1669,23 @@ class WholeBodyIK:
         world-frame translational Jacobians MuJoCo gives directly, and the
         3-vector partials finite-differenced on the cheap pure-numpy scalar
         above (no forward kinematics in the inner loop).
+
+        With swivel_parallel_ref the transported reference is fetched once
+        and held FROZEN through the finite differences: the reference's own
+        dependence on q (through the axis) is second-order in the
+        perturbation and not worth the transport bookkeeping inside the FD
+        loop.
         """
         S, E, W = self._swivel_points(side)
-        phi, offset = self._swivel_from_points(S, E, W)
+        ref = None
+        if self.config.swivel_parallel_ref:
+            axis = W - S
+            a_norm = float(np.linalg.norm(axis))
+            if a_norm > 1e-9:
+                r = self._swivel_reference(side, axis / a_norm)
+                if r is not None:
+                    ref = (float(r[0]), float(r[1]), float(r[2]))
+        phi, offset = self._swivel_from_points(S, E, W, ref=ref)
         if offset < 1e-9:
             return None
 
@@ -1388,9 +1696,9 @@ class WholeBodyIK:
         for j in range(9):
             base = coords[j]
             coords[j] = base + h
-            a_hi, off_hi = self._swivel_scalar(*coords)
+            a_hi, off_hi = self._swivel_scalar(*coords, ref=ref)
             coords[j] = base - h
-            a_lo, off_lo = self._swivel_scalar(*coords)
+            a_lo, off_lo = self._swivel_scalar(*coords, ref=ref)
             coords[j] = base
             if off_lo < 1e-9 or off_hi < 1e-9:
                 return None
@@ -1519,7 +1827,35 @@ class WholeBodyIK:
         x = float(np.clip((on - mu) / (on - full), 0.0, 1.0))
         return x * x * (3.0 - 2.0 * x)
 
-    def _project_onto_limits(self, vel: np.ndarray) -> np.ndarray:
+    def _limit_inequalities(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        """Stacked (G, h) of every active limit's Δq inequalities, or None.
+
+        Shared by [S3]'s constrained primary and `_project_onto_limits`, so
+        the two act on exactly the same constraint set. Also counts the rows
+        contributed by the collision limit into
+        `_last_ineq_collision_rows` for the [S7] diagnostics -- an active
+        collision constraint is the difference between "the solver is
+        stuck" and "the solver is being stopped", and nothing logged it.
+        """
+        limits = self._limits_with_collision if self.avoid_collisions else self.limits
+        G_list, h_list = [], []
+        collision_rows = 0
+        for limit in limits:
+            ineq = limit.compute_qp_inequalities(self.configuration, self.config.dt)
+            if not ineq.inactive:
+                G_list.append(ineq.G)
+                h_list.append(ineq.h)
+                if limit is self.collision_limit:
+                    collision_rows = ineq.G.shape[0]
+        self._last_ineq_collision_rows = collision_rows
+        if not G_list:
+            return None
+        return np.vstack(G_list), np.hstack(h_list)
+
+    def _project_onto_limits(
+        self, vel: np.ndarray,
+        ineq: Optional[tuple[np.ndarray, np.ndarray]] = None,
+    ) -> np.ndarray:
         """Clip a velocity onto the same hard joint/collision limits the
         other two modes get for free from mink's QP, by solving the
         closest-feasible-point QP min_Δq' ||Δq' - Δq||^2 s.t. GΔq' <= h.
@@ -1540,18 +1876,15 @@ class WholeBodyIK:
         more than it saves (~0.75ms/call vs ~0.56ms/call, benchmarked at
         home + a small offset target). Left as one QP; the real per-solve
         cost floor is compute_qp_inequalities itself (~0.4ms, mostly
-        mj_differentiatePos), not the solve on top of it."""
-        limits = self._limits_with_collision if self.avoid_collisions else self.limits
-        G_list, h_list = [], []
-        for limit in limits:
-            ineq = limit.compute_qp_inequalities(self.configuration, self.config.dt)
-            if not ineq.inactive:
-                G_list.append(ineq.G)
-                h_list.append(ineq.h)
-        if not G_list:
+        mj_differentiatePos), not the solve on top of it.
+
+        `ineq` lets a caller that already built this configuration's (G, h)
+        via _limit_inequalities pass it in rather than rebuilding it."""
+        if ineq is None:
+            ineq = self._limit_inequalities()
+        if ineq is None:
             return vel
-        G = np.vstack(G_list)
-        h = np.hstack(h_list)
+        G, h = ineq
         dq = vel * self.config.dt
         nv = vel.shape[0]
         problem = qpsolvers.Problem(np.eye(nv), -dq, G, h)

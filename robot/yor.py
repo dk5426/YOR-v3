@@ -870,6 +870,17 @@ class YOR():
         return self.wholebody.toggle_base_motion(enable)
 
     @require_initialization
+    @require_wholebody
+    def relatch_elbow_swivel(self, side: str | None = None) -> bool:
+        """Accept the elbow branch the arm(s) are currently in.
+
+        Clears the latched swivel target for `side` ("left"/"right", or both
+        when omitted); the next solve re-latches from the live pose. The
+        cheap recovery from a fought elbow branch -- no homing cycle needed.
+        """
+        return self.wholebody.relatch_elbow_swivel(side)
+
+    @require_initialization
     def get_state(self) -> dict:
         """Snapshot for teleop clients (plain types), matching the sim node."""
         if self.wholebody is None:
@@ -1310,6 +1321,77 @@ def main():
         help="only with --enable-manipulability: step size in radians per "
              "iteration along the normalised ascent direction "
              "(default: %(default)s)")
+    # ── Gated experiments (2026-08-25 wave). Every flag below defaults to
+    #    off / current behaviour; enable individually to A/B. Restore point:
+    #    git tag pre-gates. ────────────────────────────────────────────────
+    parser.add_argument(
+        "--arm-joint-deadband", type=float, default=None, metavar="RAD",
+        help="[T2] per-joint deadband below which a solved arm target is "
+             "not dispatched (default: keep config value, currently 0.05 "
+             "rad ~ 2.9 deg -- the cause of the slow-motion staircase; try "
+             "0.005)")
+    parser.add_argument(
+        "--target-leash-m", type=float, default=None, metavar="M",
+        help="[S2] cap how far an EE target may sit from the current EE "
+             "pose; excess is forgotten each tick, killing clutch wind-up "
+             "at the server (default: 0 = off; try 0.15)")
+    parser.add_argument(
+        "--target-leash-rad", type=float, default=None, metavar="RAD",
+        help="[S2] same leash for orientation, along the geodesic "
+             "(default: 0 = off; try 0.8)")
+    parser.add_argument(
+        "--nullspace-home-gain", type=float, default=None, metavar="GAIN",
+        help="[S1] null-space pull of the arm joints toward the home "
+             "posture, in (rad/s per rad of error); the missing recovery "
+             "force for contorted poses. 0 = off (default; try 0.3)")
+    parser.add_argument(
+        "--nullspace-home-weight", type=float, default=None, metavar="W",
+        help="[S1] weight of the home attractor in the secondary stack "
+             "(default: config 1.0)")
+    parser.add_argument(
+        "--nullspace-home-max-vel", type=float, default=None, metavar="V",
+        help="[S1] per-joint cap on the home-attractor desire in rad/s "
+             "(default: config 0.3)")
+    parser.add_argument(
+        "--constrained-primary", action="store_true",
+        help="[S3] solve the primary EE step subject to the joint/collision "
+             "inequalities instead of clipping afterwards, so blocked arm "
+             "motion reroutes through base/lift (the backward-motion fix). "
+             "Falls back to the unconstrained step on any QP failure. "
+             "Costs ~1 extra small QP per iteration.")
+    parser.add_argument(
+        "--dls-task-weighting", action="store_true",
+        help="[S4a] apply ee_position_cost/ee_orientation_cost row scaling "
+             "inside dls_projector (off, those knobs are silently ignored "
+             "and 1 m weighs the same as 1 rad)")
+    parser.add_argument(
+        "--dls-adaptive-damping", type=float, default=None, metavar="SIGMA",
+        help="[S4b] sigma_min threshold below which lambda ramps from "
+             "--dls-damping up to --dls-damping-max; keeps rotation crisp "
+             "away from singularity, softens only near it (default: 0 = "
+             "off; try 0.05)")
+    parser.add_argument(
+        "--dls-damping-max", type=float, default=None, metavar="LAM",
+        help="[S4b] lambda at sigma_min = 0 with --dls-adaptive-damping "
+             "(default: config 0.2)")
+    parser.add_argument(
+        "--swivel-parallel-ref", action="store_true",
+        help="[S5a] parallel-transported swivel reference: removes the "
+             "reference-frame step at |u_z| = 0.9 that yanks the elbow "
+             "during high/low reaches (off = current z/x convention)")
+    parser.add_argument(
+        "--swivel-relatch-err", type=float, default=None, metavar="RAD",
+        help="[S5b] if the swivel error stays above this for "
+             "--swivel-relatch-time, accept the branch the arm is actually "
+             "in instead of fighting it (default: 0 = off; try 1.57)")
+    parser.add_argument(
+        "--swivel-relatch-time", type=float, default=None, metavar="S",
+        help="[S5b] dwell before a re-latch (default: config 1.0 s)")
+    parser.add_argument(
+        "--no-solver-diagnostics", action="store_true",
+        help="[S7] skip the per-solve sigma_min/manipulability/swivel/"
+             "collision-row diagnostics (on by default; two 6x7 SVDs per "
+             "solve)")
     args = parser.parse_args()
 
     if not args.no_console_log:
@@ -1332,6 +1414,12 @@ def main():
            else {"base_yaw_filter_tau": args.base_yaw_filter_tau}),
         **({} if args.base_vel_filter_tau is None
            else {"base_vel_filter_tau": args.base_vel_filter_tau}),
+        **({} if args.arm_joint_deadband is None
+           else {"arm_joint_deadband_rad": args.arm_joint_deadband}),
+        **({} if args.target_leash_m is None
+           else {"target_leash_m": args.target_leash_m}),
+        **({} if args.target_leash_rad is None
+           else {"target_leash_rad": args.target_leash_rad}),
     )
 
     # Same base tuning WholeBodyController would build internally (see its
@@ -1376,7 +1464,39 @@ def main():
         enable_manipulability=args.enable_manipulability,
         manipulability_weight=args.manipulability_weight,
         manipulability_gain=args.manipulability_gain,
+        # ── Gated experiments ──
+        **({} if args.nullspace_home_gain is None
+           else {"nullspace_home_gain": args.nullspace_home_gain}),
+        **({} if args.nullspace_home_weight is None
+           else {"nullspace_home_weight": args.nullspace_home_weight}),
+        **({} if args.nullspace_home_max_vel is None
+           else {"nullspace_home_max_vel": args.nullspace_home_max_vel}),
+        constrained_primary=args.constrained_primary,
+        dls_task_weighting=args.dls_task_weighting,
+        **({} if args.dls_adaptive_damping is None
+           else {"dls_adaptive_damping_sigma": args.dls_adaptive_damping}),
+        **({} if args.dls_damping_max is None
+           else {"dls_damping_max": args.dls_damping_max}),
+        swivel_parallel_ref=args.swivel_parallel_ref,
+        **({} if args.swivel_relatch_err is None
+           else {"swivel_relatch_err_rad": args.swivel_relatch_err}),
+        **({} if args.swivel_relatch_time is None
+           else {"swivel_relatch_after_s": args.swivel_relatch_time}),
+        record_solver_diagnostics=not args.no_solver_diagnostics,
     )
+    gates_on = [label for label, on in (
+        (f"arm_deadband={args.arm_joint_deadband}", args.arm_joint_deadband is not None),
+        (f"leash_m={args.target_leash_m}", args.target_leash_m is not None),
+        (f"leash_rad={args.target_leash_rad}", args.target_leash_rad is not None),
+        (f"home_gain={args.nullspace_home_gain}", args.nullspace_home_gain is not None),
+        ("constrained_primary", args.constrained_primary),
+        ("dls_task_weighting", args.dls_task_weighting),
+        (f"adaptive_damping={args.dls_adaptive_damping}", args.dls_adaptive_damping is not None),
+        ("swivel_parallel_ref", args.swivel_parallel_ref),
+        (f"swivel_relatch={args.swivel_relatch_err}", args.swivel_relatch_err is not None),
+    ) if on]
+    print("[yor] experiment gates: "
+          + (", ".join(gates_on) if gates_on else "all off (pre-gate behaviour)"))
     print(
         f"[yor] posture-fix: stiffen_joint7={args.posture_stiffen_joint7}"
         + (f" (scale={args.posture_joint7_scale:g}x)" if args.posture_stiffen_joint7 else "")
