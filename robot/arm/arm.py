@@ -119,7 +119,8 @@ class ArmNode:
             # achievable accel (2.0-2.5 rad/s^2) on several joints, so any
             # of them may reintroduce the original jitter -- if so, revert
             # to whichever earlier line was last confirmed jitter-free.
-            self.config.joint_vel_max = [2.98, 2.98, 2.98, 2.98, 3.72, 3.72, 3.72]
+            # self.config.joint_vel_max = [2.98, 2.98, 2.98, 2.98, 3.72, 3.72, 3.72]
+            self.config.joint_vel_max = [2.98 * 4.0, 2.98 * 4.0, 2.98 * 4.0, 2.98 * 4.0, 3.72 * 4.0, 3.72 * 4.0, 3.72 * 4.0]
             # Previous (1.3x of 95%-of-firmware; smooth, still some lag):
             # self.config.joint_acc_max = [2.47, 2.47, 3.09, 3.09, 3.09, 3.09, 3.09]
             # Previous (p90 demand, 3-file estimate; better, still lag):
@@ -127,6 +128,25 @@ class ArmNode:
             # Previous (p95 demand, 3-file estimate, outliers removed):
             self.config.joint_acc_max = [4.98, 3.42, 3.57, 9.57, 5.38, 5.76, 8.99]
             # self.config.joint_acc_max = [4.60, 3.86, 5.05, 7.73, 6.33, 6.33, 8.41]
+            # self.config.joint_acc_max = [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0 ]
+            # Third-order limit for the Ruckig profile. This used to be left
+            # unset, which meant +infinity -- nerolib's ControllerConfig had no
+            # jerk field at all. Ruckig's validate() accepts infinity (it only
+            # rejects NaN and negatives), so it reached the jerk-limited
+            # profile solver and produced NaN intermediates there, failing
+            # intermittently with ErrorExecutionTimeCalculation /
+            # ErrorSynchronizationCalculation. That is what made the arm drop a
+            # command mid-motion.
+            #
+            # 2000 is chosen to fix the conditioning WITHOUT retuning the arm:
+            # a_max/j = 10/2000 = 5 ms of acceleration rounding, ~1.25 ticks of
+            # the 250 Hz control loop, i.e. as near to the previous infinite
+            # behaviour as a well-conditioned solve gets. It is deliberately
+            # not a smoothing knob -- the arm is replanned every ~11 ms by the
+            # 90 Hz dispatch, so a jerk low enough to be *felt* would stop the
+            # profile ever reaching joint_acc_max. Lower it on purpose if you
+            # want softer starts, and expect to lose acceleration for it.
+            self.config.joint_jerk_max = [2000.0] * 7
             
             if default_kp is not None:
                 if isinstance(default_kp, (int, float)):

@@ -35,8 +35,9 @@ if str(_ROOT) not in sys.path:
 
 from robot.arm.arm import ArmNode
 from robot.base import BaseController
-from robot.base_motor import DRIVE_VEL_SCALE as _DRIVE_VEL_SCALE
+from robot.base_motor import DRIVE_VEL_SCALE as _DRIVE_VEL_SCALE, MODULE_ORDER
 from robot.wholebody_control import WholeBodyController, WholeBodyHardwareConfig
+from robot.swerve_log import DEFAULT_HZ as SWERVE_LOG_HZ, SwerveRecorder
 from robot.arm.wholebody_ik import WholeBodyIKConfig
 from tools.base_pid_preflight import (
     COMMISSIONED_MANIFEST, DEFAULT_MANIFEST, STOCK_MANIFEST, drive_command_scale,
@@ -87,12 +88,18 @@ class YOR():
         base_pid_manifest: Optional[Path] = None,
         restore_base_pid: bool = True,
         base_pid_stock_manifest: Optional[Path] = None,
+        swerve_log: bool = True,
+        swerve_log_hz: float = SWERVE_LOG_HZ,
+        gripper: str = "none",
     ):
         self._initialized = False
         self._flash_base_pid = bool(flash_base_pid)
         self._base_pid_manifest = Path(base_pid_manifest) if base_pid_manifest else DEFAULT_MANIFEST
         self._restore_base_pid = bool(restore_base_pid)
         self._base_pid_provenance = "unknown"
+        self._swerve_log = bool(swerve_log)
+        self._swerve_log_hz = float(swerve_log_hz)
+        self._swerve_recorder: Optional[SwerveRecorder] = None
         self._base_pid_stock_manifest = (
             Path(base_pid_stock_manifest) if base_pid_stock_manifest
             else STOCK_MANIFEST
@@ -139,21 +146,30 @@ class YOR():
         self._ik_config = ik_config
         self._homing_lock = threading.Lock()
 
+        # Which gripper hardware is fitted, if any. Off by default: with no
+        # gripper attached a value arriving from teleop is dropped rather than
+        # sent to an actuator that is not there, and -- more to the point --
+        # ArmNode calibrates a dynamixel gripper by physically driving it shut
+        # and back open at startup, which must never happen by accident.
+        self.gripper_kind = str(gripper)
+        if self.gripper_kind not in ("none", "dynamixel", "native"):
+            raise ValueError(
+                f"gripper must be none|dynamixel|native, got {gripper!r}")
+        dynamixel_gripper = self.gripper_kind == "dynamixel"
+        native_gripper = self.gripper_kind == "native"
+
         if not self.no_arms:
-            # Neither gripper is fitted on this robot, so both gripper paths are
-            # switched off explicitly: a gripper value arriving from teleop is
-            # dropped rather than sent to an actuator that is not there.
             self.left_arm = ArmNode(
                 can_port="can_left",
-                dynamixel_gripper=False,
-                native_gripper=False,
+                dynamixel_gripper=dynamixel_gripper,
+                native_gripper=native_gripper,
                 firmware_version=FirmwareVersion.V111,
             )
             self.right_arm = ArmNode(
                 can_port="can_right",
                 is_left_arm=False,
-                dynamixel_gripper=False,
-                native_gripper=False,
+                dynamixel_gripper=dynamixel_gripper,
+                native_gripper=native_gripper,
                 firmware_version=FirmwareVersion.V111,
             )
 
@@ -174,6 +190,7 @@ class YOR():
         self.base_controller.mode = "BASE_VEL"
         self.base_controller.target_velocity = np.zeros(3, dtype=float)
         self.base.start_control()
+        self._start_swerve_log()
         self.base.set_target_base_velocity(np.zeros(3), smooth=False)
         time.sleep(0.5)
 
@@ -317,6 +334,36 @@ class YOR():
             gains = "gains unreadable"
         return (f"{Path(path).name} [{gains}, scale={self._drive_vel_scale:g}]"
                 + ("" if ok else " SYNC FAILED"))
+
+    def _start_swerve_log(self) -> None:
+        """Record per-module swerve telemetry for the life of the base loop.
+
+        Deliberately not tied to whole-body control. The trajectory log only
+        exists when a WholeBodyController does, so `--no-arms` -- which is how
+        the base gets driven from joystick.py -- recorded nothing at all, and
+        even with arms it samples at the 30 Hz solve rate rather than the 50 Hz
+        the SPARKs publish at. This runs off the base loop instead, so a
+        joystick run and a teleop run are directly comparable.
+        """
+        if not self._swerve_log:
+            return
+        path = (_ROOT / "artifacts" / "wholebody_logs" / "swerve"
+                / f"swerve_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        try:
+            self._swerve_recorder = SwerveRecorder(
+                path, self.base, MODULE_ORDER, sample_hz=self._swerve_log_hz,
+                config_notes=[f"base_pid={self._base_pid_provenance}",
+                              f"sample_hz={self._swerve_log_hz}"])
+            self._swerve_recorder.start()
+            print(f"[YOR] recording swerve telemetry to {path}")
+        except Exception as exc:
+            print(f"[YOR] swerve log unavailable ({exc!r}); continuing without it")
+            self._swerve_recorder = None
+
+    def stop_swerve_log(self) -> None:
+        if self._swerve_recorder is not None:
+            self._swerve_recorder.stop()
+            self._swerve_recorder = None
 
     def _report_base_configuration(self) -> None:
         """Print what the swerve controllers say about their own setup.
@@ -1051,10 +1098,86 @@ def main():
              "which after a SPARK power cycle are the stock ones")
     parser.add_argument(
         "--base-pid-manifest", type=Path, default=None, metavar="PATH",
-        help=f"PID manifest to sync at startup (default: {DEFAULT_MANIFEST.name}, "
-             f"the gains the controllers hold in flash and that DRIVE_VEL_SCALE=2.0 "
-             f"is correct for). The tuned floor-measured set is "
-             f"{COMMISSIONED_MANIFEST.name}; see its description before using it.")
+        help=f"PID manifest to sync at startup (default: {DEFAULT_MANIFEST.name} — "
+             f"commissioned drive gains with stock full-range steering, "
+             f"floor-validated 2026-08-24; each manifest carries its own "
+             f"drive_command_scale). {STOCK_MANIFEST.name} is the flash state "
+             f"a power cycle reverts to and what shutdown restores; "
+             f"{COMMISSIONED_MANIFEST.name} adds the clamped Kp=20 steering "
+             f"loop — see its description before using it.")
+    parser.add_argument(
+        "--base-motion-weight", type=float, default=None, metavar="W",
+        help="cost of base motion relative to arm motion in the solver (default 100). "
+             "1.0 is the unweighted solve, which lets the base answer 24%% of pure EE "
+             "tracker noise and reverse direction every other tick. Raising it makes "
+             "'base motion is emergent' true: the arms absorb high-frequency error and "
+             "the base moves only when they run out of reach.")
+    parser.add_argument(
+        "--base-motion-weight-min", type=float, default=None, metavar="W",
+        help="what --base-motion-weight falls to when the arms run out of posture "
+             "(default 1.0, i.e. no penalty). The cost is gated on arm manipulability, "
+             "so the chassis moves to keep the arms working rather than only after they "
+             "have contorted. Set equal to --base-motion-weight to disable the gate.")
+    parser.add_argument(
+        "--base-weight-gate", type=float, nargs=2, default=None, metavar=("ON", "FULL"),
+        help="manipulability band the base cost ramps across (default 0.045 0.025). "
+             "mu is 0.0506 at the home keyframe; ON sits just below it so ordinary "
+             "motion does not open the gate, FULL at the quartile where the arm is "
+             "visibly stretched.")
+    parser.add_argument(
+        "--base-max-accel", type=float, default=None, metavar="A",
+        help="ceiling on how fast the commanded base velocity vector may change, m/s^2 "
+             "(default 1.5). This is the reversal guard: the heading limiter treats a "
+             "180-degree flip as free because a module answers it by reversing the drive, "
+             "which is true for the module and false for the chassis. 0 disables.")
+    parser.add_argument(
+        "--base-vel-deadband", type=float, nargs=2, default=None,
+        metavar=("ENTRY", "EXIT"),
+        help="hysteresis deadband on the linear base command, m/s: motion "
+             "starts above ENTRY and stops below EXIT. Default 0 0 "
+             "(disabled) since 2026-08-25 -- with the low-pass filter on "
+             "the linear request the deadband caused start-stop bursts. "
+             "Pass 0.05 0.025 to restore the previous behaviour.")
+    parser.add_argument(
+        "--base-yaw-deadband", type=float, nargs=2, default=None,
+        metavar=("ENTRY", "EXIT"),
+        help="hysteresis deadband on the base yaw command, rad/s: rotation "
+             "starts above ENTRY and stops below EXIT. Default 0 0 "
+             "(disabled) since 2026-08-25, same reasoning as the linear "
+             "pair. The pre-experiment value was 0.05 0.025; the raised "
+             "experiment used 0.15 0.075.")
+    parser.add_argument(
+        "--base-vel-filter-tau", type=float, default=None, metavar="TAU",
+        help="one-pole low-pass time constant on the linear base request, s "
+             "(default 0.15). Merges the solver's burst-shaped translation "
+             "requests into sustained commands; costs ~TAU of onset lag. "
+             "0 disables.")
+    parser.add_argument(
+        "--base-recenter", type=float, nargs=2, default=None,
+        metavar=("GAIN", "MAXVEL"),
+        help="null-space base recentering: continuously roll the chassis "
+             "toward the pose that restores the hands' home-pose offset "
+             "from the base, at GAIN * distance m/s, capped at MAXVEL, with "
+             "the arms counter-moving so the hands stay put. Symmetric --  "
+             "not gated by arm reach, so it pulls the base home on retract "
+             "as well as reach. Default 0.5 0.15; 0 0 disables.")
+    parser.add_argument(
+        "--base-yaw-filter-tau", type=float, default=None, metavar="TAU",
+        help="one-pole low-pass time constant on the base yaw request, s "
+             "(default 0.15; the only yaw smoothing since the yaw deadband "
+             "was removed). 0.08 is the old light setting; 0.25 measured "
+             "well in replay but felt clearly worse on the floor; "
+             "0 disables.")
+    parser.add_argument(
+        "--swerve-log", action=argparse.BooleanOptionalAction, default=True,
+        help="record per-module swerve telemetry (commanded and measured steer angle, "
+             "drive velocity and drive position) to artifacts/wholebody_logs/swerve/ for "
+             "the life of the base control loop. Independent of whole-body control, so it "
+             "covers joystick runs and --no-arms.")
+    parser.add_argument(
+        "--swerve-log-hz", type=float, default=SWERVE_LOG_HZ, metavar="HZ",
+        help=f"swerve log sample rate (default {SWERVE_LOG_HZ:g}, matching the SPARK "
+             f"periodic status 2 period)")
     parser.add_argument(
         "--restore-base-pid", action=argparse.BooleanOptionalAction, default=True,
         help="on shutdown, write the SPARK stock gains back over the commissioned "
@@ -1067,6 +1190,14 @@ def main():
     parser.add_argument(
         "--no-arms", action="store_true",
         help="skip both arm controllers and their startup joint homing")
+    parser.add_argument(
+        "--gripper", choices=("none", "dynamixel", "native"), default="none",
+        help="which gripper hardware is fitted (default: none, gripper "
+             "commands dropped). 'dynamixel' drives the U2D2 servos on "
+             "/dev/ttyUSB0 and CALIBRATES THEM AT STARTUP by closing and "
+             "reopening each gripper -- only pass it with the hands attached "
+             "and clear. 'native' routes the gripper through the arm's own "
+             "CAN gripper via nerolib.")
     parser.add_argument(
         "--no-base-motion", action="store_true",
         help="keep the whole-body IK base fixed and disable wheel dispatch")
@@ -1189,6 +1320,18 @@ def main():
         enable_base_motion=not args.no_base_motion,
         enable_lift_motion=not args.no_lift_motion,
         record_trajectories=not args.no_trajectory_log,
+        **({} if args.base_max_accel is None
+           else {"base_max_accel": args.base_max_accel}),
+        **({} if args.base_vel_deadband is None
+           else {"base_vel_deadband": args.base_vel_deadband[0],
+                 "base_vel_deadband_exit": args.base_vel_deadband[1]}),
+        **({} if args.base_yaw_deadband is None
+           else {"base_yaw_deadband": args.base_yaw_deadband[0],
+                 "base_yaw_deadband_exit": args.base_yaw_deadband[1]}),
+        **({} if args.base_yaw_filter_tau is None
+           else {"base_yaw_filter_tau": args.base_yaw_filter_tau}),
+        **({} if args.base_vel_filter_tau is None
+           else {"base_vel_filter_tau": args.base_vel_filter_tau}),
     )
 
     # Same base tuning WholeBodyController would build internally (see its
@@ -1212,6 +1355,16 @@ def main():
         ),
         redundancy_resolution=args.redundancy_resolution,
         dls_damping=args.dls_damping,
+        **({} if args.base_motion_weight is None
+           else {"base_motion_weight": args.base_motion_weight}),
+        **({} if args.base_motion_weight_min is None
+           else {"base_motion_weight_min": args.base_motion_weight_min}),
+        **({} if args.base_weight_gate is None
+           else {"base_weight_gate_on": args.base_weight_gate[0],
+                 "base_weight_gate_full": args.base_weight_gate[1]}),
+        **({} if args.base_recenter is None
+           else {"base_recenter_gain": args.base_recenter[0],
+                 "base_recenter_max_vel": args.base_recenter[1]}),
         nullspace_swivel_weight=args.nullspace_swivel_weight,
         elbow_swivel_gain=args.elbow_swivel_gain,
         elbow_swivel_targets=(
@@ -1251,7 +1404,10 @@ def main():
         flash_base_pid=args.flash_base_pid,
         base_pid_manifest=args.base_pid_manifest,
         restore_base_pid=args.restore_base_pid,
+        swerve_log=args.swerve_log,
+        swerve_log_hz=args.swerve_log_hz,
         base_pid_stock_manifest=args.base_pid_stock_manifest,
+        gripper=args.gripper,
     )
     server = None
     shutdown_started = False
@@ -1286,6 +1442,7 @@ def main():
 
         # Stop hardware workers before RPC teardown/interpreter shutdown so
         # PicoLift cannot keep reconnecting after Ctrl-C.
+        attempt("swerve log stop", yor.stop_swerve_log)
         attempt("base control loop stop", yor.base.stop_control)
 
         # Then hand the swerve controllers back in stock condition, while the

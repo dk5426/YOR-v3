@@ -126,6 +126,50 @@ DRIVE_VEL_SCALE = 2.0
 # velocity the base is ever asked for and safely above float noise.
 ZERO_SPEED_EPS_MPS = 1e-3
 
+# ----------------------------
+# Base velocity ramp
+# ----------------------------
+# The profiler in Base.control_loop is a jerk-limited velocity ramp: it
+# integrates acceleration toward the commanded velocity, and the acceleration
+# itself may only change by BASE_MAX_JERK per second. That is what rounds the
+# edges off a step command without a low-pass filter -- a filter lags *every*
+# sample by its time constant, including the steady-state ones, whereas a ramp
+# is only behind while the command is actually changing and tracks exactly once
+# it settles.
+#
+# Replaces the raised-cosine S-curve that planned a fixed-duration segment and
+# re-planned it whenever the target moved. Reading the live target every tick
+# is most of the responsiveness: a command that changes mid-move is picked up
+# on the next tick instead of after the current segment finishes.
+#
+# Tuned for low perceived latency rather than maximum smoothness:
+#
+#   * Jerk is high. It only shapes the first ~a_max/j seconds of a move
+#     (~38 ms here), enough to stop the wheels slipping and the mast rocking,
+#     short enough that the operator reads it as immediate. It has to be raised
+#     alongside acceleration -- the *ratio* sets how long the rounding lasts,
+#     so bumping accel alone makes a move feel softer, not snappier.
+#   * Acceleration is a traction and tip-over budget, not a comfort setting.
+#   * Deceleration is deliberately stronger than acceleration (~1.6x). Starts
+#     are where smoothness is noticed; stops are where latency is noticed, and
+#     an operator releasing the stick wants the robot to be *done* moving.
+#
+# THESE ARE PAST THE POINT WHERE SOFTWARE IS THE BINDING CONSTRAINT. 7.0 m/s^2
+# is ~0.71 g, and two physical ceilings sit right around there: wheel traction
+# (roughly 0.7-0.9 g on a clean level floor, less on dust or a ramp), and
+# tip-over about the short axis, roughly g * (half-track / CoG height) -- with
+# a half-track of 0.17 m that shrinks as the lift goes up.
+#
+# The ramp only shapes the *command*; the SPARK velocity PID still has to
+# follow it, and under config/base_pid_stock.json it does not -- that loop is
+# P-only and reaches about 40% of setpoint. Tuning these numbers cannot fix
+# tracking that happens downstream of them.
+#
+# Order is [vx, vy, omega]: m/s^2 and rad/s^2 here, m/s^3 and rad/s^3 for jerk.
+BASE_MAX_ACCEL = np.array([4.5, 4.5, 14.0], dtype=float)
+BASE_MAX_DECEL = np.array([7.0, 7.0, 22.0], dtype=float)
+BASE_MAX_JERK = np.array([120.0, 120.0, 400.0], dtype=float)
+
 
 # ----------------------------
 # Math helpers
@@ -823,17 +867,14 @@ class Base:
         self._last_loop_time = time.monotonic()
         self._loop_dt = CONTROL_PERIOD
 
-        # --- S-curve profiling state (kept; now optional per-command) ---
-        self._smooth_active = False  # whether to apply smoothing for the *current* command
-        self._v_prof = np.zeros(3, dtype=float)
-        self._seg_v0 = np.zeros(3, dtype=float)
-        self._seg_v1 = np.zeros(3, dtype=float)
-        self._seg_t = 0.0
-        self._seg_T = 0.0
+        # --- Jerk-limited ramp state (optional per-command) ---
+        self._smooth_active = False  # whether to apply the ramp to the *current* command
+        self._v_prof = np.zeros(3, dtype=float)  # velocity the wheels are being given
+        self._a_prof = np.zeros(3, dtype=float)  # acceleration currently being held
 
-        self._a_max = np.array([1.9, 1.9, 6.5], dtype=float)
-        self._T_min = 0.01
-        self._retarget_eps = 1e-3
+        self._a_max_accel = BASE_MAX_ACCEL.copy()
+        self._a_max_decel = BASE_MAX_DECEL.copy()
+        self._j_max = BASE_MAX_JERK.copy()
 
     def swerve_devices(self) -> dict[int, Any]:
         """{CAN id: SparkFlex} for all eight swerve controllers.
@@ -902,11 +943,11 @@ class Base:
         Module order is MODULE_ORDER: FL, FR, RR, RL.
 
         `v_target` is the velocity the loop was last handed; `v_profiled` is
-        what the S-curve profiler had actually reached when smoothing is on.
-        The two diverge for the length of a segment, and that gap is the
-        profiler's contribution -- worth logging separately from the command,
-        because tuning the base against `v_target` alone attributes the
-        profiler's lag to the wheels.
+        what the jerk-limited ramp had actually reached when smoothing is on.
+        The two diverge while the ramp is converging on a changed command, and
+        that gap is the ramp's contribution -- worth logging separately from
+        the command, because tuning the base against `v_target` alone
+        attributes the ramp's lag to the wheels.
         """
         return {
             "steer_cmd_rad": np.asarray(self.steer_cmd, dtype=float).copy(),
@@ -915,6 +956,16 @@ class Base:
             "drive_cmd_mps": np.asarray(self.drive_cmd, dtype=float).copy(),
             "drive_meas_raw": np.array(
                 [m.get_velocity_raw() for m in self.drive_motors], dtype=float),
+            # Cumulative motor rotations. Logged alongside velocity because it
+            # is the better distance signal: a counter does not accumulate the
+            # sampling error that integrating a 30 Hz-sampled velocity does,
+            # and it is what robot/nav/odometry/swerve_odom.py integrates. With
+            # it in the trajectory log, wheel odometry can be reconstructed
+            # offline and compared against BaseOdometry's commanded-velocity
+            # dead reckoning without another tape run. Same cached status frame
+            # 2 as GetVelocity, so it costs no extra bus traffic.
+            "drive_pos_rot": np.array(
+                [m.get_position_counts() for m in self.drive_motors], dtype=float),
             "v_target": np.asarray(self.base_target, dtype=float).copy(),
             "v_profiled": np.asarray(self._v_prof, dtype=float).copy(),
             "motors_enabled": bool(self._motors_enabled),
@@ -1273,21 +1324,27 @@ class Base:
                 # base should stop driving, not re-aim its wheels.
                 self.drive_cmd = np.zeros(NUM_SWERVES)
 
+                # The drives have been held at zero for longer than the
+                # watchdog, so the robot really is stopped. Clear the ramp too,
+                # or the next command resumes from a profile that describes
+                # motion that is no longer happening.
+                self._v_prof[:] = 0.0
+                self._a_prof[:] = 0.0
+
             else:
                 dt = self._loop_dt
                 v_cmd = self.base_target
 
                 if self._smooth_active:
-                    if np.linalg.norm(v_cmd - self._seg_v1) > self._retarget_eps:
-                        self._start_scurve_segment(v_cmd)
-                    v_used = self._update_scurve(dt)
+                    # No segment to re-plan: the ramp reads the live target
+                    # every tick, so a command that changes mid-move is picked
+                    # up on the next tick rather than after the current profile
+                    # finishes. That is most of the responsiveness.
+                    v_used = self._update_velocity_ramp(v_cmd, dt)
                 else:
-                    # Keep profiling state consistent so enabling smoothing later doesn't jump from stale state
+                    # Keep ramp state consistent so enabling smoothing later doesn't jump from stale state
                     self._v_prof = v_cmd.copy()
-                    self._seg_v0 = v_cmd.copy()
-                    self._seg_v1 = v_cmd.copy()
-                    self._seg_t = 0.0
-                    self._seg_T = 0.0
+                    self._a_prof[:] = 0.0
                     v_used = v_cmd
 
                 wheel_speeds, wheel_angles = self._vehicle_velocity_to_angle_and_speed(
@@ -1323,35 +1380,71 @@ class Base:
         for i, dm in enumerate(self.drive_motors):
             self.drive_vel[i] = dm.get_velocity_raw()
 
-    def _start_scurve_segment(self, v_target: np.ndarray):
+    def _update_velocity_ramp(self, v_target: np.ndarray, dt: float) -> np.ndarray:
+        """Advance the jerk-limited ramp one tick toward ``v_target``.
+
+        Per axis this is a double integrator driven at its jerk limit::
+
+            a += clip(a_desired - a, -j*dt, +j*dt)
+            v += a * dt
+
+        with ``a_desired`` chosen so the ramp lands *on* the target instead of
+        sailing through it. Unlike a low-pass filter it converges in finite
+        time and then tracks exactly, so a held command carries no lag at all.
+        """
         v_target = np.asarray(v_target, dtype=float)
+        v = self._v_prof
+        a = self._a_prof
 
-        if getattr(self, "_seg_T", 0.0) > 0 and np.allclose(v_target, self._seg_v1, atol=1e-3):
-            return
+        dv = v_target - v
 
-        dv = v_target - self._v_prof
-        abs_dv = np.abs(dv)
+        # Is each axis being asked for more speed, or less? Anything that
+        # reduces the magnitude counts as a stop -- including a reversal, which
+        # has to pass through zero first -- and gets the larger deceleration
+        # budget. Once a reversal is through zero the signs agree again and the
+        # axis goes back onto the acceleration budget by itself.
+        speeding_up = (np.abs(v_target) > np.abs(v)) & (v_target * v >= 0.0)
+        a_lim = np.where(speeding_up, self._a_max_accel, self._a_max_decel)
 
-        if np.all(abs_dv < 1e-3):
-            return
+        # Largest acceleration that can still be unwound to zero, at the jerk
+        # limit, within the velocity that is left. Without this the ramp
+        # overshoots every target, since `a` cannot be dropped to zero in a
+        # single tick; near the target it also fades `a` out on its own, which
+        # is the arrival half of the S.
+        #
+        # The continuous bound is sqrt(2*j*|dv|), but riding it exactly is only
+        # marginally feasible: on a discrete tick the ramp ends up a fraction
+        # above the curve, cannot shed `a` fast enough to stay on it, and
+        # arrives with acceleration still on the clock. The -j*dt/2 term is the
+        # discrete correction; it keeps the ramp just inside the feasible
+        # region so it lands with `a` already at zero.
+        j_dt = self._j_max * dt
+        a_arrival = 0.5 * (np.sqrt(j_dt * j_dt + 8.0 * self._j_max * np.abs(dv)) - j_dt)
+        a_desired = np.sign(dv) * np.minimum(a_lim, a_arrival)
 
-        T_needed = np.max((abs_dv * np.pi) / (2.0 * np.maximum(self._a_max, 1e-6)))
-        T = max(self._T_min, float(T_needed))
+        # The jerk limit itself. This is the only thing rounding the start of a
+        # move, so a high _j_max keeps that rounding brief.
+        a = a + np.clip(a_desired - a, -j_dt, j_dt)
 
-        self._seg_v0 = self._v_prof.copy()
-        self._seg_v1 = v_target.copy()
-        self._seg_t = 0.0
-        self._seg_T = T
+        # Integrate, but never step past the target: on a tick that would cross
+        # it, the increment is capped at the error that is actually left. That
+        # is what lands the ramp exactly on the command instead of ringing
+        # around it -- and capping the *step* rather than zeroing `a` is what
+        # keeps the last tick of a move inside the jerk limit, since `a` then
+        # bleeds off at j while v sits pinned on the target. A tick pushing
+        # away from the target (the carry-over acceleration a reversal still
+        # has to unwind) is left alone; that motion is real.
+        step = a * dt
+        step = np.where(
+            step * dv >= 0.0,
+            np.sign(dv) * np.minimum(np.abs(step), np.abs(dv)),
+            step,
+        )
+        v = v + step
 
-    def _update_scurve(self, dt: float) -> np.ndarray:
-        if self._seg_T <= 1e-9:
-            return self._v_prof
-
-        self._seg_t = min(self._seg_t + dt, self._seg_T)
-        tau = self._seg_t / self._seg_T
-        s = 0.5 * (1.0 - np.cos(np.pi * tau))
-        self._v_prof = self._seg_v0 + (self._seg_v1 - self._seg_v0) * s
-        return self._v_prof
+        self._v_prof = v
+        self._a_prof = a
+        return v
 
     def _vehicle_velocity_to_angle_and_speed(
         self, u_3dof: np.ndarray, cos_error_scaling: bool = True

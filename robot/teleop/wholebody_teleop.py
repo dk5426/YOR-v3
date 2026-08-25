@@ -111,6 +111,13 @@ class TeleopCommand:
     left_target: Optional[mink.SE3] = None
     right_target: Optional[mink.SE3] = None
     lift_target: Optional[float] = None
+    # Gripper: 1.0 open, 0.0 closed. Set only on a change, never every tick --
+    # the server applies a gripper value by sending the arm a joint target of
+    # its *measured* pose, which competes with the interpolated targets the
+    # whole-body dispatch loop is streaming. One command per open/close is a
+    # blip the next dispatch tick corrects; one per tick would fight it.
+    left_gripper: Optional[float] = None
+    right_gripper: Optional[float] = None
     home_left: bool = False
     home_right: bool = False
     home_arms: bool = False
@@ -317,6 +324,7 @@ class OculusSource(InputSource):
 
     VR_CONTROLLER_TOPIC = b"oculus_controller"
     LIFT_SPEED = 0.15  # m/s at full stick
+    GRIPPER_TRIGGER_THRESHOLD = 0.5  # index trigger past this = closed
 
     def __init__(self, host: str, port: int = 5555, pose_filter: bool = True,
                  filter_min_cutoff: float = 3.0, filter_beta: float = 8.0,
@@ -373,6 +381,10 @@ class OculusSource(InputSource):
         self._clutch: dict[str, tuple[mink.SE3, mink.SE3]] = {}
         self._debounce: dict[str, float] = {}
         self._button_down: dict[str, bool] = {}
+        # Last gripper value actually sent per side, so update() can send on
+        # change only. Cleared on disengage: whatever the operator holds when
+        # they re-engage is then re-sent, rather than assumed still in effect.
+        self._gripper_sent: dict[str, Optional[float]] = {"left": None, "right": None}
 
     def start(self) -> None:
         import zmq  # deferred so keyboard mode needs no zmq
@@ -507,22 +519,36 @@ class OculusSource(InputSource):
         cs, poses = latest
         home_pressed: dict[str, bool] = {}
 
-        for side, engage_btn, home_btn, ctrl_T, tgt_attr in (
-            ("left",  cs.left_x,  cs.left_y,  poses["left"],  "left_target"),
-            ("right", cs.right_a, cs.right_b, poses["right"], "right_target"),
+        for side, engage_btn, home_btn, ctrl_T, tgt_attr, trigger in (
+            ("left",  cs.left_x,  cs.left_y,  poses["left"],  "left_target",
+             cs.left_index_trigger),
+            ("right", cs.right_a, cs.right_b, poses["right"], "right_target",
+             cs.right_index_trigger),
         ):
             if self._debounced(f"{side}_engage", engage_btn):
                 self._engaged[side] = not self._engaged[side]
                 if self._engaged[side]:
                     self._clutch[side] = (ctrl_T, getattr(state, tgt_attr))
+                else:
+                    self._gripper_sent[side] = None
                 print(f"[oculus] {side} {'engaged' if self._engaged[side] else 'disengaged'}")
             home_pressed[side] = self._debounced(f"{side}_home", home_btn)
             if home_pressed[side]:
                 self._engaged[side] = False
+                self._gripper_sent[side] = None
                 setattr(cmd, f"home_{side}", True)
             if self._engaged[side]:
                 X_Cinit, X_ee_init = self._clutch[side]
                 setattr(cmd, tgt_attr, self._ee_target(X_Cinit, X_ee_init, ctrl_T))
+                # Index trigger is the grip: squeezed closes, released opens.
+                # Thresholded rather than passed through as an analogue value
+                # because the servo is driven to a calibrated open/close pair,
+                # and because a continuous stream would re-command the arm's
+                # measured pose on every tick (see TeleopCommand.left_gripper).
+                grip = 0.0 if trigger > self.GRIPPER_TRIGGER_THRESHOLD else 1.0
+                if grip != self._gripper_sent[side]:
+                    self._gripper_sent[side] = grip
+                    setattr(cmd, f"{side}_gripper", grip)
 
         if home_pressed.get("left") and home_pressed.get("right"):
             cmd.home_left = False
@@ -606,17 +632,36 @@ class WholeBodyTeleop:
             st.collision_avoidance = self.yor.toggle_collision_avoidance()
             print(f"\n[teleop] collision_avoidance = {st.collision_avoidance}")
 
-        # Targets: send atomically when both move, individually otherwise
+        # Targets: send atomically when both move, individually otherwise.
+        # A gripper change rides along with the pose it belongs to; it only
+        # travels on its own when that arm sent no pose this tick.
         if cmd.left_target is not None and cmd.right_target is not None:
             st.left_target, st.right_target = cmd.left_target, cmd.right_target
             self.yor.set_bimanual_ee_target(
-                L_ee_target=st.left_target, R_ee_target=st.right_target)
+                L_ee_target=st.left_target, R_ee_target=st.right_target,
+                L_gripper_target=cmd.left_gripper,
+                R_gripper_target=cmd.right_gripper)
         elif cmd.left_target is not None:
             st.left_target = cmd.left_target
-            self.yor.set_left_ee_target(ee_target=st.left_target)
+            self.yor.set_left_ee_target(ee_target=st.left_target,
+                                        gripper_target=cmd.left_gripper)
+            if cmd.right_gripper is not None:
+                self.yor.set_right_ee_target(ee_target=st.right_target,
+                                             gripper_target=cmd.right_gripper)
         elif cmd.right_target is not None:
             st.right_target = cmd.right_target
-            self.yor.set_right_ee_target(ee_target=st.right_target)
+            self.yor.set_right_ee_target(ee_target=st.right_target,
+                                         gripper_target=cmd.right_gripper)
+            if cmd.left_gripper is not None:
+                self.yor.set_left_ee_target(ee_target=st.left_target,
+                                            gripper_target=cmd.left_gripper)
+        else:
+            if cmd.left_gripper is not None:
+                self.yor.set_left_ee_target(ee_target=st.left_target,
+                                            gripper_target=cmd.left_gripper)
+            if cmd.right_gripper is not None:
+                self.yor.set_right_ee_target(ee_target=st.right_target,
+                                             gripper_target=cmd.right_gripper)
 
         if cmd.lift_target is not None:
             st.lift_target = cmd.lift_target

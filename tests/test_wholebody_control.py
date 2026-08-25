@@ -297,6 +297,160 @@ def test_base_motion():
           f"pose {wbc.odometry.pose.round(3)}")
 
 
+def test_yaw_filter_and_hysteresis():
+    """The yaw dispatch path: filter + hysteresis deadband, added 2026-08-24.
+
+    The failure this guards against was measured, not hypothetical: solver yaw
+    noise straddling a single 0.02 threshold sent one-tick rotation pulses at
+    7.4/s, each of which re-aimed all four swerve modules. The contract is:
+    single-tick pulses die in the filter, sustained rotation passes, a request
+    hovering between the exit and entry thresholds does not toggle, and losing
+    base authority resets the filter state.
+
+    The deadband defaults to 0/0 (disabled) since 2026-08-25 -- with the
+    filter carrying noise rejection, the deadband caused start-stop bursts
+    on the floor. The mechanism stays (restorable via --base-yaw-deadband),
+    so this test pins explicit thresholds rather than the defaults.
+    """
+    print("\nyaw filter and hysteresis deadband")
+    wbc, left, right, base = build()
+    cfg = wbc.config
+    cfg.base_yaw_deadband, cfg.base_yaw_deadband_exit = 0.05, 0.025
+
+    check("the deadband is disabled by default",
+          type(cfg).base_yaw_deadband == 0.0
+          and type(cfg).base_yaw_deadband_exit == 0.0)
+
+    # A single-tick pulse at the old chatter magnitude produces no rotation.
+    wbc._yaw_filt, wbc._yaw_active = 0.0, False
+    out = [wbc._filter_yaw(0.03)] + [wbc._filter_yaw(0.0) for _ in range(30)]
+    check("a single-tick pulse never leaves the deadband",
+          all(v == 0.0 for v in out), f"max {max(np.abs(out)):.4f}")
+
+    # A sustained real rotation passes, at close to its asked rate.
+    wbc._yaw_filt, wbc._yaw_active = 0.0, False
+    for _ in range(60):
+        last = wbc._filter_yaw(0.3)
+    check("a sustained request passes the deadband", last != 0.0, f"{last:.3f}")
+    check("and converges to the asked rate", abs(last - 0.3) < 0.01, f"{last:.3f}")
+
+    # Hovering inside the hysteresis gap must not toggle: once rotating at a
+    # rate between exit and entry, rotation continues; once stopped, the same
+    # rate never starts it.
+    gap = 0.5 * (cfg.base_yaw_deadband + cfg.base_yaw_deadband_exit)
+    still_on = [wbc._filter_yaw(gap) for _ in range(30)]
+    check("a request inside the gap keeps an active rotation alive",
+          all(v != 0.0 for v in still_on))
+    wbc._yaw_filt, wbc._yaw_active = 0.0, False
+    stay_off = [wbc._filter_yaw(gap * 0.999) for _ in range(5)]
+    # the filter converges toward `gap`, which is below entry — never activates
+    stay_off += [wbc._filter_yaw(gap * 0.999) for _ in range(60)]
+    check("the same request from rest never starts one",
+          all(v == 0.0 for v in stay_off))
+
+    # A one-tick solver spike is clamped before it charges the filter.
+    wbc._yaw_filt, wbc._yaw_active = 0.0, False
+    first = wbc._filter_yaw(12.0)
+    check("a 12 rad/s spike charges the filter with at most one clamped tick",
+          abs(wbc._yaw_filt) <= cfg.base_max_ang_vel * (wbc.dt / (cfg.base_yaw_filter_tau + wbc.dt)) + 1e-9,
+          f"filt {wbc._yaw_filt:.4f}")
+
+    # Losing base authority forgets the filter state.
+    wbc._yaw_filt, wbc._yaw_active = 0.4, True
+    wbc.toggle_fix_base(True)
+    class _R: base_position = np.zeros(3)
+    wbc._dispatch_base(_R())
+    check("losing base authority resets the yaw filter",
+          wbc._yaw_filt == 0.0 and not wbc._yaw_active,
+          f"filt {wbc._yaw_filt}, active {wbc._yaw_active}")
+    wbc.toggle_fix_base(False)
+
+
+def test_base_pose_dispatch():
+    """The base is driven by the solver's *pose*, not its per-tick velocity.
+
+    Everything here is about the property the velocity path could not have:
+    an error that the wheels have not worked off yet is still an error on the
+    next cycle. Under the old dispatch a tick whose velocity was clamped,
+    deadbanded or filtered away simply lost that motion, because the next
+    solve's velocity said nothing about the shortfall.
+    """
+    print("\nbase pose dispatch")
+    wbc, left, right, base = build()
+
+    class _R:
+        # Where the solver wants the chassis: 0.5 m ahead (the robot faces -Y)
+        # and a quarter turn round. Deliberately carries a zero base_velocity,
+        # which under the old dispatch would have meant "do not move".
+        base_position = np.array([0.0, -0.5, 0.4])
+        base_velocity = np.zeros(3)
+
+    wbc.odometry.reset(np.zeros(3))
+    wbc.base_pose.reset()
+    base.velocity_commands.clear()
+    wbc._dispatch_base(_R())
+    first = base.velocity_commands[-1]
+    check("a pose error drives the base even at zero solver velocity",
+          first[0] > 0.0 and first[2] > 0.0, str(first.round(4)))
+    check("the dispatch telemetry carries the target and the error",
+          np.allclose(wbc._base_dispatch["target"], _R.base_position)
+          and wbc._base_dispatch["err"][0] > 0.0,
+          str(wbc._base_dispatch["err"].round(4)))
+
+    # The pose controller must resolve the error in the same frame the rest of
+    # this file uses; a disagreement would drive the base sideways.
+    for yaw in (0.0, 0.6, -2.4):
+        wbc.odometry.reset(np.array([0.0, 0.0, yaw]))
+        world = np.array([0.3, -0.2])
+        fwd, lat, _ = wbc._world_to_body(np.array([world[0], world[1], 0.0]))
+        err = wbc.base_pose._to_body(world[0], world[1], yaw)
+        agree = abs(err[0] - fwd) < 1e-9 and abs(err[1] - lat) < 1e-9
+        check(f"pose error and _world_to_body agree at yaw {yaw}", agree,
+              f"{np.round(err, 4)} vs {(round(fwd, 4), round(lat, 4))}")
+
+    # Closed loop: odometry integrates what was commanded, so repeated
+    # dispatch against a standing target has to converge onto it.
+    wbc.odometry.reset(np.zeros(3))
+    wbc.base_pose.reset()
+    base.velocity_commands.clear()
+    for _ in range(400):
+        wbc._dispatch_base(_R())
+    pose = wbc.odometry.pose
+    lin_err = float(np.hypot(*(_R.base_position[:2] - pose[:2])))
+    yaw_err = abs(float(pose[2] - _R.base_position[2]))
+    check("the base converges onto the pose the solver asked for",
+          lin_err < 0.02 and yaw_err < 0.02,
+          f"lin {lin_err*1e3:.1f} mm, yaw {math.degrees(yaw_err):.2f} deg")
+    check("and settles instead of hunting",
+          np.max(np.abs(base.velocity_commands[-1])) < 0.01,
+          str(base.velocity_commands[-1].round(4)))
+
+    # Losing authority resets the PD: while the base is not ours the measured
+    # pose can move without us, and the first cycle back must not damp against
+    # motion it never commanded.
+    for name, take_authority, give_back in (
+        ("fix_base", lambda: wbc.toggle_fix_base(True), lambda: wbc.toggle_fix_base(False)),
+        ("a disabled base", lambda: wbc.toggle_base_motion(False),
+         lambda: wbc.toggle_base_motion(True)),
+        ("a manual override", wbc.notify_manual_base_command,
+         lambda: setattr(wbc, "_manual_base_until", 0.0)),
+    ):
+        wbc.odometry.reset(np.zeros(3))
+        wbc._dispatch_base(_R())          # give the PD some history
+        take_authority()
+        wbc._dispatch_base(_R())
+        check(f"{name} resets the pose PD",
+              wbc.base_pose._last_pose is None
+              and np.allclose(wbc.base_pose.measured_velocity, 0.0)
+              and not wbc._base_dispatch["active"])
+        give_back()
+
+    stopped, *_ = build(enable_base_motion=True)
+    stopped._dispatch_base(_R())
+    stopped.emergency_stop()
+    check("an e-stop resets the pose PD too", stopped.base_pose._last_pose is None)
+
+
 def test_fix_base_and_toggles():
     print("\nfix_base / base-motion toggles")
     wbc, left, right, base = build()
@@ -581,14 +735,20 @@ def test_trajectory_log():
           all(len(r) == len(header) for r in rows[len(config_rows) + 1:]))
 
     last = data[-1]
+    # atol, because the column holds six decimals: half an ulp of that is
+    # larger than the default relative tolerance on a command of a few
+    # centimetres per second, and what is under test is the plumbing.
     check("the base command it actually sent is logged",
           last["base_active"] == "True"
-          and np.isclose(float(last["base_sent_0"]), base.velocity_commands[-1][0])
-          and np.isclose(float(last["base_sent_1"]), base.velocity_commands[-1][1]),
+          and np.isclose(float(last["base_sent_0"]), base.velocity_commands[-1][0],
+                         atol=1e-6)
+          and np.isclose(float(last["base_sent_1"]), base.velocity_commands[-1][1],
+                         atol=1e-6),
           f"{last['base_sent_0']},{last['base_sent_1']} vs {base.velocity_commands[-1]}")
-    check("the solver's unclamped request is logged alongside it",
+    check("the pose error and the unshaped request are logged alongside it",
           all(math.isfinite(float(last[k]))
-              for k in ("base_req_vx", "base_req_vy", "base_req_wz")))
+              for k in ("base_err_fwd", "base_err_lat", "base_err_yaw",
+                        "base_req_fwd", "base_req_lat", "base_req_yaw")))
     check("the lift goal and measurement are logged",
           last["lift_active"] == "True"
           and abs(float(last["lift_goal"]) - 0.5) < 1e-9
@@ -606,6 +766,7 @@ def test_trajectory_log():
         "steer_cmd_rad": np.array([0.1, 0.2, 0.3, 0.4]),
         "steer_meas_rad": np.array([0.11, 0.19, 0.31, 0.39]),
         "drive_cmd_mps": np.full(4, 0.25), "drive_meas_raw": np.full(4, 0.24),
+        "drive_pos_rot": np.array([10.5, 11.5, 12.5, 13.5]),
     }
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "traj2.csv"
@@ -614,6 +775,10 @@ def test_trajectory_log():
         wbc._trajectory_recorder.close()
         rows = list(csv.reader(path.read_text().splitlines()))
     row = dict(zip(rows[2], rows[3]))
+    check("cumulative drive position is logged when available",
+          abs(float(row["drive_pos_FL"]) - 10.5) < 1e-9
+          and abs(float(row["drive_pos_RL"]) - 13.5) < 1e-9,
+          str({k: row[k] for k in ("drive_pos_FL", "drive_pos_RL")}))
     check("module commanded/measured pairs are logged when available",
           abs(float(row["steer_cmd_FL"]) - 0.1) < 1e-9
           and abs(float(row["steer_meas_FL"]) - 0.11) < 1e-9
@@ -631,6 +796,8 @@ def main() -> int:
         test_lift_servo,
         test_lift_without_feedback,
         test_base_motion,
+        test_yaw_filter_and_hysteresis,
+        test_base_pose_dispatch,
         test_fix_base_and_toggles,
         test_manual_override,
         test_emergency_stop_resume,

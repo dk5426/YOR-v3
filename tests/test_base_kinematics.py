@@ -45,6 +45,8 @@ class FakeSpark:
         self.velocity_setpoints: list[float] = []
         self.heartbeats = 0
         self.idle_mode = None
+        self.position_rot = 0.0
+        self._pos_t = time.monotonic()
         self.ctrl_type = None
         self.status2_period = None
 
@@ -64,7 +66,14 @@ class FakeSpark:
     def GetVelocity(self):
         return self.velocity_setpoints[-1] if self.velocity_setpoints else 0.0
 
-    def GetPosition(self): return 0.0
+    # Cumulative motor rotations, advanced by whatever velocity was last set,
+    # so a test can check the counter actually moves with the wheel.
+    def GetPosition(self):
+        now = time.monotonic()
+        self.position_rot += self.velocity_setpoints[-1] * (now - self._pos_t) \
+            if self.velocity_setpoints else 0.0
+        self._pos_t = now
+        return self.position_rot
     def GetIdleModeRaw(self): return 0
     def GetCtrlType(self): return 1
     def GetVelocityConversionFactor(self): return 0.00083203
@@ -298,8 +307,11 @@ def test_axis_map_is_not_crossed() -> None:
 
     check("forward is element 0", amap.forward_index == 0)
     check("lateral is element 1", amap.lateral_index == 1)
+    # Matched on the array literal rather than on the name it is assigned to:
+    # the invariant under test is the element order, and the assignment has
+    # since been renamed (it feeds apply_deadzone directly).
     check("the joystick agrees: it has always put its forward stick in element 0",
-          "target_velocity = np.array([vx, vy, w]"
+          "np.array([vx, vy, w]"
           in (_REPO / "robot/teleop/joystick.py").read_text())
 
 
@@ -323,8 +335,21 @@ def test_linear_limits_preserve_direction() -> None:
     print("\nlinear deadband and clamp")
     from robot.wholebody_control import WholeBodyController, WholeBodyHardwareConfig
 
+    # Probes of the geometry, so the two stages _limit_linear also owns are
+    # switched off here: the low-pass would make every probe depend on the one
+    # before it, and the deadbands ship at 0 since 2026-08-25 (the filter
+    # carries noise rejection now), which would make every threshold check
+    # vacuous. Both are pinned to the values the mechanism was built against
+    # and are exercised as filters in tests/test_wholebody_control.py.
     wbc = WholeBodyController.__new__(WholeBodyController)
-    wbc.config = WholeBodyHardwareConfig()
+    wbc.config = WholeBodyHardwareConfig(
+        base_vel_filter_tau=0.0,
+        base_vel_deadband=0.05, base_vel_deadband_exit=0.05,
+        base_yaw_deadband=0.05,
+    )
+    wbc.dt = 1.0 / wbc.config.control_hz
+    wbc._lin_filt = (0.0, 0.0)
+    wbc._lin_active = False
     dead = wbc.config.base_vel_deadband
     limit = wbc.config.base_max_lin_vel
 
@@ -532,24 +557,74 @@ def test_steering_feedback_is_closed() -> None:
           bool(np.all(np.abs(np.abs(speeds) - 0.25) < 1e-9)), str(np.round(speeds, 4)))
 
 
-def test_scurve_uses_measured_time() -> None:
-    print("\nS-curve profiler")
-    base = bare_base()
-    base._v_prof = np.zeros(3)
-    base._seg_v0 = np.zeros(3)
-    base._seg_v1 = np.array([0.25, 0.0, 0.0])
-    base._seg_t, base._seg_T = 0.0, 0.10
+def test_velocity_ramp_respects_its_limits() -> None:
+    """The ramp's contract, which is not the S-curve's.
 
-    half = base._update_scurve(0.05).copy()
-    check("half a segment is half-way through the raised cosine",
-          abs(half[0] - 0.125) < 1e-9, f"{half[0]:.4f}")
-    done = base._update_scurve(0.05).copy()
-    check("the segment completes", abs(done[0] - 0.25) < 1e-9, f"{done[0]:.4f}")
+    The old raised-cosine profiler planned a fixed-duration segment and was
+    tested on the shape of that segment. The ramp has no segment: it reads the
+    live target every tick and is bounded by acceleration and jerk instead. So
+    the checks are on those bounds, on landing exactly, and on the asymmetry
+    that makes stops quicker than starts.
+    """
+    print("\nvelocity ramp")
+    dt = bm.CONTROL_PERIOD
 
-    base._seg_t, base._seg_T, base._v_prof = 0.0, 0.10, np.zeros(3)
-    slow = base._update_scurve(0.10).copy()
-    check("a slow tick advances further than a fast one",
-          slow[0] > half[0], f"{slow[0]:.4f} vs {half[0]:.4f}")
+    def run(target, ticks=1200, base=None):
+        if base is None:
+            base = bare_base()
+            base._v_prof = np.zeros(3)
+            base._a_prof = np.zeros(3)
+            base._a_max_accel = bm.BASE_MAX_ACCEL.copy()
+            base._a_max_decel = bm.BASE_MAX_DECEL.copy()
+            base._j_max = bm.BASE_MAX_JERK.copy()
+        accels, jerks, prev = [], [], base._a_prof.copy()
+        settle = None
+        for i in range(ticks):
+            v = base._update_velocity_ramp(np.asarray(target, float), dt).copy()
+            accels.append(base._a_prof.copy())
+            jerks.append((base._a_prof - prev) / dt)
+            prev = base._a_prof.copy()
+            if settle is None and np.all(np.abs(np.asarray(target, float) - v) < 1e-9):
+                settle = i * dt
+        return base, np.array(accels), np.array(jerks), settle
+
+    base, acc, jerk, t_up = run([0.25, 0.0, 0.0])
+    check("acceleration stays inside BASE_MAX_ACCEL",
+          acc[:, 0].max() <= bm.BASE_MAX_ACCEL[0] + 1e-9,
+          f"{acc[:, 0].max():.3f} <= {bm.BASE_MAX_ACCEL[0]}")
+    check("jerk stays inside BASE_MAX_JERK",
+          np.abs(jerk[:, 0]).max() <= bm.BASE_MAX_JERK[0] + 1e-6,
+          f"{np.abs(jerk[:, 0]).max():.1f} <= {bm.BASE_MAX_JERK[0]}")
+    check("the ramp lands exactly on the target, with no overshoot",
+          base._v_prof[0] == 0.25 and base._a_prof[0] == 0.0,
+          f"v={base._v_prof[0]:.9f} a={base._a_prof[0]:.9f}")
+
+    # Holding the same command must not drift: this is the property a low-pass
+    # filter cannot offer, and the reason the ramp replaced one.
+    for _ in range(200):
+        base._update_velocity_ramp(np.array([0.25, 0.0, 0.0]), dt)
+    check("a held command is tracked exactly, with no residual lag",
+          base._v_prof[0] == 0.25, f"{base._v_prof[0]:.9f}")
+
+    _, dec, _, t_down = run([0.0, 0.0, 0.0], base=base)
+    check("deceleration is allowed to exceed acceleration",
+          np.abs(dec[:, 0]).max() > acc[:, 0].max(),
+          f"{np.abs(dec[:, 0]).max():.3f} > {acc[:, 0].max():.3f}")
+    check("deceleration stays inside BASE_MAX_DECEL",
+          np.abs(dec[:, 0]).max() <= bm.BASE_MAX_DECEL[0] + 1e-9,
+          f"{np.abs(dec[:, 0]).max():.3f} <= {bm.BASE_MAX_DECEL[0]}")
+    check("so a stop settles quicker than the matching start",
+          t_down < t_up, f"stop {t_down * 1e3:.0f} ms < start {t_up * 1e3:.0f} ms")
+
+    # A reversal has to shed speed before it can build it in the other
+    # direction, so the whole approach to zero is on the deceleration budget.
+    rev, racc, _, _ = run([0.20, 0.0, 0.0])
+    _, racc2, _, _ = run([-0.20, 0.0, 0.0], base=rev)
+    check("a reversal passes through zero rather than jumping sign",
+          rev._v_prof[0] == -0.20, f"{rev._v_prof[0]:.9f}")
+    check("and stays inside the deceleration budget while doing it",
+          np.abs(racc2[:, 0]).max() <= bm.BASE_MAX_DECEL[0] + 1e-9,
+          f"{np.abs(racc2[:, 0]).max():.3f}")
 
     check("the loop measures its own dt rather than assuming the nominal one",
           "self._loop_dt" in (_REPO / "robot/base_motor.py").read_text())
@@ -628,6 +703,106 @@ def test_control_loop_end_to_end() -> None:
           str(np.round(np.degrees(stopped["steer_meas_rad"]), 1)))
     check("telemetry reports the motors as enabled while commands arrive",
           driving["motors_enabled"] is True)
+    check("cumulative drive position is reported",
+          "drive_pos_rot" in stopped and stopped["drive_pos_rot"].size == 4,
+          str(stopped.get("drive_pos_rot")))
+    check("...and it advanced while the wheels turned",
+          bool(np.all(np.abs(stopped["drive_pos_rot"]) > np.abs(driving["drive_pos_rot"]) - 1e-9)
+               and np.any(np.abs(stopped["drive_pos_rot"]) > 1e-9)),
+          f"{np.round(driving['drive_pos_rot'],4)} -> {np.round(stopped['drive_pos_rot'],4)}")
+
+
+def test_swerve_recorder() -> None:
+    """Per-module logging must not depend on whole-body control.
+
+    The trajectory CSV only exists when a WholeBodyController does, so
+    `yor.py --no-arms` -- which is how the base gets driven from joystick.py --
+    recorded nothing at all, and even with arms it sampled at the 30 Hz solve
+    rate rather than the 50 Hz the SPARKs publish at.
+    """
+    print("\nswerve recorder")
+    import csv as _csv
+    import tempfile
+    from robot.swerve_log import DEFAULT_HZ, SwerveRecorder
+
+    class FakeBase:
+        def __init__(self): self.t0 = time.monotonic(); self.fail = False
+        def swerve_telemetry(self):
+            if self.fail:
+                raise RuntimeError("bus dropped")
+            return {"motors_enabled": True,
+                    "v_target": np.array([0.2, 0.0, 0.0]),
+                    "v_profiled": np.array([0.19, 0.0, 0.0]),
+                    "steer_cmd_rad": np.zeros(4),
+                    "steer_meas_rad": np.array([0.01, np.nan, 0.02, 0.0]),
+                    "drive_cmd_mps": np.full(4, 0.2),
+                    "drive_meas_raw": np.full(4, 0.21),
+                    "drive_pos_rot": np.full(4, (time.monotonic() - self.t0) * 4.0)}
+
+    check("the default rate matches the SPARK status 2 period (20 ms)",
+          abs(DEFAULT_HZ - 50.0) < 1e-9, str(DEFAULT_HZ))
+
+    base = FakeBase()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "s.csv"
+        rec = SwerveRecorder(path, base, bm.MODULE_ORDER, sample_hz=100.0,
+                             config_notes=["base_pid=whatever", "sample_hz=100.0"])
+        rec.start()
+        time.sleep(0.3)
+        base.fail = True          # a bus hiccup must not take the thread down
+        time.sleep(0.1)
+        base.fail = False
+        time.sleep(0.2)
+        rec.stop()
+        rows = list(_csv.reader(path.read_text().splitlines()))
+
+    hdr, data = rows[1], rows[2:]
+    check("a config row is stamped", rows[0][0].startswith("# base_pid="), rows[0][0][:30])
+    check("every module gets all five signals",
+          all(f"{g}_{m}" in hdr for g in
+              ("steer_cmd", "steer_meas", "drive_cmd", "drive_meas", "drive_pos")
+              for m in bm.MODULE_ORDER), str(len(hdr)))
+    check("rows are the full width", all(len(r) == len(hdr) for r in data))
+    check("it sampled at roughly the requested rate", 30 < len(data) < 60, f"{len(data)} rows")
+    check("a missing reading stays nan rather than becoming zero",
+          data[0][hdr.index("steer_meas_FR")] == "nan",
+          data[0][hdr.index("steer_meas_FR")])
+    check("the recorder survived the telemetry failure",
+          any(r for r in data[len(data) // 2:]), f"{len(data)} rows total")
+    pos = [float(r[hdr.index("drive_pos_FL")]) for r in data]
+    check("cumulative position advances monotonically",
+          all(b >= a - 1e-9 for a, b in zip(pos, pos[1:])), f"{pos[0]:.3f} -> {pos[-1]:.3f}")
+
+
+def test_yor_starts_the_swerve_log_with_the_base() -> None:
+    """Read from source: importing robot/yor.py needs nerolib and a CAN bus."""
+    print("\nrobot/yor.py swerve-log wiring")
+    import ast as _ast
+    source = (_REPO / "robot/yor.py").read_text()
+    tree = _ast.parse(source)
+    init = next(item for node in _ast.walk(tree)
+                if isinstance(node, _ast.ClassDef) and node.name == "YOR"
+                for item in node.body
+                if isinstance(item, _ast.FunctionDef) and item.name == "init")
+    calls = [_ast.unparse(n.func) for n in _ast.walk(init)
+             if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute)]
+    check("init() starts the swerve log", "self._start_swerve_log" in calls, str(calls[:6]))
+    check("...right after the base control loop, not inside the whole-body branch",
+          "self.base.start_control" in calls
+          and calls.index("self.base.start_control") < calls.index("self._start_swerve_log")
+          and calls.index("self._start_swerve_log") < calls.index("self.base.lift_home"),
+          str(calls))
+
+    shutdown = source.split("def graceful_shutdown")[1].split("atexit.register")[0]
+    check("shutdown stops it before the base loop goes down",
+          shutdown.index("stop_swerve_log") < shutdown.index("yor.base.stop_control"))
+
+    main_body = source.split("def main()")[1]
+    check("the command line exposes the switch", "--swerve-log" in main_body)
+    check("and the rate", "--swerve-log-hz" in main_body)
+    check("both reach the constructor",
+          "swerve_log=args.swerve_log" in main_body
+          and "swerve_log_hz=args.swerve_log_hz" in main_body)
 
 
 def main() -> int:
@@ -642,9 +817,11 @@ def main() -> int:
         test_deadband_keeps_the_base_out_of_the_bad_regime,
         test_drive_scale_travels_with_the_gain_set,
         test_steering_feedback_is_closed,
-        test_scurve_uses_measured_time,
+        test_velocity_ramp_respects_its_limits,
         test_controller_setup_is_applied_and_reported,
         test_control_loop_end_to_end,
+        test_swerve_recorder,
+        test_yor_starts_the_swerve_log_with_the_base,
     ):
         test()
 

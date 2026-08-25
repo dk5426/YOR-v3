@@ -253,6 +253,14 @@ class WholeBodyIKConfig:
     # Optional manipulability maximisation. OFF by default: the gradient is
     # finite-differenced (7 perturbed Jacobians per arm per iteration), which
     # is the most expensive thing in the solve when enabled.
+    #
+    # NOTE (2026-08-25): with the gate defaults below, enabling the flag is
+    # pure cost -- manipulability_gate_on = 0.02 sits far below the operating
+    # mu of ~0.042, so the gate never opens; measured on the 2026-08-24
+    # replay it gives mu_p05 identical to shipped for 2.4x the solve time.
+    # Re-tune the gates before expecting this flag to have any effect. The
+    # base-weight gate (base_weight_gate_on/-_full) reaches +32% mu_p05 for
+    # +0% solve time and is the mechanism actually in use.
     enable_manipulability: bool = False
     manipulability_weight: float = 0.5
     # Step size in radians along the (normalised) ascent direction, per
@@ -267,9 +275,106 @@ class WholeBodyIKConfig:
     manipulability_gate_full: float = 0.005
     manipulability_fd_step: float = 1e-4
 
-    # Tikhonov term on z in the secondary solve. N is rank-deficient by
-    # construction, so this is what makes the normal equations well posed;
-    # it also bounds z's component outside range(N) to zero.
+    # base_velocity_continuity was removed on 2026-08-25. It carried a
+    # fraction of the previous base velocity into the next solve as a warm
+    # start (dq = dq_ref + J^+(b - J dq_ref)). The 0.80 default was derived
+    # as 1 - dt/0.167 from a chassis lag figure that actually decomposes
+    # into ~125 ms of *transport delay* plus only ~27 ms of first-order time
+    # constant; a first-order carry is the right shape for a lag and does
+    # nothing for a delay. Swept 0.0/0.5/0.9/0.97 on the 2026-08-24 replay
+    # at both the shipped and an open base weight: every metric was
+    # identical, EE p95 moved by <0.02 mm. If chassis lag needs solver-side
+    # compensation, re-derive against a measured lag (feed-forward of the
+    # transport delay is the mechanism-matched shape), don't resurrect the
+    # carry.
+
+    # Cost multiplier on base DOFs in the primary solve, relative to 1.0 for
+    # every arm and lift DOF. 1.0 is the unweighted damped inverse and is
+    # arithmetically identical to having no weighting at all.
+    #
+    # Raising it is what makes "base motion is emergent" true rather than
+    # aspirational. Unweighted, the base answers 24% of a pure 2 mm EE noise
+    # input, because it has the most leverage per unit of joint motion; the
+    # base then chases tracker jitter and reverses direction every other tick.
+    # See docs/BASE_COMMAND_LOOP_REVIEW.md and the 2026-08-24 analysis.
+    # 100 is the knee measured on 2026-08-24: against pure 2 mm EE noise it
+    # takes the fraction of ticks whose base command clears the dispatch
+    # deadband from 71.3% to 0.7%, while a target 0.60 m beyond arm reach
+    # still rolls the base 0.31 m and converges to 0.00 mm. Weight 30 only
+    # reaches 26.7%. Preference, not prohibition: when the arms cannot reach,
+    # the primary term supplies base motion no null-space weight can cancel.
+    base_motion_weight: float = 100.0
+
+    # What that cost falls to when the arms are running out of posture, and
+    # the manipulability band it falls across. Noise rejection is not lost,
+    # because tracker noise arrives while the arms are still comfortable and
+    # the gate is shut.
+    #
+    # Band re-picked on the 2026-08-24 replay corpus. mu is 0.0506 at the
+    # home keyframe; the earlier band (0.045/0.025) sat entirely *below*
+    # that, so the chassis was only recruited after the posture had already
+    # degraded -- the opposite of what this gate is documented to do. With
+    # gate_on above home the base moves *so that* the posture does not
+    # degrade: measured over 55 replay windows, arm reach while driving
+    # 0.890 -> 0.807, manipulability p05 +32%, EE error p95 0.769 ->
+    # 0.646 mm, at the cost of ~2.5x more base path.
+    #
+    # The floor is 10, not 1: it keeps the linear DOFs above
+    # base_motion_weight_yaw when the gate opens, so yaw stays the cheap
+    # route into the base. Measured with the floor at 1 the yaw split below
+    # does nothing (yaw_share 0.065 vs 0.209 with the floor).
+    base_motion_weight_min: float = 10.0
+    base_weight_gate_on: float = 0.065
+    base_weight_gate_full: float = 0.050
+
+    # Cost multiplier on the base YAW dof, independent of base_motion_weight,
+    # which applies to base_x/base_y only. 1.0 = as cheap as an arm joint.
+    # What matters is the RATIO to the linear weight, not the absolute value:
+    # with both cheap the minimum-norm solve still reaches with the arms.
+    # Measured on the 2026-08-24 replay (with the gate band above and the
+    # min-10 floor): chassis share of demanded yaw 0.038 -> 0.209.
+    # (A hardware trial at 5.0 on 2026-08-25 killed chassis yaw outright --
+    # the requested |wz| p95 fell to 0.000 rad/s. Smooth the yaw at the
+    # dispatch filter instead of pricing it out here.)
+    base_motion_weight_yaw: float = 1.0
+
+    # Null-space base recentering: continuously prefer rolling the chassis
+    # toward the pose that restores the hands' latched home-pose offset from
+    # the base, at gain * distance, capped at max_vel, instead of preferring
+    # zero base motion. Added 2026-08-25.
+    #
+    # Why: this is a velocity IK -- the base is only ever asked to move
+    # while the hand targets are moving, so on hardware the chassis moved
+    # in 100 ms bursts that started and died with every pause of the
+    # operator's hands, however displaced the base still was. This term
+    # supplies the missing "keep gliding under the work while the hands
+    # hold still": it acts purely in the null space (the arms counter-move,
+    # EE tracking is untouched by construction), self-attenuates as the
+    # offset shrinks (desire -> 0 at desire -> 0 error, no explicit gate
+    # needed), and is applied on the first solver iteration only so
+    # per-tick motion is exactly min(gain * dist, max_vel) * dt.
+    #
+    # It is NOT scaled by the manipulability gate that drives base_weight
+    # (item 1/#3), even though it looks like it should be -- that was the
+    # first version, and it was wrong. Manipulability recovers as the arms
+    # retract, so on a reach-then-retract motion the gate closed while the
+    # base was still short of home, stranding it there mid-return; the last
+    # part of "bring the hand back" then fell to the arm folding and the
+    # lift instead of the chassis. Manipulability answers "is the arm
+    # stretched", not "is the base still displaced" -- the offset error
+    # already answers that on its own, symmetrically in both directions.
+    #
+    # The *desire* is exactly min(gain * dist, max_vel); the achieved speed
+    # is the least-squares balance of that desire against the hold-still
+    # base term and the posture term's penalty on the arms' counter-motion,
+    # so it lands at a fraction of the desire, which is why this has its
+    # own weight rather than riding the hold-still one. gain = 0 disables.
+    # x/y only; yaw recentering was deliberately left out -- yaw is already
+    # cheap in the primary solve.
+    base_recenter_gain: float = 0.5       # 1/s: m/s of desire per metre offset
+    base_recenter_max_vel: float = 0.15   # m/s cap on the recentering desire
+    base_recenter_weight: float = 100.0   # null-space weight of the desire
+
     nullspace_regularization: float = 1e-8
 
     # Singular values below this fraction of the largest are treated as zero
@@ -290,8 +395,8 @@ class WholeBodyIKConfig:
     # Freejoint linear velocity (m/s) and angular velocity (rad/s)
     base_lin_vel_limit: float  = 0.5    # vx, vy
     base_ang_vel_limit: float  = 1.0    # wz
-    lift_vel_limit: float      = 0.15   # m/s
-    arm_vel_limit: float       = 2.5    # rad/s
+    lift_vel_limit: float      = 0.05   # m/s
+    arm_vel_limit: float       = 8.0   # rad/s
 
     # ── Self-collision avoidance ───────────────────────────────────────────────
     # Hard QP inequality (mink.CollisionAvoidanceLimit): the solver can never
@@ -546,6 +651,7 @@ class WholeBodyIK:
         self.configuration.update(self.data.qpos)
         self.posture_task.set_target_from_configuration(self.configuration)
         self._reset_nullspace_state()
+        self._latch_recenter_offset()
         self.initialized = True
 
     def init_from_qpos(self, qpos: np.ndarray) -> None:
@@ -553,7 +659,25 @@ class WholeBodyIK:
         self.configuration.update(qpos)
         self.posture_task.set_target_from_configuration(self.configuration)
         self._reset_nullspace_state()
+        self._latch_recenter_offset()
         self.initialized = True
+
+    def _latch_recenter_offset(self) -> None:
+        """Record where the hands naturally sit relative to the chassis.
+
+        The recentering objective must not drive the base *under* the hands
+        -- at a comfortable posture the hands sit well in front of the
+        chassis. It drives the base to wherever restores this offset,
+        expressed in the base frame so it rotates with the chassis.
+        """
+        T_l, T_r = self.forward_kinematics()
+        mid_xy = 0.5 * (T_l.translation()[:2] + T_r.translation()[:2])
+        base_xy = self.configuration.q[self.base_qpos_adrs[:2]]
+        yaw = float(self.configuration.q[self.base_qpos_adrs[2]])
+        c, s = np.cos(yaw), np.sin(yaw)
+        world = mid_xy - base_xy
+        self._recenter_offset_body = np.array(
+            [c * world[0] + s * world[1], -s * world[0] + c * world[1]])
 
     def update_configuration(self, qpos: np.ndarray) -> None:
         """Sync IK with current robot state (call each control cycle)."""
@@ -652,6 +776,9 @@ class WholeBodyIK:
         prev_base_q = self.configuration.q[self.base_qpos_adrs]
 
         for iters in range(1, self.config.max_iters + 1):
+            self._first_iteration = iters == 1
+            if self._first_iteration:
+                self._base_weight_cached = None
             vel = self._solve_qp(ee_tasks, other_tasks)
             # Arm-only hardware mode needs exact base and lift locks. High-cost
             # damping tasks alone still permit small virtual motion when an EE
@@ -874,7 +1001,47 @@ class WholeBodyIK:
         # which N annihilates -- so no secondary objective can ever perturb
         # the EE task, which is the whole point of the priority ordering.
         U, sv, Vt = np.linalg.svd(J, full_matrices=False)
-        dq_primary = Vt.T @ ((sv / (sv ** 2 + lam2)) * (U.T @ b))
+
+        # ── Base motion cost ─────────────────────────────────────────────────
+        # The damped inverse above treats every free DOF as equally cheap, and
+        # the base has by far the largest leverage on an end effector -- a
+        # chassis translation moves both hands one-for-one. So the minimum-norm
+        # solution reaches for the base first, for everything, including noise:
+        # measured against 2 mm of pure EE jitter, 24% of the response went to
+        # the base. That is what produced the reversals, and it contradicts
+        # what this controller is documented to do -- roll the chassis only
+        # when the arms and lift together cannot reach.
+        #
+        # Weighting fixes it at the source. Minimising ||W q̇||² instead of
+        # ||q̇||² subject to the same task makes base motion expensive relative
+        # to arm motion, so the arms absorb high-frequency error and the base
+        # moves only once they genuinely run out. Implemented by scaling the
+        # columns of J: with y = W q̇, solving in y and mapping back gives the
+        # weighted damped inverse exactly.
+        #
+        # Weight 1.0 is the unweighted solve, so this is off by default in the
+        # arithmetic sense -- Jw is J and the SVD below is the same one.
+        # x/y carry the gated base_motion_weight; yaw has its own cost so
+        # "rotate the chassis" can be cheaper than "translate the chassis"
+        # without being cheaper than nothing -- see base_motion_weight_yaw.
+        weight = np.ones(n)
+        base_weight = self._gated_base_weight()
+        yaw_weight = float(self.config.base_motion_weight_yaw)
+        if not self.fix_base:
+            slots_xy = np.flatnonzero(np.isin(free_ids, self.base_dof_ids[:2]))
+            slot_yaw = np.flatnonzero(np.isin(free_ids, self.base_dof_ids[2:3]))
+            weight[slots_xy] = max(base_weight, 1e-6)
+            weight[slot_yaw] = max(yaw_weight, 1e-6)
+
+        if np.all(weight == 1.0):
+            Uw, svw, Vtw = U, sv, Vt        # reuse the SVD taken for N
+            Jw = J
+        else:
+            Jw = J / weight                 # J @ diag(1/weight)
+            Uw, svw, Vtw = np.linalg.svd(Jw, full_matrices=False)
+
+        y = Vtw.T @ ((svw / (svw ** 2 + lam2)) * (Uw.T @ b))
+        dq_primary = y / weight
         rank_tol = self.config.nullspace_rank_tol * (sv[0] if sv.size else 0.0)
         V_r = Vt[sv > rank_tol].T
         N = np.eye(n) - V_r @ V_r.T
@@ -889,6 +1056,96 @@ class WholeBodyIK:
             w = float(np.sqrt(weight))
             blocks_A.append(w * N)
             blocks_r.append(w * (desired - dq_primary))
+
+        # ── Base motion, in the null space too ───────────────────────────────
+        # Weighting the primary solve alone does not work, and the reason is
+        # instructive: the base has two independent routes to the same motion.
+        # Measured against pure 2 mm EE noise, a 100x primary weight moved
+        # |base| from 0.0923 to 0.0848, and switching off the posture and
+        # swivel objectives moved it to 0.0903 -- block either path and the
+        # other simply supplies it. Both at once gives 0.0002.
+        #
+        # So the preference has to be stated here as well: among all solutions
+        # that serve the end effectors equally, prefer the one that moves the
+        # base least. That is exactly what the null space is for -- N z cannot
+        # change the EE task, so trading base motion for arm motion through it
+        # is free. When the arms genuinely cannot reach, the primary term
+        # supplies base motion that no amount of null-space preference can
+        # cancel, which is the behaviour this controller documents.
+        #
+        # Split per axis for the same reason the primary weight is: if the
+        # null-space term stayed uniform it would re-impose on yaw exactly
+        # the cost the primary term just relaxed -- the two-routes problem
+        # above, applied to the fix for it.
+        #
+        if not self.fix_base:
+            for dof_ids, w_val in ((self.base_dof_ids[:2], base_weight),
+                                   (self.base_dof_ids[2:3], yaw_weight)):
+                if w_val > 1.0:
+                    slots = np.flatnonzero(np.isin(free_ids, dof_ids))
+                    if slots.size:
+                        w = float(np.sqrt(w_val - 1.0))
+                        blocks_A.append(w * N[slots, :])
+                        blocks_r.append(w * (0.0 - dq_primary[slots]))
+
+        # ── Base recentering, x/y, always on ─────────────────────────────────
+        # Continuously prefer rolling the chassis toward under the hand
+        # targets -- see base_recenter_gain. Proportional to the offset
+        # error, so it is self-attenuating (desire -> 0 as error -> 0) and
+        # needs no explicit gate.
+        #
+        # It USED to be scaled by the manipulability-gate "openness" that
+        # also drives base_weight (item 1) -- reasoning that recentering
+        # should only matter when the arms are genuinely reach-limited. That
+        # was wrong: manipulability recovers as the arms retract, so on a
+        # reach-then-retract motion the gate closed while the base was still
+        # short of home, stranding it there -- the last part of "bring the
+        # hand back" then fell to the arm folding and the lift, exactly the
+        # 2026-08-25 hardware complaint. Manipulability answers "is the arm
+        # stretched"; it does not answer "is the base still displaced",
+        # which is what this term needs. The offset error already answers
+        # that on its own, symmetrically in both directions.
+        #
+        # A separate objective from the hold-still term above (own weight,
+        # not folded into base_weight's) because it needs to win not just
+        # against hold-still but against the posture term's penalty on the
+        # arms' counter-motion, which is the dominant attenuation.
+        # First iteration only, like every velocity-shaped term, so the
+        # per-tick desire is not multiplied by the iteration count.
+        gain = float(self.config.base_recenter_gain)
+        if gain > 0.0 and self._first_iteration and not self.fix_base:
+            hand_xy = [
+                task.transform_target_to_world.translation()[:2]
+                for task in (self.left_ee_task, self.right_ee_task)
+                if task.transform_target_to_world is not None
+            ]
+            if hand_xy:
+                base_xy = self.configuration.q[self.base_qpos_adrs[:2]]
+                # Where the base would sit if the hands kept their
+                # home-pose offset from the chassis (offset latched at
+                # init, rotated by the current yaw) -- NOT under the
+                # hands, which would pull forward even at rest.
+                yaw = float(self.configuration.q[self.base_qpos_adrs[2]])
+                c, s = np.cos(yaw), np.sin(yaw)
+                off = self._recenter_offset_body
+                off_world = np.array([c * off[0] - s * off[1],
+                                      s * off[0] + c * off[1]])
+                goal_xy = np.mean(hand_xy, axis=0) - off_world
+                v = gain * (goal_xy - base_xy)
+                speed = float(np.linalg.norm(v))
+                cap = float(self.config.base_recenter_max_vel)
+                if 0.0 < cap < speed:
+                    v *= cap / speed
+                dq_recenter = v * self.config.dt
+                slots = np.flatnonzero(
+                    np.isin(free_ids, self.base_dof_ids[:2]))
+                if slots.size and dq_recenter.any():
+                    w = float(np.sqrt(self.config.base_recenter_weight))
+                    order = np.searchsorted(
+                        np.asarray(self.base_dof_ids[:2]), free_ids[slots])
+                    blocks_A.append(w * N[slots, :])
+                    blocks_r.append(
+                        w * (dq_recenter[order] - dq_primary[slots]))
 
         # ── Posture (unchanged objective, now weighted alongside the rest) ──
         posture_error = self.posture_task.compute_error(self.configuration)
@@ -1010,6 +1267,8 @@ class WholeBodyIK:
         configured angle; the rest re-latch on the next solve.
         """
         self._prev_vel = None
+        self._first_iteration = True
+        self._base_weight_cached = None
         self._swivel_target = {
             side: self.config.elbow_swivel_targets.get(side)
             for side in ("left", "right")
@@ -1202,6 +1461,54 @@ class WholeBodyIK:
             d.qpos[adr] = original
             grad[i] = (hi - lo) / (2.0 * h)
         return grad, mu
+
+    def _gated_base_weight(self) -> float:
+        """Base motion cost, made cheap when the arms are running out of posture.
+
+        A flat cost is the wrong shape. High enough to stop the base chasing
+        tracker noise, it also stops the base helping until the arms have
+        already contorted -- measured on 2026-08-24 across three runs, base
+        motion averaged 0.00001 m/tick while the worst arm's manipulability was
+        above 0.050 and 0.0014-0.0020 below it. The chassis was a last resort
+        after the posture had degraded, which is the wrong way round: it should
+        move *so that* the posture does not degrade.
+
+        Manipulability is the right discriminator because it is exactly the
+        quantity that distinguishes "the arms are fine, this is noise" from
+        "the arms are running out". mu at the home keyframe is 0.0506, and the
+        gate ramps from base_motion_weight at `gate_on` down to
+        `base_motion_weight_min` at `gate_full`.
+
+        Only the *value* is needed, not the gradient, which is what makes this
+        affordable: two Jacobians and two 6x7 SVDs per solve, against the 28
+        perturbed kinematics evaluations `_manipulability_gradient` costs and
+        that keep enable_manipulability off.
+
+        The worst arm governs. One arm at a singularity is enough of a reason
+        to move the chassis, and averaging would let a comfortable arm hide it.
+        """
+        full = float(self.config.base_motion_weight)
+        floor = float(self.config.base_motion_weight_min)
+        if full == floor or self.fix_base:
+            return full
+        if not self._first_iteration and self._base_weight_cached is not None:
+            # Posture barely moves within one solve; compute it once per tick.
+            return self._base_weight_cached
+
+        data = self.configuration.data
+        mu = min(
+            float(np.exp(self._log_manipulability(self._arm_jacobian(side, data))))
+            for side in ("left", "right")
+        )
+        on = float(self.config.base_weight_gate_on)
+        gate_full = float(self.config.base_weight_gate_full)
+        if on <= gate_full:
+            gate = 1.0 if mu <= gate_full else 0.0
+        else:
+            x = float(np.clip((on - mu) / (on - gate_full), 0.0, 1.0))
+            gate = x * x * (3.0 - 2.0 * x)          # smoothstep
+        self._base_weight_cached = full + (floor - full) * gate
+        return self._base_weight_cached
 
     def _manipulability_gate(self, mu: float) -> float:
         """Smoothstep: 0 at mu >= gate_on, 1 at mu <= gate_full."""

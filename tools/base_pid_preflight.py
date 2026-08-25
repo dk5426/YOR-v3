@@ -23,8 +23,8 @@ owned by exactly one process at a time, and a second set of SparkFlex objects
 on the same CAN bus while the base control loop is running is a way to corrupt
 both.
 
-The values live in config/base_pid_stock.json, not here. What this file
-owns is the order of operations, which for the standalone command is:
+The values live in the config/base_pid_*.json manifests, not here. What this
+file owns is the order of operations, which for the standalone command is:
 
     1. read the manifest and reject anything out of range
     2. cross-check the module CAN IDs against robot/base_motor.py
@@ -55,27 +55,31 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-# Two manifests, same schema, same validation, same readback; only the numbers
-# and the intent differ.
+# Three manifests, same schema, same validation, same readback; only the
+# numbers and the intent differ.
 #
-# STOCK is what the controllers hold in flash and revert to on a power cycle.
-# It is what the robot applies by default, and what robot/yor.py writes back on
-# shutdown -- see YOR._restore_base_pid_gains. Running on it means the speed
-# axis is self-consistent: the stock drive loop is P-only and reaches about
-# half its setpoint, which is exactly what DRIVE_VEL_SCALE = 2.0 was introduced
-# to compensate for.
+# STOCK is what the controllers hold in flash and revert to on a power cycle,
+# and what robot/yor.py writes back on shutdown -- see
+# YOR._restore_base_pid_gains. Its drive loop is P-only and reaches about half
+# its setpoint, which its drive_command_scale of 2.0 compensates for.
 #
 # COMMISSIONED is the tuned, feed-forward-dominated set measured on the floor
-# on 2026-08-17. It tracks its setpoint, which means DRIVE_VEL_SCALE = 2.0 is
-# *not* correct for it -- see docs/BASE_COMMAND_LOOP_REVIEW.md finding 6. It is
-# opt-in until that is resolved:
+# on 2026-08-17: drive tracks its setpoint, steering runs Kp=20/Kd=6 behind a
+# deliberate +/-0.25 output clamp. Opt-in.
 #
-#     python robot/yor.py --base-pid-manifest config/base_pid_commissioned.json
+# HYBRID is the commissioned drive loop with the stock full-range steering
+# loop, floor-validated on 2026-08-24. It is the default: the drive tracking
+# fix is the single biggest responsiveness win, and it takes none of the
+# steering-clamp risk (see finding 9 in docs/BASE_COMMAND_LOOP_REVIEW.md).
+# Each manifest carries its own drive_command_scale, so switching sets cannot
+# reintroduce the finding-6 speed mismatch.
 STOCK_MANIFEST = _REPO / "config/base_pid_stock.json"
 COMMISSIONED_MANIFEST = _REPO / "config/base_pid_commissioned.json"
+HYBRID_MANIFEST = _REPO / "config/base_pid_hybrid.json"
 
-# What gets applied when nothing says otherwise.
-DEFAULT_MANIFEST = STOCK_MANIFEST
+# What gets applied when nothing says otherwise. Shutdown still restores
+# STOCK_MANIFEST -- the default only decides what startup syncs to.
+DEFAULT_MANIFEST = HYBRID_MANIFEST
 
 # Every field the preflight writes, as (manifest key, setter, getter). Readback
 # covers exactly this list, so a field can never be written without being

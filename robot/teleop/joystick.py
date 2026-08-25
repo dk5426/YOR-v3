@@ -37,7 +37,21 @@ PS4_CONTROLLER_MAP = {
 controller_map = XBOX_CONTROLLER_MAP
 
 
-def apply_deadzone(arr, dz=0.05):
+# Ticks of explicit zero to send after the stick is released, at the 60 Hz
+# joystick rate. One would do — the relay latches it — but a short burst
+# survives a dropped RPC without leaving the base holding its last command.
+STOP_TAIL_TICKS = 15
+
+# Raised from 0.05. This is a stop threshold, not just a jitter filter. The
+# existing creep guard below keys off the command falling under 1e-2, which a
+# stick that returns cleanly to centre does and a stick whose rest position
+# sits outside the deadzone never does — the latter streams ~10 mm/s forever
+# and the guard never fires. 0.05 is inside the resting scatter of a worn
+# stick; 0.12 is not.
+STICK_DEADZONE = 0.12
+
+
+def apply_deadzone(arr, dz=STICK_DEADZONE):
     return np.where(np.abs(arr) <= dz, 0.0, np.sign(arr) * (np.abs(arr) - dz) / (1 - dz))
 
 
@@ -48,14 +62,29 @@ class JoystickNode:
             raise RuntimeError("No joystick detected")
         self.joystick = Joystick(0)
 
-        # Three speed presets (m/s, m/s, rad/s) for Base.set_target_base_velocity
+        # Three speed presets (m/s, m/s, rad/s) for Base.set_target_base_velocity,
+        # cycled with L1 in the order default -> precision -> fast.
+        #
+        # Lowered from 0.50/0.25/0.75. Ramp time scales with how far there is to
+        # go, so top speed is itself a latency knob: the old 0.75 preset spent
+        # ~280 ms reaching speed no matter how hard the ramp pushed. These also
+        # bring teleop back under the rest of the stack, which was already more
+        # conservative — navigation caps at 0.35 m/s (BaseController.vmax) and
+        # the whole-body solver at 0.25 (base_max_lin_vel). The joystick was the
+        # only thing on the robot asking for 0.75.
         self.max_vels = [
+            np.array([0.35, 0.35, 1.20]),
+            np.array([0.18, 0.18, 0.80]),
             np.array([0.50, 0.50, 1.57]),
-            np.array([0.25, 0.25, 1.57]),
-            np.array([0.75, 0.75, 1.57]),
         ]
         self.max_vel_setting = 0
-        self.vel_alpha = 0.9  # low-pass on commanded vel
+
+        # Weight on the *previous* command. Only here to reject stick jitter
+        # that survives the deadzone — 0.9 was heavy enough to be the de facto
+        # motion profile, and it lagged the stick by about a third of a second
+        # in both directions. Shaping the motion is the jerk-limited ramp's job
+        # (BASE_MAX_* in robot/base_motor.py); this just cleans up the input.
+        self.vel_alpha = 0.25
 
         self.control_loop_running = False
 
@@ -100,10 +129,26 @@ class JoystickNode:
         print(f"MAX VEL SETTING: {self.max_vel_setting}")
         print("="*50)
 
+    def _halt_base(self) -> None:
+        """Command zero velocity and make it the last thing the relay heard.
+
+        The relay in robot/base.py latches its last command and re-sends it at
+        108 Hz indefinitely, so a joystick that merely stops talking leaves the
+        base driving. Every exit from the control block goes through here: the
+        stop button, and the process terminating. Sent a few times because a
+        single dropped RPC would otherwise leave the robot moving.
+        """
+        for _ in range(3):
+            try:
+                self.yor.set_base_velocity(np.zeros(3, dtype=float))
+            except Exception as exc:
+                print(f"WARN: base halt failed: {exc}")
+                return
+
     def control_loop(self):
         rate = RateLimiter(60, name="joystick")
         last_target_velocity = np.zeros(3, dtype=float)
-        last_sent_velocity = np.zeros(3, dtype=float)
+        zero_tail = 0
         display_counter = 0  # Counter to control display frequency
 
         while True:
@@ -116,6 +161,13 @@ class JoystickNode:
 
             if self.control_loop_running and self.joystick.get_button(controller_map["back"]):
                 self.control_loop_running = False
+                # Stopping control has to stop the *robot*. Everything below is
+                # skipped once this flag is false, so without an explicit halt
+                # the relay keeps forwarding the last velocity it was given and
+                # the base drives away from an operator who just pressed stop.
+                self._halt_base()
+                last_target_velocity = np.zeros(3, dtype=float)
+                zero_tail = 0
                 print("Control stopped")
                 self.display_joystick_inputs()
 
@@ -143,12 +195,21 @@ class JoystickNode:
                 vy = -self.joystick.get_axis(controller_map["right_horizontal_axis"])
                 vx = -self.joystick.get_axis(controller_map["right_vertical_axis"])
                 w  = -self.joystick.get_axis(controller_map["left_horizontal_axis"])
-                target_velocity = np.array([vx, vy, w], dtype=float)
-                target_velocity = apply_deadzone(target_velocity)
+                raw = apply_deadzone(np.array([vx, vy, w], dtype=float))
+
+                # Centred sticks are a hard zero, not a small number. Deciding
+                # this on the *raw* stick rather than on the filtered magnitude
+                # is what makes released mean released: the EMA decays toward
+                # zero but never arrives, so a magnitude test can only ever be
+                # a threshold, and any stick resting above that threshold never
+                # trips it.
+                sticks_idle = not raw.any()
 
                 # scale & smooth
-                target_velocity = self.max_vels[self.max_vel_setting] * target_velocity
+                target_velocity = self.max_vels[self.max_vel_setting] * raw
                 target_velocity = (1 - self.vel_alpha) * target_velocity + self.vel_alpha * last_target_velocity
+                if sticks_idle:
+                    target_velocity = np.zeros(3, dtype=float)
                 last_target_velocity = target_velocity
 
                 # Send to Base (SparkFlex swerve).
@@ -158,12 +219,12 @@ class JoystickNode:
                 # threshold left the last above-threshold value standing --
                 # which BaseController's 108 Hz relay then re-sent forever,
                 # about 10 mm/s of creep that nothing ever cleared.
-                if np.linalg.norm(target_velocity, ord=1) > 1e-2:
+                if not sticks_idle:
                     self.yor.set_base_velocity(target_velocity)
-                elif np.any(last_sent_velocity):
-                    last_target_velocity = np.zeros(3, dtype=float)
-                    self.yor.set_base_velocity(last_target_velocity)
-                last_sent_velocity = last_target_velocity
+                    zero_tail = STOP_TAIL_TICKS
+                elif zero_tail > 0:
+                    zero_tail -= 1
+                    self.yor.set_base_velocity(target_velocity)
 
                 # D-pad up/down controls lift via Pico serial
                 num_hats = self.joystick.get_numhats()
@@ -194,7 +255,11 @@ class JoystickNode:
 
 def main():
     node = JoystickNode()
-    node.control_loop()
+    try:
+        node.control_loop()
+    finally:
+        # Ctrl-C included: the relay does not time out on its own.
+        node._halt_base()
 
 
 if __name__ == "__main__":

@@ -22,7 +22,8 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 from tools.base_pid_preflight import (  # noqa: E402
-    COMMISSIONED_MANIFEST, DEFAULT_MANIFEST, PID_FIELDS, STOCK_MANIFEST,
+    COMMISSIONED_MANIFEST, DEFAULT_MANIFEST, HYBRID_MANIFEST, PID_FIELDS,
+    STOCK_MANIFEST,
     check_can_ids_against_base,
     check_can_interface, compare, load_manifest, main, plan_writes, read_back,
     run_devices, sync_from_manifest, sync_open_devices, validate_manifest,
@@ -436,8 +437,15 @@ def test_defaults_manifest() -> None:
     # plausible (they are the REV factory values) but would wipe the
     # controllers rather than restore them, since these SPARKs hold non-zero
     # gains in flash.
-    check("the stock manifest is what the robot applies by default",
-          DEFAULT_MANIFEST == STOCK_MANIFEST, str(DEFAULT_MANIFEST))
+    #
+    # The default changed from stock to hybrid on 2026-08-24 after floor
+    # validation; the restore path is pinned separately below, because what
+    # startup applies and what shutdown restores are different decisions.
+    check("the hybrid manifest is what the robot applies by default",
+          DEFAULT_MANIFEST == HYBRID_MANIFEST, str(DEFAULT_MANIFEST))
+    check("but shutdown must keep restoring flash-stock, never the default",
+          "self._base_pid_stock_manifest" in
+          (_REPO / "robot/yor.py").read_text())
     check("stock is a real gain set, not all zeros",
           any(manifest["roles"][role]["p"] > 0.0 for role in manifest["roles"]),
           str({r: manifest["roles"][r]["p"] for r in manifest["roles"]}))

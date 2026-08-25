@@ -1,0 +1,46 @@
+{
+  "manifest_version": 1,
+  "description": "EXPERIMENT, not commissioned. Commissioned drive + commissioned steering gains with the output clamp opened from +/-0.25 to +/-0.5 and Kd reduced 6.0 -> 2.0. Purpose: halve the module slew time that cos_error_scaling converts into drive lag, without giving finding 9 (unverified position PID wrapping) full motor output. Do not promote this to the default until finding 9 is settled and this has run on the floor.",
+  "can_interface": "can0",
+  "pid_slot": 0,
+  "drive_command_scale": 1.068,
+  "drive_command_scale_notes": "Same as base_pid_commissioned.json, because the scale depends only on the drive gains and those are identical. Still provisional at 1.068: the 2026-08-24 measurement that would have pinned it was contaminated by a curved run (5.8% wheel-speed spread, RL slowest), which biases the recommendation high. Re-measure once the modules are matched.",
+  "roles": {
+    "drive": {
+      "p": 0.35,
+      "i": 0.0,
+      "d": 0.0,
+      "velocity_ff": 0.23,
+      "output_min": -1.0,
+      "output_max": 1.0,
+      "notes": "Feed-forward dominated rather than a conventional PD loop. Kd is deliberately zero: a tested value of 10 caused an audibly harsh 100 Hz torque ripple and rough deceleration during floor testing."
+    },
+    "steering": {
+      "p": 20.0,
+      "i": 0.0,
+      "d": 2.0,
+      "velocity_ff": 0.0,
+      "output_min": -0.5,
+      "output_max": 0.5,
+      "notes": "Kp=20 saturates at 0.5/20 = 0.025 turns = 9 deg of error; measured slew error is 23-28 deg, so this is still a saturated (bang-bang) loop, at half output instead of quarter. Kd cut to 2.0 because the derivative term scales with the same clamp: at 180 deg/s a module contributes Kd*0.5 turns/s, which saturates on its own, and the clamp is what has been keeping encoder noise out of the gearbox. A wrap-crossing under finding 9 costs a half-power detour here, not a full-power spin."
+    }
+  },
+  "modules": {
+    "FL": {
+      "drive": 1,
+      "steering": 5
+    },
+    "FR": {
+      "drive": 4,
+      "steering": 8
+    },
+    "RR": {
+      "drive": 3,
+      "steering": 7
+    },
+    "RL": {
+      "drive": 2,
+      "steering": 6
+    }
+  }
+}

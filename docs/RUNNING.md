@@ -241,8 +241,9 @@ A 1 Hz status line shows both target positions, lift, and toggle states.
 (mink.SE3), `set_lift_target(m)`, `home_left_arm` / `home_right_arm` /
 `lift_home`, `toggle_fix_base`, `toggle_collision_avoidance`,
 `get_state()` (poses + lift + base + flags as plain types),
-`get_lift_position`, `get_base_velocity` ([vx, vy, ω] from the last solve —
-this is what the base consumes on hardware).
+`get_lift_position`, `get_base_velocity` ([vx, vy, ω] the base was last
+actually commanded, in the world frame; on hardware the base is driven from a
+pose target, and this is what that PD asked the wheels for).
 
 The hardware node (`robot/yor.py`, port 5557) exposes the same names, so the
 same client drives it with `--target hw`. See section 8.
@@ -574,6 +575,39 @@ To stop a joint moving outright, limit its velocity in `_build_velocity_limits`
 instead: that's a hard QP constraint, so unlike a cost it cannot be traded away
 against the end-effector task.
 
+### How the base is driven
+
+The solver produces both a base pose (`base_position`) and a base velocity
+(`base_velocity`). The hardware loop dispatches the **pose**:
+`WholeBodyController._dispatch_base` hands it, together with the dead-reckoned
+pose, to `BasePoseController` in `robot/base.py`, which closes a PD on the
+difference and returns a chassis-frame `[forward, left, yaw_rate]`. That
+request then goes through the same shaping chain the solver's velocity used to
+— vector clamp, low-pass, deadbands, heading-rate limit, acceleration limit —
+and out through the BASE_VEL relay to `Base.set_target_base_velocity`.
+
+The velocity path was dropped because a velocity only describes one tick.
+Whatever the wheels did not deliver on that tick — clamped, deadbanded,
+filtered, or a module still slewing — was gone as soon as the next solve
+overwrote it, and the shortfall accumulated as a position lag nothing read
+back. A pose target keeps it: the distance the base still owes is simply the
+error on the next cycle.
+
+Tuning knobs are `base_pose_kp_xy` / `base_pose_kd_xy` / `base_pose_kp_yaw` /
+`base_pose_kd_yaw` and the two deadbands `base_pose_deadband_m` (on the error
+*vector*) and `base_pose_yaw_deadband_rad`; inside either band the
+corresponding output is exactly zero. `get_state()` reports
+`base_pose_target` and `base_pose_error` (chassis frame: forward, left, yaw),
+and the trajectory log carries `base_err_*`, `base_req_*`, `base_body_*` and
+`base_sent_*` for the same tick, which is what separates "already arrived"
+from "the deadband ate it" from "the clamp capped it".
+
+One coupling to know about: `base_feedback_alpha` must stay at 0 for this to
+work. It pulls the solver's base belief back toward odometry, which is the
+same signal the PD closes on, so a non-zero value shrinks the error the base
+is driven by — at 0.3 the chassis settles at roughly a seventh of the speed
+the solver asked for. `init()` prints a warning if it is set.
+
 ### Arbitration between whole-body and direct control
 
 Direct commands win, briefly. Any call to `set_base_velocity` / `move_to` /
@@ -590,6 +624,7 @@ loop), then `resume_wholebody()`.
 
 | Limitation | Consequence |
 |---|---|
+| The base pose loop closes on dead-reckoned odometry, not on the floor | The PD makes the chassis converge on the pose the *solver* asked for, measured in the solver's own frame. It removes the accumulated command lag the velocity path had, but it cannot see wheel slip or a push: both move the robot without moving odometry, so neither shows up as an error. Absolute accuracy still depends on the SLAM correction below. |
 | The *solver's* base odometry is dead-reckoned from the commanded velocity | The solver's idea of where the chassis is drifts. Fine for clutch-based teleop (targets are relative to the current EE pose); absolute world-frame targets degrade the longer the base drives. Fixable — see "Feeding the SLAM pose into whole-body IK" above — but off until `slam_yaw_sign` is calibrated, so it drifts by default. |
 | The Odin's `slam/pcd` cloud is unordered | `pcd_source: slam` reshapes it to `(1,N,4)`, so mapping's 3×3 flying-pixel rejection spans unrelated points and is effectively inert. Acceptable because the Odin filters on-device, but do not read that filter as active. |
 | `BaseAxisMap` signs are unverified | Checked against the conventions in `base.py`, not against the physical robot. Do step 1 of the checklist. |

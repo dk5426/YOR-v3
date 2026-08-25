@@ -210,6 +210,260 @@ class PID:
         return float(u)
 
 
+class BasePoseController:
+    """Continuous PD from a base *pose* target to a base *velocity* command.
+
+        forward / left = Kp_xy  * (target_xy - measured_xy), in the body frame
+                         - Kd_xy  * filtered d(measured_xy)/dt
+        yaw_rate       = Kp_yaw * wrap(target_yaw - measured_yaw)
+                         - Kd_yaw * filtered d(measured_yaw)/dt
+
+    This is what whole-body control drives the chassis with: it hands over
+    `WholeBodyIKResult.base_position` -- where the solver believes the base
+    should be -- together with the pose it measures, and this closes the gap.
+
+    **Why a pose and not a velocity.** The solver's `base_velocity` is a
+    difference of two consecutive base beliefs divided by dt, so it is only
+    ever a statement about one tick. Everything the wheels fail to deliver on
+    that tick -- the vector clamp, the deadband, the low-pass, the swerve
+    slew, a module still turning -- is lost the moment the next solve
+    overwrites it, because the next velocity does not know the previous one
+    was not served. The shortfall accumulates silently as a position lag that
+    nothing ever reads back. A pose target cannot lose it: whatever the base
+    failed to travel is still sitting in the error on the next cycle, so the
+    chassis converges to where the solver asked instead of to wherever the
+    clamps happened to leave it.
+
+    Three details matter more than the gains:
+
+    * **The derivative is of the measurement, not of the error.** The target
+      moves every tick and jumps outright whenever authority changes hands
+      (an override lapsing, a re-enable, a SLAM correction); differentiating
+      the error would answer each of those with a velocity spike. Measurement
+      damping is pure damping, the same choice, for the same reason, as
+      `LiftVelocityPD` in robot/wholebody_control.py.
+
+    * **Both deadbands act on the error and produce an exact zero.** Linear
+      motion is deadbanded on the *vector* magnitude, never per axis: a
+      per-axis band turns the command as well as shrinking it, so a request
+      21 degrees off the forward axis would go out as pure forward -- wrong
+      direction, not merely wrong length. Yaw gets its own band in its own
+      units. Inside either band the corresponding output is 0.0 exactly, so
+      the modules are not left humming against the last few millimetres.
+
+    * **It measures nothing itself.** Target and measured pose must arrive in
+      the same frame, from the caller that owns both (whole-body control
+      passes the solver's target and its own odometry). This class holds no
+      odometry, no SLAM subscription and no notion of a map.
+
+    Frame: `heading_offset` says where the chassis' nose points at yaw 0. The
+    default -pi/2 matches the whole-body description, in which the robot faces
+    -Y and its left side is +X -- the same convention `BaseAxisMap` and
+    `WholeBodyController._world_to_body` are written against. The output is
+    `[forward, left, yaw_rate]`, which is the order `Base` itself takes.
+
+    Two entry points, because the sink differs by caller:
+
+    * `compute()` returns the command and sends nothing. Use it when the
+      caller has its own dispatch path -- whole-body control still runs its
+      heading-rate, acceleration and yaw-filter chain over the result and
+      writes it through the BASE_VEL relay, so the wheels never receive two
+      writers.
+    * `step()` computes and sends straight to `Base.set_target_base_velocity`,
+      for a caller that owns the base outright.
+    """
+
+    def __init__(
+        self,
+        base=None,
+        *,
+        kp_xy: float = 1.5,
+        kd_xy: float = 0.15,
+        kp_yaw: float = 2.0,
+        kd_yaw: float = 0.2,
+        xy_deadband: float = 0.01,
+        yaw_deadband: float = 0.02,
+        max_lin_vel: float = 0.25,
+        max_ang_vel: float = 0.60,
+        derivative_tau: float = 0.10,
+        max_gap_s: float = 0.25,
+        heading_offset: float = -math.pi / 2.0,
+    ) -> None:
+        self.base = base
+        self.kp_xy = float(kp_xy)
+        self.kd_xy = float(kd_xy)
+        self.kp_yaw = float(kp_yaw)
+        self.kd_yaw = float(kd_yaw)
+        self.xy_deadband = float(xy_deadband)
+        self.yaw_deadband = float(yaw_deadband)
+        self.max_lin_vel = float(max_lin_vel)
+        self.max_ang_vel = float(max_ang_vel)
+        self.derivative_tau = float(derivative_tau)
+        self.max_gap_s = float(max_gap_s)
+        self.heading_offset = float(heading_offset)
+
+        # Never ask for more than the drive is configured to allow. Base takes
+        # its own per-axis ceiling ([vx, vy, omega]) at construction and does
+        # not enforce it in the control loop, so a controller that ignores it
+        # would simply command past it.
+        limits = getattr(base, "max_vel", None)
+        if limits is not None:
+            limits = np.asarray(limits, dtype=float).reshape(-1)
+            if limits.size >= 3:
+                self.max_lin_vel = min(
+                    self.max_lin_vel, float(min(abs(limits[0]), abs(limits[1]))))
+                self.max_ang_vel = min(self.max_ang_vel, float(abs(limits[2])))
+
+        self.reset()
+
+    # -- state ---------------------------------------------------------------
+
+    def reset(self) -> None:
+        """Forget the measurement history and the last command.
+
+        Every event that breaks the continuity of the measured pose -- the
+        base being disabled, an override taking it away, fix_base, an
+        e-stop -- must call this, or the first cycle afterwards damps against
+        a velocity the base never had.
+        """
+        self._last_pose: Optional[np.ndarray] = None
+        self._last_time: Optional[float] = None
+        # Body-frame [forward, left, yaw] of the *measurement*, low-passed.
+        self._vel_filt = np.zeros(3, dtype=float)
+        self.last_error = np.zeros(3, dtype=float)
+        self.last_command = np.zeros(3, dtype=float)
+
+    @property
+    def measured_velocity(self) -> np.ndarray:
+        """The damping term's view of how the base is moving, body frame."""
+        return self._vel_filt.copy()
+
+    # -- control -------------------------------------------------------------
+
+    def compute(
+        self,
+        target_pose,
+        current_pose,
+        dt: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> np.ndarray:
+        """One cycle. Returns `[forward, left, yaw_rate]` (m/s, m/s, rad/s).
+
+        `target_pose` and `current_pose` are both `[x, y, yaw]` in the same
+        frame. `dt` is the control period; omit it to measure one off the
+        monotonic clock.
+        """
+        target = self._as_pose(target_pose, "target_pose")
+        current = self._as_pose(current_pose, "current_pose")
+        now = time.monotonic() if now is None else float(now)
+
+        self._update_derivative(current, now, dt)
+
+        err_fwd, err_left = self._to_body(
+            target[0] - current[0], target[1] - current[1], current[2])
+        err_yaw = _wrap_pi(float(target[2]) - float(current[2]))
+        self.last_error = np.array([err_fwd, err_left, err_yaw], dtype=float)
+
+        # Deadband on the magnitude of the XY error vector, so the direction
+        # the caller asked for survives it or nothing does.
+        if math.hypot(err_fwd, err_left) <= self.xy_deadband:
+            forward = lateral = 0.0
+        else:
+            forward = self.kp_xy * err_fwd - self.kd_xy * float(self._vel_filt[0])
+            lateral = self.kp_xy * err_left - self.kd_xy * float(self._vel_filt[1])
+            forward, lateral = self._clamp_linear(forward, lateral)
+
+        if abs(err_yaw) <= self.yaw_deadband:
+            yaw_rate = 0.0
+        else:
+            yaw_rate = self.kp_yaw * err_yaw - self.kd_yaw * float(self._vel_filt[2])
+            yaw_rate = float(np.clip(yaw_rate, -self.max_ang_vel, self.max_ang_vel))
+
+        self.last_command = np.array([forward, lateral, yaw_rate], dtype=float)
+        return self.last_command.copy()
+
+    def step(
+        self,
+        target_pose,
+        current_pose,
+        dt: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> np.ndarray:
+        """`compute()`, then send the result to the base."""
+        command = self.compute(target_pose, current_pose, dt=dt, now=now)
+        self.send(command)
+        return command
+
+    def send(self, command) -> np.ndarray:
+        """Hand a `[forward, left, yaw_rate]` command to the swerve drive."""
+        if self.base is None:
+            raise RuntimeError("BasePoseController has no base to command")
+        command = np.asarray(command, dtype=float).reshape(-1)[:3]
+        self.base.set_target_base_velocity(command, smooth=True)
+        return command
+
+    def halt(self) -> None:
+        """Stop the base and forget the PD's history. Never raises."""
+        self.reset()
+        if self.base is None:
+            return
+        try:
+            self.base.set_target_base_velocity(np.zeros(3, dtype=float), smooth=True)
+        except Exception as exc:  # a stop path must never raise
+            print(f"[base] pose controller halt failed: {exc}")
+
+    # -- helpers -------------------------------------------------------------
+
+    def _to_body(self, x: float, y: float, yaw: float) -> tuple[float, float]:
+        """Rotate a planar world vector into (forward, left) at `yaw`."""
+        phi = float(yaw) + self.heading_offset
+        c, s = math.cos(phi), math.sin(phi)
+        return (c * float(x) + s * float(y), -s * float(x) + c * float(y))
+
+    def _clamp_linear(self, forward: float, lateral: float) -> tuple[float, float]:
+        """Clamp the speed, keeping the direction: as a vector, not per axis."""
+        speed = math.hypot(forward, lateral)
+        if speed > self.max_lin_vel and speed > 1e-12:
+            scale = self.max_lin_vel / speed
+            forward, lateral = forward * scale, lateral * scale
+        return float(forward), float(lateral)
+
+    def _update_derivative(
+        self, current: np.ndarray, now: float, dt: Optional[float]
+    ) -> None:
+        last_pose, last_time = self._last_pose, self._last_time
+        self._last_pose, self._last_time = current.copy(), float(now)
+
+        if last_pose is None or last_time is None:
+            return
+
+        step = (float(now) - last_time) if dt is None else float(dt)
+        if step <= 0.0 or step > self.max_gap_s:
+            # Either time did not advance or the loop stalled. Neither gives a
+            # velocity worth damping against.
+            self._vel_filt[:] = 0.0
+            return
+
+        fwd, left = self._to_body(
+            (current[0] - last_pose[0]) / step,
+            (current[1] - last_pose[1]) / step,
+            current[2],
+        )
+        raw = np.array(
+            [fwd, left, _wrap_pi(float(current[2]) - float(last_pose[2])) / step],
+            dtype=float,
+        )
+        alpha = step / (self.derivative_tau + step) if self.derivative_tau > 0.0 else 1.0
+        self._vel_filt += alpha * (raw - self._vel_filt)
+
+    @staticmethod
+    def _as_pose(value, name: str) -> np.ndarray:
+        pose = np.asarray(value, dtype=float).reshape(-1)
+        if pose.size < 3:
+            raise ValueError(f"{name} must be [x, y, yaw], got {pose.size} values")
+        return pose[:3].astype(float)
+
+
 class BaseController:
     def __init__(
         self,
@@ -264,8 +518,15 @@ class BaseController:
         self.pos_tol = pos_tol
         self.theta_tol = theta_tol
 
-        self.vel_alpha = 0.5   # was 0.2 — faster response to direction changes near goal
-                               # (0.2 was so sluggish that overshoot → oscillation)
+        # Weight on the *new* PID output; the remainder carries the previous
+        # command forward. This exists to take the edge off the derivative
+        # spike the 20 Hz SLAM pose puts on a 30 Hz loop, nothing more — the
+        # jerk-limited ramp in Base.control_loop is what actually shapes the
+        # motion now, and unlike this filter it stops lagging once the command
+        # settles. Kept deliberately light (was 0.5, and 0.2 before that): a
+        # heavy EMA here delays *every* sample, which reads as the base
+        # responding late to the operator rather than as smoothness.
+        self.vel_alpha = 0.8
 
         self._vel_lock = threading.Lock()
         self.last_target_velocity = np.zeros(3, dtype=float)
@@ -432,7 +693,7 @@ class BaseController:
                             if dist < self.pos_tol:
                                 stop = True
                         else:
-                            to_tgt = dir_from_yaw(tth)
+                            to_tgt = dir_from_yaw(tth + math.pi / 2.0) #to_tgt = dir_from_yaw(tth)
                             d_theta = heading_error_from_dir(
                                 T_base, to_tgt, forward_col=0, flip_sign=True
                             )
@@ -524,8 +785,6 @@ class BaseController:
                 "yaw_des": (None if tth is None else float(tth)),
                 "rot_only": bool(self._rot_only),
             }
-            with self._nav_lock:
-                self._nav = debug_info
 
             d_theta = heading_error_from_dir(
                 T_base,
@@ -550,7 +809,7 @@ class BaseController:
             d_world = np.array([dx, 0.0, dz], dtype=float)
             d_body = R_bw.T @ d_world
 
-            d_fwd = float(d_body[2])
+            d_fwd = -float(d_body[2])
             d_left = float(d_body[0])
 
             now = time.monotonic()
@@ -577,6 +836,16 @@ class BaseController:
             vx = _soft_clip(vx, self.vmin, self.vmax)
             vy = _soft_clip(vy, self.vmin, self.vmax)
             omega = _soft_clip(omega, self.omegamin, self.omegamax)
+
+            debug_info["d_fwd"] = float(d_fwd)
+            debug_info["d_left"] = float(d_left)
+            debug_info["d_theta_deg"] = float(math.degrees(d_theta))
+            debug_info["cmd_vx"] = float(vx)
+            debug_info["cmd_vy"] = float(vy)
+            debug_info["cmd_omega"] = float(omega)
+
+            with self._nav_lock:
+                self._nav = debug_info
 
             if rotation_only:
                 self.target_velocity = np.array([0.0, 0.0, omega], dtype=float)

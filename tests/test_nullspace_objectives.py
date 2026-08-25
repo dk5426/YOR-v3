@@ -11,6 +11,7 @@ older `q̇ = q̇_primary + N q̇_posture` when the new weights are off.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -418,6 +419,234 @@ def test_modes_and_locks_unaffected():
           f"{viol} violations")
 
 
+def test_manipulability_gated_base_weight() -> None:
+    """The base must move so the arms keep a posture, not after they lose one.
+
+    A flat base cost is the wrong shape. High enough to stop the chassis
+    chasing tracker noise, it also stops it helping until the arms have
+    already contorted: measured across three runs on 2026-08-24, base motion
+    averaged 0.00001 m/tick while the worst arm's manipulability was above
+    0.050 and 0.0014-0.0020 below it. The operator's description was "it moved
+    forward but only after awkwardly putting the arms forward".
+
+    Manipulability gates it because it is exactly what separates "the arms are
+    fine, this is noise" from "the arms are running out".
+    """
+    print("\nmanipulability-gated base weight")
+    import numpy as _np
+
+    def mu_of(ik):
+        d = ik.configuration.data
+        return min(float(_np.exp(ik._log_manipulability(ik._arm_jacobian(s_, d))))
+                   for s_ in ("left", "right"))
+
+    home = build()
+    check("mu at the home keyframe matches what the runs measured",
+          abs(mu_of(home) - 0.0506) < 5e-3, f"{mu_of(home):.5f}")
+
+    def push(**cfg):
+        ik = build(**cfg); ik.toggle_fix_base(False)
+        T_l0, T_r0 = ik.forward_kinematics()
+        mus = []
+        for k in range(90):
+            g = mink.SE3.from_rotation_and_translation(
+                T_l0.rotation(), T_l0.translation() + _np.array([0.0, -0.60*(k+1)/90, 0.0]))
+            ik.solve(g, T_r0)
+            mus.append(mu_of(ik))
+        return _np.array(mus)
+
+    # Gate disabled = base expensive on ALL three DOFs. Since the per-axis
+    # split, yaw has its own weight (default 1.0 = cheap), so pinning only
+    # the linear floor would leave the chassis a yaw route to keep helping.
+    flat = push(base_motion_weight_min=100.0, base_motion_weight_yaw=100.0)
+    gated = push()                                      # shipped defaults
+    check("without the gate the arms reach a singularity",
+          flat.min() < 1e-3, f"min mu {flat.min():.6f}")
+    check("with it they do not",
+          gated.min() > 20 * flat.min() and gated.min() > 5e-3,
+          f"min mu {flat.min():.6f} -> {gated.min():.6f}")
+    check("and the posture is better throughout, not just at the worst moment",
+          _np.median(gated) > _np.median(flat),
+          f"median mu {_np.median(flat):.5f} -> {_np.median(gated):.5f}")
+
+    # Since the 2026-08-25 re-tune the gate band (0.065/0.050) straddles the
+    # home mu of 0.0506, so at rest the base weight sits near the min-10
+    # floor rather than at 100 -- the chassis is recruited *before* the arms
+    # degrade, by design. Noise rejection at rest is now carried by the
+    # recentering objective: with the hands at their home offset its desire
+    # is ~zero, so it acts as a null-space *anchor* holding the base
+    # against noise (measured 0% of pure-noise ticks past the 0.05 entry
+    # threshold, vs 55% for the pre-gate unweighted solve).
+    def noise(**cfg):
+        ik = build(**cfg); ik.toggle_fix_base(False)
+        T_l0, T_r0 = ik.forward_kinematics(); rng = _np.random.default_rng(11); v = []
+        for _ in range(150):
+            g = mink.SE3.from_rotation_and_translation(
+                T_l0.rotation(), T_l0.translation() + rng.normal(0, 0.002, 3))
+            v.append(_np.asarray(ik.solve(g, T_r0).base_velocity, float)[:2].copy())
+        v = _np.array(v)
+        return float((_np.hypot(v[:, 0], v[:, 1]) > 0.05).mean() * 100)
+
+    live_bad = noise(base_motion_weight=1.0, base_motion_weight_min=1.0,
+                     base_recenter_gain=0.0)
+    live_gated = noise()
+    check("at rest the base ignores tracker noise the unweighted solve chases",
+          live_gated <= 5.0 and live_bad >= 30.0,
+          f"past entry deadband: unweighted no-anchor {live_bad:.1f}% -> "
+          f"shipped {live_gated:.1f}%")
+
+    # Only the value is needed, not the gradient -- that is what makes it
+    # affordable where enable_manipulability is not.
+    ik = build(); ik.toggle_fix_base(False)
+    T_l0, T_r0 = ik.forward_kinematics()
+    g = mink.SE3.from_rotation_and_translation(
+        T_l0.rotation(), T_l0.translation() + _np.array([0.0, -0.2, 0.0]))
+    for _ in range(5):
+        ik.solve(g, T_r0)
+    t0 = time.perf_counter()
+    for _ in range(40):
+        ik.solve(g, T_r0)
+    per = (time.perf_counter() - t0) / 40 * 1000
+    check("a solve still fits the 30 Hz budget", per < 33.3 * 0.6, f"{per:.2f} ms")
+
+    check("a locked base skips the gate entirely",
+          build()._gated_base_weight()
+          == build().config.base_motion_weight)
+
+
+def test_base_recentering() -> None:
+    """Stretched arms + stationary hands must keep the base rolling.
+
+    This IK is a velocity solver, so the base was only ever asked to move
+    while the hand targets moved -- on hardware (2026-08-25) the chassis
+    moved in 100 ms bursts that died with every pause of the operator's
+    hands. The recentering objective supplies base motion while the targets
+    hold still, through the null space, so the hands must not move for it.
+    """
+    print("\nnull-space base recentering")
+    import numpy as _np
+
+    def run(steps=90, **cfg):
+        # Yaw pinned expensive: with yaw cheap the chassis serves lateral
+        # targets by turning toward them, which restores the hand offset
+        # geometrically and hides the translation this test measures.
+        cfg.setdefault("base_motion_weight_yaw", 100.0)
+        ik = build(**cfg)
+        ik.toggle_fix_base(False)
+        T_l0, T_r0 = ik.forward_kinematics()
+        base_xy0 = ik.configuration.q[ik.base_qpos_adrs[:2]].copy()
+        # Drag both hands 0.45 m out to stretch the arms and open the gate,
+        # then FREEZE the targets and watch the base.
+        g_l = mink.SE3.from_rotation_and_translation(
+            T_l0.rotation(), T_l0.translation() + _np.array([0.0, -0.45, 0.0]))
+        g_r = mink.SE3.from_rotation_and_translation(
+            T_r0.rotation(), T_r0.translation() + _np.array([0.0, -0.45, 0.0]))
+        for k in range(30):
+            f = (k + 1) / 30
+            gl = mink.SE3.from_rotation_and_translation(
+                T_l0.rotation(), (1-f)*T_l0.translation() + f*g_l.translation())
+            gr = mink.SE3.from_rotation_and_translation(
+                T_r0.rotation(), (1-f)*T_r0.translation() + f*g_r.translation())
+            ik.solve(gl, gr)
+        held_v, held_err = [], []
+        for _ in range(steps):
+            res = ik.solve(g_l, g_r)
+            held_v.append(float(_np.hypot(*_np.asarray(res.base_velocity)[:2])))
+            T_now, _ = ik.forward_kinematics()
+            held_err.append(float(_np.linalg.norm(
+                T_now.translation() - g_l.translation())))
+        # Bring the hands back to comfortable poses (relative to wherever
+        # the base has rolled) and check the term shuts off with the gate.
+        T_l1, T_r1 = ik.forward_kinematics()
+        shift = _np.r_[ik.configuration.q[ik.base_qpos_adrs[:2]] - base_xy0, 0.0]
+        rest_v = []
+        for k in range(30):
+            f = (k + 1) / 30
+            gl = mink.SE3.from_rotation_and_translation(
+                T_l0.rotation(),
+                (1-f)*T_l1.translation() + f*(T_l0.translation() + shift))
+            gr = mink.SE3.from_rotation_and_translation(
+                T_r0.rotation(),
+                (1-f)*T_r1.translation() + f*(T_r0.translation() + shift))
+            ik.solve(gl, gr)
+        for _ in range(60):        # let the residual recentering converge
+            ik.solve(gl, gr)
+        for _ in range(15):
+            res = ik.solve(gl, gr)
+            rest_v.append(float(_np.hypot(*_np.asarray(res.base_velocity)[:2])))
+        return _np.array(held_v), _np.array(held_err), _np.array(rest_v)
+
+    v_on, err_on, v_rest = run()                      # defaults: gain 0.5
+    v_off, _, _ = run(base_recenter_gain=0.0)
+
+    check("with stationary targets, recentering keeps the base moving",
+          _np.median(v_on) > 5 * max(_np.median(v_off), 1e-6),
+          f"median |v| on {_np.median(v_on)*1000:.1f} vs "
+          f"off {_np.median(v_off)*1000:.1f} mm/s")
+    check("the desire respects its speed cap (+small numerical slack)",
+          v_on.max() <= build().config.base_recenter_max_vel * 1.2,
+          f"max {v_on.max():.3f} m/s")
+    check("EE tracking is untouched while the base recenters",
+          _np.median(err_on) < 2e-3,
+          f"median err {_np.median(err_on)*1000:.2f} mm")
+    check("recentering shuts off once the arms are comfortable again",
+          _np.median(v_rest) < 0.25 * _np.median(v_on) + 1e-3,
+          f"held {_np.median(v_on)*1000:.1f} -> "
+          f"rest {_np.median(v_rest)*1000:.1f} mm/s")
+
+
+def test_base_recentering_symmetric_on_retract() -> None:
+    """Retracting the hands must bring the base back too, not strand it.
+
+    Regression for the 2026-08-25 hardware complaint: reaching out rolled
+    the base forward as expected, but retracting the same distance solved
+    with the lift and the arms folding rather than the base rolling back --
+    the operator watched lift height climb and the arms fold on the return
+    leg instead of the chassis retreating.
+
+    The cause was that recentering's strength was scaled by the same
+    manipulability gate that governs base_weight (item 1): manipulability
+    *recovers* as the arms retract, so the gate closed while the base was
+    still short of home, stranding it mid-return. The fix makes recentering
+    an unconditional restoring force on the offset error, symmetric in
+    both directions. This drives a full extend-then-retract cycle back to
+    the exact starting hand pose and checks the base actually comes home.
+    """
+    print("\nbase recentering is symmetric on retract")
+    import numpy as _np
+
+    ik = build(base_motion_weight_yaw=100.0)  # isolate translation, see above
+    ik.toggle_fix_base(False)
+    T_l0, T_r0 = ik.forward_kinematics()
+    base_xy0 = ik.configuration.q[ik.base_qpos_adrs[:2]].copy()
+
+    def target(f, dist=0.45):
+        off = _np.array([0.0, -dist * f, 0.0])
+        return (mink.SE3.from_rotation_and_translation(
+                    T_l0.rotation(), T_l0.translation() + off),
+                mink.SE3.from_rotation_and_translation(
+                    T_r0.rotation(), T_r0.translation() + off))
+
+    for k in range(60):                        # extend
+        ik.solve(*target((k + 1) / 60))
+    for _ in range(20):                         # hold stretched
+        ik.solve(*target(1.0))
+    out_xy = ik.configuration.q[ik.base_qpos_adrs[:2]].copy()
+    for k in range(60):                         # retract, back to start
+        ik.solve(*target(1.0 - (k + 1) / 60))
+    for _ in range(60):                         # let it settle
+        ik.solve(*target(0.0))
+
+    home_xy = ik.configuration.q[ik.base_qpos_adrs[:2]]
+    out_dist = float(_np.linalg.norm(out_xy - base_xy0))
+    residual = float(_np.linalg.norm(home_xy - base_xy0))
+    check("the base actually rolled out while reaching",
+          out_dist > 0.05, f"{out_dist*1000:.0f} mm")
+    check("and comes back close to where it started once the hands do",
+          residual < 0.25 * out_dist,
+          f"rolled out {out_dist*1000:.0f} mm, stranded {residual*1000:.0f} mm")
+
+
 def main() -> int:
     for test in (
         test_projector_and_reduction,
@@ -429,6 +658,9 @@ def main() -> int:
         test_velocity_continuity,
         test_manipulability,
         test_modes_and_locks_unaffected,
+        test_manipulability_gated_base_weight,
+        test_base_recentering,
+        test_base_recentering_symmetric_on_retract,
     ):
         test()
 

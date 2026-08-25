@@ -1351,3 +1351,321 @@ chasing the joint7 null-space wobble. Run from `/home/pi-v3/YOR-v3-try` with
     controllers, plans all eight, and declares its own
     `drive_command_scale` -- a manifest without one silently inherits the
     module default, which is right for exactly one gain set. 115/115.
+
+29. **Drive position counts added to the trajectory log** (2026-08-24).
+    `drive_pos_{FL,FR,RR,RL}` -- cumulative motor rotations from
+    `GetPosition()`, 90 -> 94 columns.
+
+    The log already carried both other encoder streams (`steer_meas_*` from
+    the steering absolute encoder, `drive_meas_*` from `GetVelocity`), but not
+    drive *position* -- which is the one that matters for distance. A counter
+    does not accumulate the sampling error that integrating a 30 Hz-sampled
+    velocity does, and it is exactly what
+    `robot/nav/odometry/swerve_odom.py` integrates. Costs no extra bus
+    traffic: `GetPosition` reads the same cached status frame 2 as
+    `GetVelocity`.
+
+    What it makes answerable offline, from an ordinary run, with no tape:
+
+    * wheel odometry reconstructed per tick and compared against
+      `BaseOdometry`'s commanded-velocity dead reckoning -- the ~25%
+      over-report from item 25, measured continuously instead of once;
+    * the `METERS_PER_ROTATION` discrepancy from item 25 (0.049922 in
+      swerve_odom vs 0.047531 from PHASE0), by fitting rotations against SLAM
+      or against a known course;
+    * per-module *distance* spread, which is a cleaner read on RL's 5%
+      shortfall than comparing velocity medians -- distance integrates the
+      whole run rather than sampling it.
+
+    Steering position counts were deliberately left out: the absolute encoder
+    already gives the angle, so they would be redundant.
+
+    Suites: `test_base_kinematics` 84/84, `test_wholebody_control` 59/59,
+    `test_base_pid_preflight` 115/115, rest unchanged.
+
+30. **Swerve telemetry now recorded independently of whole-body control**
+    (2026-08-24). New `robot/swerve_log.py`, written by `yor.py` for the life
+    of the base control loop.
+
+    The trajectory CSV only exists when a `WholeBodyController` does, so
+    `yor.py --no-arms` -- which is how the base gets driven from joystick.py --
+    recorded nothing at all. And even with arms it sampled at the 30 Hz solve
+    rate against a 50 Hz status stream. This runs off the base loop instead,
+    so a joystick run and a teleop run are directly comparable.
+
+    ```
+    artifacts/wholebody_logs/swerve/swerve_<timestamp>.csv     28 columns @ 50 Hz
+      t, motors_enabled, v_target_{0,1,2}, v_prof_{0,1,2},
+      steer_cmd_*, steer_meas_*, drive_cmd_*, drive_meas_*, drive_pos_*
+    ```
+
+    Config row stamps the PID provenance and the sample rate. Default 50 Hz,
+    matching the SPARK periodic status 2 period -- sampling faster than the
+    controllers publish would only duplicate rows. `--no-swerve-log` disables,
+    `--swerve-log-hz` overrides.
+
+    Started right after `base.start_control()` in `init()` (so it covers
+    startup homing too) and stopped in `graceful_shutdown` *before* the base
+    loop goes down. Never raises: a telemetry failure writes no row rather
+    than a wrong one, and the thread keeps going -- verified in the tests by
+    failing the fake bus mid-run and checking sampling resumes.
+
+    It duplicates some trajectory-log columns on purpose. That one exists to
+    correlate the wheels with *solver* output on the same tick; this one
+    exists to look at the wheels on their own, at the rate they actually
+    report.
+
+    Both logs are written when whole-body is running. Suites:
+    `test_base_kinematics` 98/98 (+14), rest unchanged.
+
+31. **Why the base wanders on hardware but not in sim** (2026-08-24). Run
+    `traj_20260824_195659`, 199 s, hybrid gains, 33.8% of ticks commanding the
+    base.
+
+    **The command alternates direction roughly every other tick.** Tick-to-tick
+    change in the commanded base heading is purely bimodal:
+
+    ```
+      0- 10 deg : 1027  (57.4%)
+     10-170 deg :    0  ( 0.0%)
+    170-180 deg :  763  (42.6%)   <- outright reversals
+    ```
+
+    764 forward sign reversals and 820 lateral over 1922 commanded ticks --
+    one every **0.08 s**, with a median burst length of 0.03 s.
+
+    **The hardware base responds with 167 ms of lag** (peak cross-correlation
+    0.904 at 5 ticks between commanded speed and measured wheel speed).
+
+    167 ms of lag against an 80 ms reversal period. The chassis is always
+    accelerating toward a direction that has already flipped, so it never
+    converges -- it shuttles. Measured: **6.807 m of odometry path for 0.300 m
+    of net displacement, 22.7x.**
+
+    **In sim there is no lag at all.** `yor_mujoco.py` calls
+    `ik.apply_to_sim_kinematic(self.data, result)`, which writes the solve
+    straight into `data.qpos`; `_animate_swerve` only spins the wheel meshes.
+    The base pose is whatever the solver decided, instantly and exactly, so the
+    same alternating command stream produces a base that sits still (the flips
+    cancel) and the solver looks fine. Same solver, same output, opposite
+    outcome -- the difference is entirely the plant.
+
+    **The heading rate limiter from item 23 does not catch this, by design.**
+    It measures a >90 deg heading change against the *reversed* previous
+    heading, because a swerve module serves a reversal by flipping the drive
+    rather than turning. That is right for the module and wrong for the
+    chassis, which has to decelerate, stop and accelerate the other way. All
+    42.6% of the reversals pass through unlimited.
+
+    Worse, the replay validation in item 23 measured **module travel folded for
+    reversal** -- precisely the metric that hides this. The replay was correct
+    about what it measured (p90 854 -> 207 deg/s, uncatchable ticks 33.2% ->
+    0.5%) and blind to what actually destabilises the base.
+
+    **Also correcting item 31's first pass:** an initial table here reported
+    "wheels travelled 3.7-12.6 m" from `sum|diff|` of `drive_pos`. That was
+    jitter-inflated -- range/sum ran as low as 0.064, i.e. 94% of the sum was
+    sampling noise. Position differencing needs the 50 Hz swerve log and a
+    velocity cross-check, not the 30 Hz trajectory log.
+
+    **Candidate fixes, in order of principle:**
+    1. Penalise base *velocity change* in the solver. This is the same
+       bimodality the arms had with elbow flips, and the cure there was the
+       null-space continuity term -- `nullspace_continuity_weight` already
+       exists and is 0.0.
+    2. Slew-limit the base velocity **vector**, reversals included, sized to
+       the measured 167 ms response: a full reversal should take at least
+       ~2x that.
+    3. Low-pass the base velocity vector before dispatch.
+
+    (2) and (3) are dispatch-side patches on a solver that is producing a
+    physically unrealisable command; (1) fixes the command.
+
+32. **Both base-stability fixes implemented; the first one had to be
+    rewritten after measurement** (2026-08-24).
+
+    **(2) Chassis acceleration limit — worked as designed.**
+    `WholeBodyHardwareConfig.base_max_accel = 1.5 m/s^2`, applied in
+    `_dispatch_base` after the heading limiter. An exact zero is exempt, so a
+    deadbanded command or a halt still stops the base immediately, and
+    `_halt_base` resets the reference so resuming is not limited from a
+    velocity the chassis no longer has.
+
+    Replayed over the real runs:
+
+    | run | reversals >90 deg before | after | commanded path before | after |
+    |---|---:|---:|---:|---:|
+    | 195538 | 61.7% | **4.4%** | 3.52 m | 2.57 m |
+    | 195659 | 42.6% | **10.4%** | 10.99 m | 8.35 m |
+
+    **(1) Solver-side continuity — the first two attempts did not work, and
+    finding out why is the actual result.**
+
+    *Attempt A, carry the previous base velocity into the primary solve.* The
+    carry referenced `self._prev_vel`, which `solve()` rewrites **every
+    iteration**, so after a converged solve it holds the last and smallest
+    refinement step rather than anything the chassis was asked for. Fixed by
+    adding `_prev_base_vel` (the tick-level value actually dispatched) and
+    applying the carry on the first iteration only -- the reported base
+    velocity is a sum over iterations, so applying it every iteration would
+    multiply it by the iteration count. Effect after the fix: real but tiny.
+    In a regime built to reproduce the failure (target the arms can reach,
+    2 mm of EE noise), reversals went 58.8% -> 57.8% at carry 0.95.
+
+    *Attempt B, weight base DOFs in the primary damped inverse.* Also nearly
+    inert: base response to pure noise fell only from 0.0923 to 0.0848 at a
+    **1000x** weight.
+
+    *Why.* The base has two independent routes to the same motion. Blocking
+    the primary path leaves the null-space objectives (posture, swivel)
+    supplying it; switching those off leaves the primary supplying it. Only
+    both at once collapse it -- 0.0923 -> 0.0002.
+
+    *The fix that works:* weight base DOFs in **both** the primary solve and
+    the null-space secondary. The second half is the principled one -- among
+    all solutions serving the EE equally, prefer the one that moves the base
+    least, which `N z` can express for free because it cannot change the EE
+    task. `base_motion_weight = 100.0`.
+
+    Measured, against pure 2 mm EE noise, fraction of ticks whose base command
+    clears the 0.04 dispatch deadband:
+
+    | weight | median \|v\| | past deadband | reversals |
+    |---|---:|---:|---:|
+    | 1 | 0.0554 | 71.3% | 77.9% |
+    | 30 | 0.0287 | 26.7% | 82.4% |
+    | **100** | **0.0138** | **0.7%** | **0.0%** |
+
+    And it is a preference, not a prohibition: a target 0.60 m beyond arm
+    reach still rolls the base 0.31 m and converges to 0.00 mm, where the
+    arms alone leave 359 mm.
+
+    Root cause worth recording: unweighted, the base answered **24%** of a
+    pure 2 mm EE noise input, because the damped inverse treats every free
+    DOF as equally cheap and the chassis has the most leverage per unit of
+    joint motion. "Base motion is emergent" was aspirational, not true.
+
+    New CLI: `--base-motion-weight`, `--base-velocity-continuity`,
+    `--base-max-accel`. Suites all green.
+
+33. **Base cost gated on arm manipulability** (2026-08-24). The operator's
+    report: "it moved forward but only after awkwardly putting the arms
+    forward, and when I moved back it just moved the lift up and the arms
+    back."
+
+    **Confirmed in the data before changing anything.** Reconstructing
+    manipulability from three runs (1757 samples), base motion by mu band:
+
+    | worst-arm mu | base motion |
+    |---|---:|
+    | > 0.050 (healthy) | 0.00001 m/tick |
+    | 0.045-0.050 | 0.00154 |
+    | 0.020-0.030 | 0.00192 |
+    | < 0.020 | 0.00198 |
+
+    mu is 0.0506 at the home keyframe, so the chassis was doing essentially
+    nothing until the arms had already dropped below their home posture --
+    and mu's 10th percentile across those runs was 0.0009, i.e. the arms were
+    genuinely reaching singularity. The base was a last resort *after* the
+    posture degraded, when it should move *so that* it does not.
+
+    **Cause was item 32's own fix.** `base_motion_weight = 100` is the right
+    magnitude for rejecting tracker noise and the wrong shape for recruiting
+    the base: a flat cost cannot tell "the arms are fine, this is noise" from
+    "the arms are running out".
+
+    **Fix: gate the cost on manipulability.** `_gated_base_weight()` ramps the
+    base cost from `base_motion_weight` (100) at mu >= `base_weight_gate_on`
+    (0.045) down to `base_motion_weight_min` (1.0) at
+    `base_weight_gate_full` (0.025), by smoothstep. Worst arm governs -- one
+    arm at a singularity is reason enough to move the chassis, and averaging
+    would let a comfortable arm hide it.
+
+    Measured, pushing a target 0.60 m out:
+
+    | | min mu | median mu | noise past deadband |
+    |---|---:|---:|---:|
+    | flat weight 100 | 0.000063 | 0.01604 | 0.7% |
+    | gated (shipped) | **0.012558** | **0.02701** | **0.7%** |
+
+    The arms no longer reach singularity -- min mu improves 200x -- and
+    **noise rejection is completely unchanged**, because tracker noise arrives
+    while the arms are still comfortable and the gate is shut. That is the
+    property that makes this work rather than just trading one problem for
+    the other.
+
+    **Affordable because only the value is needed, not the gradient.** Two
+    Jacobians and two 6x7 SVDs per solve, cached across the iterations of one
+    solve since posture barely moves within a tick. Measured 2.03 ms per solve
+    against a 33.3 ms budget -- against the 28 perturbed kinematics
+    evaluations `_manipulability_gradient` costs, which is why
+    `enable_manipulability` is still off.
+
+    New CLI: `--base-motion-weight-min`, `--base-weight-gate ON FULL`. Setting
+    the two weights equal disables the gate. A more aggressive band
+    (`--base-weight-gate 0.050 0.035`) held min mu at 0.0182 in the sweep, at
+    the cost of the gate being partly open almost always -- worth trying if
+    the arms still look stretched on hardware.
+
+34. **`tools/replay_solver.py` — A/B solver configurations on one recorded
+    trajectory** (2026-08-24).
+
+    Every hardware run so far was judged against a different operator input,
+    which makes "does this balance base, lift and arms better?" unanswerable:
+    the input changed at the same time as the solver did.
+
+    **The recordings already existed.** `_TrajectoryRecorder` writes
+    `left_target_ee_*` / `right_target_ee_*` every tick, and those columns
+    *are* the solver's input -- the same SE3 pair `solve()` is called with.
+    Verified on traj_20260824_213002: the target moves on 94% of ticks with a
+    median 4.95 mm step, and `lift_goal == lift_q` on 100% of ticks, so the
+    operator never set a lift target and `lift_target=None` is faithful.
+    Every file in artifacts/wholebody_logs/trajectories/ is replayable.
+
+    Caveat stated in the tool: teleop generates each target relative to where
+    the hand currently is, so replaying an absolute sequence under a different
+    configuration is not a perfect re-enactment. It is a fair A/B -- identical
+    requested hand trajectory, different whole-body resolution.
+
+    ```
+    python tools/replay_solver.py --log <traj>.csv                 # compare presets
+    python tools/replay_solver.py --log <traj>.csv --view eager    # watch one
+    python tools/replay_solver.py --log <traj>.csv --set base_motion_weight=50
+    ```
+
+    **First result, on traj_20260824_213002 (897 ticks):**
+
+    | config | EE med | EE p95 | mu min | mu med | base path | base yaw | lift | revers |
+    |---|---:|---:|---:|---:|---:|---:|---:|---:|
+    | shipped | 0.19 | 1.81 | 0.0241 | 0.0356 | 1.74 m | 83d | 1.36 m | 1.2% |
+    | flat (item 32) | 0.37 | 5.70 | 0.0125 | 0.0300 | 1.65 m | 61d | **1.63 m** | 1.0% |
+    | unweighted | 0.07 | 5.02 | 0.0207 | 0.0406 | 2.89 m | 252d | 1.00 m | 3.0% |
+    | **eager (0.050->0.035)** | **0.12** | **1.39** | **0.0263** | **0.0419** | 1.92 m | 108d | **1.25 m** | 2.6% |
+    | reluctant | 0.28 | 3.82 | 0.0203 | 0.0318 | 1.63 m | 66d | 1.47 m | 1.3% |
+
+    **`eager` beats `shipped` on every column that matters** -- lower EE error
+    at both median and p95, better worst-case and typical arm posture, and
+    less lift travel -- by letting the chassis commit sooner. And the table
+    shows the operator's complaint directly: **lift travel moves inversely
+    with base willingness** (flat 1.63 m at 61 deg of yaw, eager 1.25 m at
+    108 deg). The lift was substituting for a base that would not move.
+
+    **Gate sweep is non-monotonic, so it has to be measured, not interpolated:**
+
+    ```
+    0.045->0.025   EE p95  1.81   mu_min 0.0241   base 1.74m
+    0.050->0.035   EE p95  1.39   mu_min 0.0263   base 1.92m
+    0.055->0.040   EE p95 31.45   mu_min 0.0000   base 5.00m   <- unstable
+    0.060->0.045   EE p95  0.89   mu_min 0.0245   base 2.75m
+    ```
+
+    0.055->0.040 loses tracking outright (mu hits 0 -- a singularity) and
+    should not be used. 0.060 sits *above* the home mu of 0.0506, so the gate
+    is fully open always and it degenerates to `unweighted`; its good numbers
+    on this trace do not carry, because a recorded trace cannot test noise
+    rejection -- the operator's input is already in it. That property was
+    measured separately (synthetic 2 mm jitter, item 33).
+
+    Recommendation: `--base-weight-gate 0.050 0.035` on the next run. Margin
+    to the home posture is thin (0.0506 vs 0.050), which is the aggressive
+    part of the choice; the sweep says it pays.

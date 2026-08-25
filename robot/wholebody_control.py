@@ -19,7 +19,8 @@ Control flow, once per cycle (default 30 Hz):
   2. solve whole-body IK for the current EE / lift targets
   3. dispatch arms, lift and base, each with its own clamp and its own
      enable flag
-  4. integrate the commanded base velocity into the odometry estimate
+  4. integrate the base velocity that was actually commanded into the odometry
+     estimate
 
 Lift and base are dispatched directly from that 30 Hz loop. Arms are not: each
 solved joint target is handed to a second, faster loop (default 90 Hz, see
@@ -43,6 +44,17 @@ Three things are worth knowing before running this on the robot:
   primary, always-available signal and the SLAM pose is bled in under a rate
   limit, so loop-closure jumps never reach the IK as a step. It ships off
   because `slam_yaw_sign` has to be calibrated first — see docs/RUNNING.md.
+
+* **The base is driven by a pose, not by a velocity.** `_dispatch_base` hands
+  the solver's `base_position` -- where the IK believes the chassis should
+  be -- and the dead-reckoned pose to `BasePoseController` (robot/base.py),
+  which closes a PD on the difference. The solver's `base_velocity` is no
+  longer dispatched: it describes a single tick, so anything the wheels did
+  not deliver on that tick (clamp, deadband, filter, module slew) was lost
+  when the next solve overwrote it, and the lag accumulated where nothing
+  read it back. Everything downstream of the request is unchanged -- the
+  heading-rate, acceleration and yaw-filter chain, the axis map, and the
+  odometry integration all still act on the velocity that leaves this file.
 
 * **Base axis mapping is a convention, not a measurement.** `BaseAxisMap`
   below encodes how the solver's body-frame velocity maps onto
@@ -84,6 +96,17 @@ try:
     from robot.base_motor import MODULE_ORDER as _MODULE_LABELS, NUM_SWERVES as _NUM_SWERVES
 except Exception:  # pragma: no cover - only when the CAN stack is absent
     _MODULE_LABELS, _NUM_SWERVES = ("FL", "FR", "RR", "RL"), 4
+
+# The base is driven by pose, and that controller lives with the rest of the
+# base hardware in robot/base.py (base_motor.py stays swerve kinematics and
+# motor control, and knows nothing about where the chassis is). Guarded for the
+# same reason as the import above: a checkout without the CAN stack can still
+# import this module for offline analysis, and only *constructing* the
+# whole-body controller needs the real class.
+try:
+    from robot.base import BasePoseController
+except Exception:  # pragma: no cover - only when the CAN stack is absent
+    BasePoseController = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,11 +285,106 @@ class WholeBodyHardwareConfig:
     # and the measured module-travel demand ran to a median 552 deg/s in the
     # 0.02-0.04 band against hardware that peaks near 300. The base spent
     # 25-41% of its moving ticks in that regime. This keeps it out.
-    base_vel_deadband: float = 0.04        # m/s
-    # Yaw gets its own, in its own units. This was the same scalar as the
-    # linear deadband, which silently meant "0.02 rad/s" as well as
-    # "0.02 m/s". Same default, so behaviour is unchanged until it is tuned.
-    base_yaw_deadband: float = 0.02        # rad/s
+    #
+    # Turned into a hysteresis pair on 2026-08-25, mirroring the yaw axis
+    # below: motion starts when |v| exceeds the entry threshold and stops
+    # when it falls below the exit threshold. 0 disables the deadband
+    # entirely (every command, however small, reaches the wheels).
+    #
+    # Default 0 as of the 2026-08-25 hardware sessions: with the low-pass
+    # filter below in place the run was smoother, but the deadband made the
+    # base move in start-stop bursts -- the filtered command hovered around
+    # the thresholds, so the chassis kept halting mid-motion. The filter now
+    # carries the noise-rejection duty the deadband was added for. The old
+    # pair (0.05/0.025) is preserved behind --base-vel-deadband in yor.py;
+    # if the modules hum or the heading whirls at standstill again (the
+    # original 2026-08-22 reason for the deadband), restore it there.
+    base_vel_deadband: float = 0.0         # m/s — entry: below this, stay stopped
+    base_vel_deadband_exit: float = 0.0    # m/s — exit: once moving, stop below this
+    # One-pole low-pass on the linear velocity request, applied per body-frame
+    # component (so direction is filtered consistently, not just magnitude)
+    # before the hysteresis deadband. The yaw axis has had this since
+    # 2026-08-24; the linear axes originally did not because that corpus
+    # showed no linear sign-flips. The 2026-08-25 run with the per-axis yaw
+    # weight changed the regime: the solver's linear request flickered
+    # between zero and above-entry (334 movement bouts, median 100 ms, 4.5
+    # deadband crossings/s), and hysteresis alone cannot help when the
+    # request genuinely returns to zero. The filter merges those bursts into
+    # either a sustained command or nothing, at the cost of ~tau of onset
+    # lag on translation. 0 disables.
+    # Raised 0.08 -> 0.15 on 2026-08-25 alongside the null-space base
+    # recentering objective (base_recenter_gain in WholeBodyIKConfig): the
+    # 14:30 run still surged (peak speed 2x the mean within each moving
+    # stretch); 0.15 matches the yaw tau the operator settled on.
+    base_vel_filter_tau: float = 0.15      # s
+    # Yaw gets its own deadband, in its own units, and it is a hysteresis
+    # pair rather than a single threshold. The 2026-08-24 runs showed why: the
+    # solver's yaw request is noise centred near zero (nonzero median
+    # 0.019 rad/s) that crossed the old single 0.02 threshold 7.4 times per
+    # second, so the base received rotation in single-tick pulses — and every
+    # pulse re-aims all four swerve modules, which is the "constant
+    # correction" felt on the floor. Real rotation in those runs sat at
+    # 0.2-0.45 rad/s, far above either threshold: a 0.05 entry kept 82% of the
+    # total commanded rotation while cutting the passing ticks by half.
+    #
+    # Rotation starts when the (filtered) request exceeds the entry threshold
+    # and stops when it falls below the exit threshold. The gap is what kills
+    # the chatter — a request hovering at either single threshold would still
+    # toggle every tick.
+    # Default 0 (disabled) as of 2026-08-25, the same decision as the linear
+    # pair above and for the same reason: with the low-pass filter carrying
+    # the noise-rejection duty, a deadband turns marginal requests into
+    # start-stop bursts. The 3x-raised experiment (0.15/0.075) confirmed the
+    # chassis had been micro-correcting yaw, and the raised threshold traded
+    # that for chatter around the boundary instead. Both pairs are preserved
+    # behind --base-yaw-deadband in yor.py; the pre-experiment value was
+    # 0.05/0.025.
+    base_yaw_deadband: float = 0.0         # rad/s — entry: below this, stay stopped
+    base_yaw_deadband_exit: float = 0.0    # rad/s — exit: once rotating, stop below this
+    # How strongly odometry corrects the solver's belief of the base pose,
+    # per tick: belief += alpha * (odometry - belief). 1.0 is a hard reset to
+    # odometry every tick (the closed-loop behaviour this replaced); 0.0 is
+    # fully open loop -- the solver integrates its own base commands and
+    # never reads odometry back, matching how the arms are run
+    # (use_measured_arm_state=False).
+    #
+    # Measured on the 2026-08-24 replay: alpha 0.3 cuts command churn 39%
+    # for +4% EE error; at 0.0 churn drops the same but the belief drifts
+    # freely from the physical base (44-68 mm over a session in replay), and
+    # the true-world EE error rises accordingly while the solver's own frame
+    # still reads ~0.8 mm -- open loop always *looks* perfect from inside.
+    # Odometry itself is still integrated and SLAM-corrected regardless, so
+    # telemetry and any consumer of odometry.pose are unaffected.
+    #
+    # Since the base is driven by pose, this knob is no longer free: it feeds
+    # odometry back into the very belief the pose target is read from, which
+    # is the same signal the PD is trying to close on. Under a sustained
+    # solver request `v`, the speed the base settles at is
+    #
+    #     u ≈ v * kp*dt / (alpha + kp*dt)
+    #
+    # so alpha 0 tracks the solver exactly (u = v), while alpha 0.3 with the
+    # default gains (kp*dt = 0.05) leaves about a seventh of it -- the base
+    # would crawl. (Simulated over the discrete loop: 15% at alpha 0.3, 5% at
+    # a hard reset; the formula ignores where in the tick each step lands.)
+    # Anything above 0 is therefore a deliberate trade, and init() says so out
+    # loud. This is why the belief must free-run for pose control to work.
+    base_feedback_alpha: float = 0.0
+    # One-pole low-pass on the yaw request, applied before the deadband.
+    # It merges one-tick pulses into either a sustained rotation or nothing,
+    # and flattens the solver's occasional absurd spikes (12 rad/s for one
+    # tick was observed). The cost is lag on rotation onset only. 0 disables.
+    #
+    # Raised from 0.08 on 2026-08-25. With the yaw deadband removed the
+    # filter is the only thing standing between solver yaw noise and the
+    # modules, and the per-axis yaw weight makes the solver use yaw freely
+    # (weight 1.0 -- a trial at 5.0 stopped chassis yaw entirely, so the
+    # smoothing duty lands here, not on the cost). 0.25 measured well in
+    # replay (halved churn, 80% kept, ~67 ms onset lag) but was clearly
+    # worse on the floor -- the lag on rotation is felt harder than the
+    # replay metrics suggest. 0.15 is the compromise the operator settled
+    # on. Tunable via --base-yaw-filter-tau in yor.py.
+    base_yaw_filter_tau: float = 0.15      # s
     # Ceiling on how fast the *direction* of the base command may turn, which
     # is a hardware limit rather than a preference: the swerve modules peak at
     # 265-353 deg/s of slew, and in the 2026-08-22 runs 27-44% of moving ticks
@@ -280,6 +398,61 @@ class WholeBodyHardwareConfig:
     # have the ill-conditioning problem, though it does move the module angles
     # through the rotation term -- that part is not bounded here.
     base_heading_rate_limit: float = 3.49   # rad/s (200 deg/s)
+    # Ceiling on how fast the base *velocity vector* may change, in m/s^2.
+    #
+    # base_heading_rate_limit deliberately does not bound a reversal: a swerve
+    # module answers a 180 deg direction change by flipping the drive rather
+    # than turning, so for the module it costs nothing. For the chassis it
+    # costs everything -- it has to decelerate, stop and accelerate the other
+    # way -- and the 2026-08-24 runs did exactly that, reversing every 0.08 s
+    # against a measured 167 ms response. 42.6% of heading changes were
+    # 170-180 deg and every one passed the heading limiter untouched.
+    #
+    # 1.5 m/s^2 turns a full 0.25 -> -0.25 reversal into 0.33 s, about twice
+    # the chassis response time, so a command the base cannot follow is never
+    # issued. Kept below base_motor's own S-curve limit (1.9) so the profiler
+    # is not the binding constraint -- and unlike the profiler, which
+    # re-targets every tick and so never finishes a segment when the command
+    # flips, this shapes the command itself.
+    #
+    # An exact zero is exempt: stopping is never delayed, so a deadbanded
+    # command or a halt still takes effect immediately. Set to 0 to disable.
+    base_max_accel: float = 1.5             # m/s^2
+    # ── Base pose PD ────────────────────────────────────────────────────────
+    # Gains for BasePoseController (robot/base.py), which turns the solver's
+    # base *pose* target into the velocity request the chain above shapes.
+    # The linear pair mirrors the navigation PID in the same file (k_pos 1.5,
+    # kd_pos 0.15) and the yaw pair its k_theta/kd_theta, because both close on
+    # the same chassis with the same mass: the difference here is only which
+    # pose is being tracked, not what is being pushed.
+    #
+    # With kp 1.5, base_max_lin_vel is reached at 0.167 m of error, so any
+    # lag larger than that is served at full speed and the gain only shapes
+    # the arrival.
+    base_pose_kp_xy: float = 1.5           # (m/s)/m
+    base_pose_kd_xy: float = 0.15          # (m/s)/(m/s), damping on measurement
+    base_pose_kp_yaw: float = 2.0          # (rad/s)/rad
+    base_pose_kd_yaw: float = 0.2          # (rad/s)/(rad/s)
+    # Pose errors this small are not worth moving for: inside them the
+    # controller outputs exactly zero rather than leaving the modules humming.
+    # The linear band is on the error *vector*, for the same reason
+    # base_vel_deadband is -- a per-axis band turns the command as well as
+    # shrinking it. Unlike the velocity deadbands above these can stay on:
+    # the pose error is an accumulated quantity, not a per-tick noise
+    # reading, so it does not flicker across the threshold.
+    base_pose_deadband_m: float = 0.01
+    base_pose_yaw_deadband_rad: float = 0.02
+    # Time constant of the low-pass on the measured base velocity that feeds
+    # the D term. Matches lift_derivative_tau, and for the same reason: the
+    # raw sample-to-sample difference of a 30 Hz pose is more artefact than
+    # velocity.
+    base_pose_derivative_tau: float = 0.10  # s
+    # Where the chassis' nose points at yaw 0, in the IK world frame. The
+    # description has the robot facing -Y with +X to its left, so the forward
+    # axis sits a quarter turn behind the yaw axis. Same convention as
+    # BaseAxisMap and _world_to_body; changing one without the others turns
+    # every base command.
+    base_pose_heading_offset: float = -math.pi / 2.0   # rad
     base_axis_map: BaseAxisMap = field(default_factory=BaseAxisMap)
     # Which swerve PID gains were actually on the controllers for this run.
     # Set by robot/yor.py after the startup sync, and stamped into the
@@ -899,6 +1072,13 @@ class _TrajectoryRecorder:
             f"nullspace_posture_weight={ik_config.nullspace_posture_weight}",
             f"enable_manipulability={ik_config.enable_manipulability}",
             f"manipulability_weight={ik_config.manipulability_weight}",
+            f"base_motion_weight={ik_config.base_motion_weight}",
+            f"base_motion_weight_min={ik_config.base_motion_weight_min}",
+            f"base_motion_weight_yaw={ik_config.base_motion_weight_yaw}",
+            f"base_weight_gate_on={ik_config.base_weight_gate_on}",
+            f"base_weight_gate_full={ik_config.base_weight_gate_full}",
+            f"base_recenter_gain={ik_config.base_recenter_gain}",
+            f"base_recenter_max_vel={ik_config.base_recenter_max_vel}",
         ])
         # Second config line: the base and lift knobs. Separate row because
         # these are what a base/lift tuning session varies, and a run is
@@ -910,6 +1090,9 @@ class _TrajectoryRecorder:
                 f"base_max_lin_vel={hw_config.base_max_lin_vel}",
                 f"base_max_ang_vel={hw_config.base_max_ang_vel}",
                 f"base_vel_deadband={hw_config.base_vel_deadband}",
+                f"base_vel_deadband_exit={hw_config.base_vel_deadband_exit}",
+                f"base_vel_filter_tau={hw_config.base_vel_filter_tau}",
+                f"base_feedback_alpha={hw_config.base_feedback_alpha}",
                 f"enable_lift_motion={hw_config.enable_lift_motion}",
                 f"lift_kp={hw_config.lift_kp}",
                 f"lift_kd={hw_config.lift_kd}",
@@ -921,7 +1104,17 @@ class _TrajectoryRecorder:
                 f"use_measured_arm_state={hw_config.use_measured_arm_state}",
                 f"base_pid={getattr(hw_config, 'base_pid_provenance', 'unknown')}",
                 f"base_heading_rate_limit={hw_config.base_heading_rate_limit}",
+                f"base_max_accel={hw_config.base_max_accel}",
                 f"base_yaw_deadband={hw_config.base_yaw_deadband}",
+                f"base_yaw_deadband_exit={hw_config.base_yaw_deadband_exit}",
+                f"base_yaw_filter_tau={hw_config.base_yaw_filter_tau}",
+                f"base_pose_kp_xy={hw_config.base_pose_kp_xy}",
+                f"base_pose_kd_xy={hw_config.base_pose_kd_xy}",
+                f"base_pose_kp_yaw={hw_config.base_pose_kp_yaw}",
+                f"base_pose_kd_yaw={hw_config.base_pose_kd_yaw}",
+                f"base_pose_deadband_m={hw_config.base_pose_deadband_m}",
+                f"base_pose_yaw_deadband_rad={hw_config.base_pose_yaw_deadband_rad}",
+                f"base_pose_derivative_tau={hw_config.base_pose_derivative_tau}",
             ])
 
         header = ["t"]
@@ -936,12 +1129,20 @@ class _TrajectoryRecorder:
         header += ["lift_q", "base_x", "base_y", "base_yaw", "iters", "solved"]
 
         # ── Base ────────────────────────────────────────────────────────────
-        # req_*: the solver's own world-frame velocity, before any clamping.
-        # body_*: after per-axis clamp and deadband, in the chassis frame.
+        # The pose the base was asked for is base_x/base_y/base_yaw above --
+        # that column trio is result.base_position, which is now the base
+        # command rather than only a diagnostic. From there:
+        # err_*:  the pose error the PD acted on, in the chassis frame
+        #         (forward, left, yaw). Subtract it from base_x/y/yaw to
+        #         recover the dead-reckoned pose.
+        # req_*:  the PD's own velocity request, chassis frame, unshaped.
+        # body_*: after the clamp, filter and deadband chain, still chassis
+        #         frame.
         # sent_*: the 3-vector handed to Base.set_target_base_velocity, in the
         #         axis order BaseAxisMap produces (not forward/lateral/yaw).
         header += ["base_active",
-                   "base_req_vx", "base_req_vy", "base_req_wz",
+                   "base_err_fwd", "base_err_lat", "base_err_yaw",
+                   "base_req_fwd", "base_req_lat", "base_req_yaw",
                    "base_body_fwd", "base_body_lat", "base_body_yaw",
                    "base_sent_0", "base_sent_1", "base_sent_2"]
         # What Base itself was holding, so a mismatch against base_sent_*
@@ -954,6 +1155,9 @@ class _TrajectoryRecorder:
         header += [f"steer_meas_{m}" for m in _MODULE_LABELS]
         header += [f"drive_cmd_{m}" for m in _MODULE_LABELS]
         header += [f"drive_meas_{m}" for m in _MODULE_LABELS]
+        # Cumulative motor rotations -- differentiate offline for per-module
+        # distance, or feed swerve_odom.py's forward model directly.
+        header += [f"drive_pos_{m}" for m in _MODULE_LABELS]
 
         # ── Lift ────────────────────────────────────────────────────────────
         header += ["lift_active", "lift_mode", "lift_goal", "lift_meas",
@@ -1002,6 +1206,7 @@ class _TrajectoryRecorder:
 
         base = base or {}
         row += [str(bool(base.get("active", False)))]
+        row += self._vec(base.get("err"), 3)
         row += self._vec(base.get("req"), 3)
         row += self._vec(base.get("body"), 3)
         row += self._vec(base.get("sent"), 3)
@@ -1010,7 +1215,8 @@ class _TrajectoryRecorder:
         row += [str(bool(swerve.get("motors_enabled", False)))]
         row += self._vec(swerve.get("v_target"), 3)
         row += self._vec(swerve.get("v_profiled"), 3)
-        for key in ("steer_cmd_rad", "steer_meas_rad", "drive_cmd_mps", "drive_meas_raw"):
+        for key in ("steer_cmd_rad", "steer_meas_rad", "drive_cmd_mps",
+                    "drive_meas_raw", "drive_pos_rot"):
             row += self._vec(swerve.get(key), _NUM_SWERVES)
 
         lift = lift or {}
@@ -1091,6 +1297,11 @@ class WholeBodyController:
         self.left_ee_target: Optional[mink.SE3] = None
         self.right_ee_target: Optional[mink.SE3] = None
         self.lift_target: Optional[float] = None
+        # Last gripper value each arm was commanded. The grippers themselves
+        # report through the arm, but nothing else remembers what was *asked*
+        # for, and a recorded episode needs the command as its action label.
+        self.left_gripper_target: Optional[float] = None
+        self.right_gripper_target: Optional[float] = None
         self._home_left: Optional[mink.SE3] = None
         self._home_right: Optional[mink.SE3] = None
         self._home_lift: float = 0.0
@@ -1108,6 +1319,29 @@ class WholeBodyController:
                 self.config.slam_pose_port,
                 self.config.slam_pose_hz,
             )
+        # The chassis is driven by pose: the solver says where the base
+        # should be and this closes on it. It is handed `self.base` so it can
+        # stand alone, but this file never lets it send -- `_dispatch_base`
+        # takes its request through the shaping chain and out via
+        # `_send_base_command`, so the BASE_VEL relay stays the only writer.
+        if BasePoseController is None:  # pragma: no cover - CAN stack absent
+            raise ImportError(
+                "robot.base could not be imported; whole-body base control "
+                "needs BasePoseController"
+            )
+        self.base_pose = BasePoseController(
+            base=self.base,
+            kp_xy=self.config.base_pose_kp_xy,
+            kd_xy=self.config.base_pose_kd_xy,
+            kp_yaw=self.config.base_pose_kp_yaw,
+            kd_yaw=self.config.base_pose_kd_yaw,
+            xy_deadband=self.config.base_pose_deadband_m,
+            yaw_deadband=self.config.base_pose_yaw_deadband_rad,
+            max_lin_vel=self.config.base_max_lin_vel,
+            max_ang_vel=self.config.base_max_ang_vel,
+            derivative_tau=self.config.base_pose_derivative_tau,
+            heading_offset=self.config.base_pose_heading_offset,
+        )
         self.lift_pd = LiftVelocityPD(
             kp=self.config.lift_kp,
             kd=self.config.lift_kd,
@@ -1119,6 +1353,10 @@ class WholeBodyController:
 
         self._last_base_velocity = np.zeros(3)   # world frame, as commanded
         self._last_base_command = np.zeros(3)    # what Base was actually sent
+        self._yaw_filt = 0.0          # low-passed yaw request (rad/s)
+        self._yaw_active = False      # hysteresis state: currently rotating?
+        self._lin_filt = (0.0, 0.0)   # low-passed linear request (fwd, lat, m/s)
+        self._lin_active = False      # hysteresis state: currently translating?
         # Per-tick dispatch telemetry for _TrajectoryRecorder. Written by the
         # dispatch methods, read once at the end of the same _step, so a logged
         # row always describes the tick that produced it rather than the
@@ -1127,6 +1365,8 @@ class WholeBodyController:
         # Reference for the heading rate limiter; None until the base first
         # moves, then frozen across stops. See _limit_heading_rate.
         self._base_heading: Optional[float] = None
+        # Last dispatched linear velocity, for the acceleration limiter.
+        self._base_vel_prev: tuple[float, float] = (0.0, 0.0)
         self._lift_dispatch: dict = {}
         # The hardware sync already reads both arms once per control tick. Keep
         # those samples for dispatch instead of making two more blocking CAN
@@ -1241,6 +1481,15 @@ class WholeBodyController:
             f"{self.ik.n_collision_pairs} collision pairs, "
             f"base motion {'ON' if self.config.enable_base_motion else 'OFF'}"
         )
+        alpha = float(self.config.base_feedback_alpha)
+        if alpha > 0.0 and self.config.enable_base_motion:
+            kp_dt = self.config.base_pose_kp_xy * self.dt
+            print(
+                f"[wholebody] base: base_feedback_alpha={alpha} pulls the pose "
+                f"target back toward odometry, so the base will settle at "
+                f"{100.0 * kp_dt / (alpha + kp_dt):.0f}% of the speed the "
+                f"solver asks for — see base_feedback_alpha"
+            )
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1321,6 +1570,8 @@ class WholeBodyController:
                            preview_time: float = 0.0) -> None:
         with self._lock:
             self.left_ee_target = ee_target
+            if gripper_target is not None:
+                self.left_gripper_target = float(gripper_target)
         if gripper_target is not None:
             self._set_gripper(self.left_arm, gripper_target)
 
@@ -1328,6 +1579,8 @@ class WholeBodyController:
                             preview_time: float = 0.0) -> None:
         with self._lock:
             self.right_ee_target = ee_target
+            if gripper_target is not None:
+                self.right_gripper_target = float(gripper_target)
         if gripper_target is not None:
             self._set_gripper(self.right_arm, gripper_target)
 
@@ -1340,6 +1593,10 @@ class WholeBodyController:
         with self._lock:
             self.left_ee_target = L_ee_target
             self.right_ee_target = R_ee_target
+            if L_gripper_target is not None:
+                self.left_gripper_target = float(L_gripper_target)
+            if R_gripper_target is not None:
+                self.right_gripper_target = float(R_gripper_target)
         if L_gripper_target is not None:
             self._set_gripper(self.left_arm, L_gripper_target)
         if R_gripper_target is not None:
@@ -1368,7 +1625,7 @@ class WholeBodyController:
         return self.ik.toggle_collision_avoidance(enable)
 
     def toggle_base_motion(self, enable: Optional[bool] = None) -> bool:
-        """Enable/disable dispatch of the solver's base velocity to the wheels."""
+        """Enable/disable dispatch of the solver's base pose to the wheels."""
         self.config.enable_base_motion = (
             (not self.config.enable_base_motion) if enable is None else bool(enable)
         )
@@ -1432,9 +1689,19 @@ class WholeBodyController:
         """Plain-type snapshot, matching YORMujoco.get_state()."""
         T_l, T_r = self.ik.forward_kinematics()
         q = self.ik.configuration.q
+        # Written whole each tick by the control thread, so one read is one
+        # tick's worth -- no lock needed, and no half-updated dict.
+        dispatch = self._base_dispatch or {}
+        pose_target = dispatch.get("target")
+        pose_error = dispatch.get("err")
         with self._lock:
             base_vel = self._last_base_velocity.copy()
             base_cmd = self._last_base_command.copy()
+            left_ee_target = self.left_ee_target
+            right_ee_target = self.right_ee_target
+            lift_target = self.lift_target
+            left_gripper_target = self.left_gripper_target
+            right_gripper_target = self.right_gripper_target
         return {
             "left_ee_wxyz_xyz": T_l.wxyz_xyz.tolist(),
             "right_ee_wxyz_xyz": T_r.wxyz_xyz.tolist(),
@@ -1442,6 +1709,18 @@ class WholeBodyController:
             "base_xytheta": self.odometry.pose.tolist(),
             "base_velocity": base_vel.tolist(),
             "base_command": base_cmd.tolist(),
+            # What the base is being driven *to* and how far off it is
+            # (chassis frame: forward, left, yaw). Without these the pose loop
+            # is invisible from outside -- a base that is not moving looks the
+            # same whether it has arrived or has lost authority.
+            "base_pose_target": (
+                None if pose_target is None
+                else np.asarray(pose_target, dtype=float).tolist()
+            ),
+            "base_pose_error": (
+                None if pose_error is None
+                else np.asarray(pose_error, dtype=float).tolist()
+            ),
             "fix_base": self.ik.fix_base,
             "fix_lift": self.ik.fix_lift,
             "collision_avoidance": self.ik.avoid_collisions,
@@ -1464,6 +1743,19 @@ class WholeBodyController:
             "lift_velocity_mode": bool(self._lift_velocity_mode),
             "lift_command_velocity": float(self._lift_cmd_velocity),
             "lift_feedback_age_s": self._lift_feedback_age(),
+            # What was last *asked* for, alongside what the robot is actually
+            # doing. Recorded episodes need the command as the action label;
+            # the measured pose above is the observation it produced. None
+            # means no command of that kind has arrived since initialise.
+            "left_ee_target_wxyz_xyz": (
+                None if left_ee_target is None else left_ee_target.wxyz_xyz.tolist()
+            ),
+            "right_ee_target_wxyz_xyz": (
+                None if right_ee_target is None else right_ee_target.wxyz_xyz.tolist()
+            ),
+            "lift_target": None if lift_target is None else float(lift_target),
+            "left_gripper_target": left_gripper_target,
+            "right_gripper_target": right_gripper_target,
         }
 
     # ── Control loop ─────────────────────────────────────────────────────────
@@ -1507,7 +1799,8 @@ class WholeBodyController:
 
         # A subsystem that is switched off still gets a row, marked inactive,
         # rather than carrying the last active tick's numbers forward.
-        self._base_dispatch = {"active": False, "req": result.base_velocity}
+        self._base_dispatch = {"active": False,
+                               "target": np.asarray(result.base_position, dtype=float)}
         self._lift_dispatch = {"active": False, "mode": "off"}
 
         if self.config.enable_arm_motion:
@@ -1557,8 +1850,23 @@ class WholeBodyController:
             self._measured_right_q = np.asarray(right_q, dtype=float).copy()
 
         lift = self._measured_lift() if self.config.use_measured_lift else None
+
+        # Base feedback is a first-order blend rather than a hard reset --
+        # see base_feedback_alpha. alpha 1 reproduces the old behaviour
+        # exactly; alpha 0 runs the base open loop, the same way the arms are
+        # run. The forced startup sync always hard-seeds from odometry so an
+        # open-loop run still starts at the robot's actual pose, mirroring
+        # the one-time encoder snapshot the arms get.
+        alpha = float(self.config.base_feedback_alpha)
+        if force_arm_read or alpha >= 1.0:
+            base = np.asarray(self.odometry.pose, dtype=float)
+        else:
+            belief = self.ik.configuration.q[self.ik.base_qpos_adrs]
+            err = np.asarray(self.odometry.pose, dtype=float) - belief
+            err[2] = _wrap_pi(err[2])
+            base = belief + alpha * err
         self.ik.set_measured_state(
-            left_q=left_q, right_q=right_q, lift=lift, base=self.odometry.pose
+            left_q=left_q, right_q=right_q, lift=lift, base=base
         )
 
     def _correct_base_from_slam(self) -> None:
@@ -1939,40 +2247,71 @@ class WholeBodyController:
             self._last_lift_command = None
 
     def _dispatch_base(self, result) -> None:
+        """Drive the chassis toward the base *pose* the solver asked for.
+
+        `result.base_position` is the IK's own belief about where the base
+        should be; the dead-reckoned pose is where it is. `BasePoseController`
+        (robot/base.py) closes a PD on the difference and returns a body-frame
+        velocity request, which then goes through exactly the chain the
+        solver's velocity used to: heading-rate limit, acceleration limit,
+        yaw filter, axis map, and the same relay.
+
+        Nothing about authority changes. A disabled base, `fix_base`, or a
+        live manual override still stops the base and now also resets the PD,
+        so the cycle that gets authority back starts from the pose measured
+        then rather than damping against motion it never commanded.
+        """
+        target = np.asarray(result.base_position, dtype=float).reshape(-1)[:3]
+
         if (not self.config.enable_base_motion
                 or self.ik.fix_base
                 or self.base_manually_overridden):
             if np.any(self._last_base_command):
                 self._halt_base()
+            # Forget the filters along with the motion: resuming later must
+            # not inherit a filtered value or a moving hysteresis state from
+            # before the override/disable.
+            self._yaw_filt = 0.0
+            self._yaw_active = False
+            self._lin_filt = (0.0, 0.0)
+            self._lin_active = False
+            self.base_pose.reset()
             with self._lock:
                 self._last_base_velocity = np.zeros(3)
             self._base_dispatch = {
                 "active": False,
-                "req": np.asarray(result.base_velocity, dtype=float),
+                "target": target.copy(),
+                "err": np.zeros(3),
+                "req": np.zeros(3),
                 "body": np.zeros(3),
                 "sent": np.zeros(3),
             }
             return
 
-        v_world = np.asarray(result.base_velocity, dtype=float)
-        forward, lateral, yaw_rate = self._world_to_body(v_world)
+        forward, lateral, yaw_rate = self.base_pose.compute(
+            target, self.odometry.pose, dt=self.dt)
+
+        request = np.array([forward, lateral, yaw_rate], dtype=float)
 
         forward, lateral = self._limit_linear(forward, lateral)
         forward, lateral = self._limit_heading_rate(forward, lateral)
-        yaw_rate = self._clamp(yaw_rate, self.config.base_max_ang_vel,
-                               self.config.base_yaw_deadband)
+        forward, lateral = self._limit_accel(forward, lateral)
+        yaw_rate = self._filter_yaw(yaw_rate)
 
         command = self.config.base_axis_map.to_command(forward, lateral, yaw_rate)
         self._send_base_command(command)
 
-        # `req` is the solver's unclamped world-frame ask, `body` is what
-        # survived the clamp and the deadband, `sent` is what left this file.
-        # Logging all three separates "the solver wanted little" from "the
-        # deadband ate it" from "the clamp capped it" -- three very different
-        # base-tuning problems that look identical at the wheels.
+        # `err` is the pose error the PD acted on, `req` its unshaped velocity
+        # request, `body` what survived the clamps and the deadband, `sent`
+        # what left this file. Logging all four separates "the base is already
+        # where it was asked to be" from "the deadband ate it" from "the clamp
+        # capped it" -- different base-tuning problems that look identical at
+        # the wheels.
         self._base_dispatch = {
             "active": True,
-            "req": v_world.copy(),
+            "target": target.copy(),
+            "err": self.base_pose.last_error.copy(),
+            "req": request,
             "body": np.array([forward, lateral, yaw_rate], dtype=float),
             "sent": command.copy(),
         }
@@ -2002,6 +2341,11 @@ class WholeBodyController:
 
         The robot faces −Y in the description and its left side is +X, so in
         the chassis frame forward = −v_y and left = +v_x (see BaseAxisMap).
+
+        This is the written-down form of that convention: `_body_to_world`
+        inverts it for odometry, and `BasePoseController`'s `heading_offset`
+        (base_pose_heading_offset, −π/2) reproduces it for the pose error.
+        Held to it by tests/test_wholebody_control.py::test_axis_map_and_odometry.
         """
         theta = float(self.odometry.pose[2])
         c, s = math.cos(theta), math.sin(theta)
@@ -2017,26 +2361,55 @@ class WholeBodyController:
         return np.array([c * vx_body - s * vy_body, s * vx_body + c * vy_body, yaw_rate])
 
     def _limit_linear(self, forward: float, lateral: float) -> tuple[float, float]:
-        """Deadband and clamp the linear velocity without rotating it.
+        """Clamp, low-pass and hysteresis-deadband the linear velocity.
 
-        Both operations act on the magnitude of (forward, lateral) and rescale
-        the pair, so the direction the solver asked for is the direction the
-        wheels get. Doing either per axis does not merely scale the command, it
-        turns it: dropping the smaller component of a diagonal leaves a
-        pure-axis motion, and clamping one axis first skews the rest.
+        Same three stages as `_filter_yaw`, in the same order and for the
+        same reasons:
 
-        That mattered more than it looks. `_dispatch_base` integrates the
-        result into `BaseOdometry`, so a distortion that always points at an
-        axis is a systematic bias in the pose the IK plans against -- it
-        accumulates rather than averaging out.
+        1. Clamp to base_max_lin_vel *before* filtering, so a one-tick
+           solver spike charges the filter with at most one tick of full
+           speed. The clamp acts on the magnitude of (forward, lateral) and
+           rescales the pair, so the direction the solver asked for is the
+           direction the wheels get -- clamping per axis would not merely
+           scale the command but turn it, and `_dispatch_base` integrates
+           the result into `BaseOdometry`, so a distortion that always
+           points at an axis accumulates as pose bias rather than averaging
+           out.
+        2. One-pole low-pass, per component so the direction is filtered
+           consistently with the magnitude. A single-tick burst decays
+           without reaching the entry threshold; a sustained request passes
+           with ~base_vel_filter_tau of onset lag. Filtering a convex
+           combination of clamped inputs cannot exceed the clamp, so no
+           re-clamp is needed.
+        3. Hysteresis deadband: motion starts above base_vel_deadband and
+           stops below base_vel_deadband_exit, so a request hovering near
+           the boundary does not re-aim all four swerve modules every other
+           tick.
         """
-        speed = math.hypot(forward, lateral)
-        if speed < self.config.base_vel_deadband:
-            return 0.0, 0.0
         limit = self.config.base_max_lin_vel
+        speed = math.hypot(forward, lateral)
         if speed > limit:
             scale = limit / speed
             forward, lateral = forward * scale, lateral * scale
+
+        tau = self.config.base_vel_filter_tau
+        if tau > 0.0:
+            alpha = self.dt / (tau + self.dt)
+            ff, fl = self._lin_filt
+            ff += alpha * (float(forward) - ff)
+            fl += alpha * (float(lateral) - fl)
+            self._lin_filt = (ff, fl)
+            forward, lateral = ff, fl
+            speed = math.hypot(forward, lateral)
+        else:
+            self._lin_filt = (float(forward), float(lateral))
+
+        if self._lin_active:
+            self._lin_active = speed >= self.config.base_vel_deadband_exit
+        else:
+            self._lin_active = speed >= self.config.base_vel_deadband
+        if not self._lin_active:
+            return 0.0, 0.0
         return float(forward), float(lateral)
 
     def _limit_heading_rate(self, forward: float, lateral: float) -> tuple[float, float]:
@@ -2091,6 +2464,68 @@ class WholeBodyController:
         self._base_heading = heading
         return float(forward), float(lateral)
 
+    def _filter_yaw(self, yaw_rate: float) -> float:
+        """Low-pass, hysteresis-deadband and clamp the yaw request.
+
+        Three stages, in an order that matters:
+
+        1. Clamp to the ang-vel limit *before* filtering, so a one-tick
+           solver spike (12 rad/s was observed) charges the filter with at
+           most one tick of full-rate rotation, not two hundred.
+        2. One-pole low-pass. A single-tick pulse decays without ever
+           reaching the entry threshold; a sustained request passes with
+           ~base_yaw_filter_tau of onset lag.
+        3. Hysteresis deadband: start rotating above base_yaw_deadband, stop
+           below base_yaw_deadband_exit. The gap keeps a request hovering at
+           the boundary from toggling the module geometry every tick — the
+           chatter measured at 7.4 toggles/s on 2026-08-24.
+        """
+        limit = self.config.base_max_ang_vel
+        yaw_rate = float(np.clip(yaw_rate, -limit, limit))
+
+        tau = self.config.base_yaw_filter_tau
+        if tau > 0.0:
+            alpha = self.dt / (tau + self.dt)
+            self._yaw_filt += alpha * (yaw_rate - self._yaw_filt)
+        else:
+            self._yaw_filt = yaw_rate
+
+        mag = abs(self._yaw_filt)
+        if self._yaw_active:
+            self._yaw_active = mag >= self.config.base_yaw_deadband_exit
+        else:
+            self._yaw_active = mag >= self.config.base_yaw_deadband
+        return self._yaw_filt if self._yaw_active else 0.0
+
+    def _limit_accel(self, forward: float, lateral: float) -> tuple[float, float]:
+        """Bound how fast the commanded velocity vector may change.
+
+        This is the reversal guard that `_limit_heading_rate` cannot be: that
+        one measures a >90 deg change against the reversed previous heading,
+        because a module serves a reversal by flipping the drive. True for the
+        module, false for the chassis, and the chassis is what has momentum.
+
+        Stopping is exempt. An exact zero -- a deadbanded command, a halt --
+        goes straight through, so nothing here can delay the base coming to
+        rest.
+        """
+        limit = self.config.base_max_accel
+        if limit <= 0.0:
+            return forward, lateral
+        if forward == 0.0 and lateral == 0.0:
+            self._base_vel_prev = (0.0, 0.0)
+            return forward, lateral
+
+        prev_f, prev_l = self._base_vel_prev
+        df, dl = forward - prev_f, lateral - prev_l
+        change = math.hypot(df, dl)
+        max_step = limit * self.dt
+        if change > max_step and change > 1e-12:
+            scale = max_step / change
+            forward, lateral = prev_f + df * scale, prev_l + dl * scale
+        self._base_vel_prev = (float(forward), float(lateral))
+        return float(forward), float(lateral)
+
     def _clamp(self, value: float, limit: float,
                deadband: Optional[float] = None) -> float:
         if deadband is None:
@@ -2109,6 +2544,12 @@ class WholeBodyController:
         except Exception as exc:
             print(f"[wholebody] base halt failed: {exc}")
         self._last_base_command = np.zeros(3)
+        self._base_vel_prev = (0.0, 0.0)
+        # A halt is a discontinuity in the measured pose as far as the PD is
+        # concerned -- the base may be pushed, or simply stand still while the
+        # solver's belief moves on. Damping the first cycle after a resume
+        # against that would be damping against motion that never happened.
+        self.base_pose.reset()
 
     def _halt_lift(self) -> None:
         """Stop the lift and forget everything the PD knew about its motion.
