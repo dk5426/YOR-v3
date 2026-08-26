@@ -477,7 +477,7 @@ class BaseController:
         k_pos: float = 1.5,
         ki_pos: float = 0.01,
         kd_pos: float = 0.15,
-        k_theta: float = 2.1,
+        k_theta: float = 1.3, # 2.1
         ki_theta: float = 0.01,
         kd_theta: float = 0.2,
         drive_vel_scale: Optional[float] = None,
@@ -610,10 +610,10 @@ class BaseController:
 
     def _run(self):
         Ld_base: float = 0.32
-        Ld_gain: float = 0.4
+        Ld_gain: float = 0.8 # 0.4
         Ld_min: float = 0.30   # was 0.20 — higher min prevents chasing a point under the nose
-        Ld_max: float = 0.40
-        end_dist_tol: float = 0.25  # was 0.08 — switch to MOVE_TO further out for smooth braking
+        Ld_max: float = 0.70 # 0.40
+        end_dist_tol: float = 0.25 
         last_path_uid = None
 
         v_meas_filt = 0.0
