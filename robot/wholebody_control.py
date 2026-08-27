@@ -107,6 +107,25 @@ try:
 except Exception:  # pragma: no cover - only when the CAN stack is absent
     _MODULE_LABELS, _NUM_SWERVES = ("FL", "FR", "RR", "RL"), 4
 
+# The module geometry, for SwerveTwistShaper. Same provenance and the same
+# fallback as the labels above: the shaper has to reproduce base_motor's wheel
+# vectors *exactly* -- it exists to predict the angle base_motor will command
+# -- so the constants are imported rather than restated, and the fallback is
+# only so this file still imports without the CAN stack.
+try:
+    from robot.base_motor import (
+        LENGTH as _MODULE_HALF_LENGTH,
+        WIDTH as _MODULE_HALF_WIDTH,
+        ROT_DIAG_SWAP_PERM as _MODULE_ROT_PERM,
+        TRANS_OPPOSITE_MASK as _MODULE_TRANS_MASK,
+        ZERO_SPEED_EPS_MPS as _MODULE_ZERO_SPEED_EPS,
+    )
+except Exception:  # pragma: no cover - only when the CAN stack is absent
+    _MODULE_HALF_LENGTH, _MODULE_HALF_WIDTH = 0.1225, 0.170
+    _MODULE_ROT_PERM = np.array([1, 0, 3, 2], dtype=int)
+    _MODULE_TRANS_MASK = np.array([False, False, False, False], dtype=bool)
+    _MODULE_ZERO_SPEED_EPS = 1e-3
+
 # The base is driven by pose, and that controller lives with the rest of the
 # base hardware in robot/base.py (base_motor.py stays swerve kinematics and
 # motor control, and knows nothing about where the chassis is). Guarded for the
@@ -167,6 +186,194 @@ class BaseAxisMap:
         cmd[self.lateral_index] = self.lateral_sign * lateral
         cmd[self.yaw_index] = self.yaw_sign * yaw_rate
         return cmd
+
+
+class SwerveTwistShaper:
+    """Bound how fast the *module angles* a twist implies may change.
+
+    Every other shaper in `_dispatch_base` limits a component of the chassis
+    twist — the linear magnitude, the linear direction, the linear
+    acceleration, the yaw rate — and none of them limits the quantity the
+    hardware actually has to serve, which is the four steering angles. Those
+    are a function of all three components together::
+
+        w_i = R_i(v_fwd, v_lat) + omega * a_i        theta_i = atan2(w_i)
+
+    so a change confined to one component still swings the modules, and the
+    swing is unbounded near the origin: `atan2` of a short vector is
+    ill-conditioned, and `w_i` is short exactly when the chassis is creeping.
+
+    That is the drive/spin transition. A twist of ``(0, 0, omega)`` points the
+    modules tangent to the chassis circle; the instant a linear component
+    appears they are asked to point somewhere else entirely, in one tick.
+    Measured on the 2026-08-25/26 runs, folding out the 180 deg reversal a
+    module serves for free with the drive sign: single-tick steering travel
+    reached 88-90 deg against a 20 ms sample, i.e. ~4400 deg/s demanded of
+    modules that slew at 265-353. 0.6-2.4% of moving ticks were over that
+    ceiling, and 10-59% of those sat in the mixed regime where ``r*omega`` and
+    ``|v|`` are within a factor of five of each other -- the transition
+    itself. A module that cannot get there is a wheel dragging sideways, and
+    four of them dragging in different directions is the twitch.
+
+    The fix is to shape the twist in module space. Given the twist last issued
+    and the one now wanted, walk as far along the segment between them as the
+    modules can follow::
+
+        q = q_prev + s * (q_des - q_prev),   s in [0, 1] as large as
+        travel_i(q) <= budget_i  for every module
+
+    A segment in twist space maps each ``w_i`` onto a straight line in the
+    plane, and a point moving along a line sweeps its polar angle
+    monotonically, so ``travel_i(s)`` is monotone and a short bisection finds
+    the largest feasible ``s``. Whatever is left over is not lost: the caller
+    integrates what was issued into `BaseOdometry`, so the residual reappears
+    as pose error next tick and the PD asks for it again. The transition takes
+    the several ticks it physically takes, instead of being demanded in one
+    and delivered in none.
+
+    ``travel`` is measured modulo pi. A 180 deg direction change costs a
+    module nothing -- it flips the drive sign and does not turn -- and
+    base_motor does exactly that, so charging for it would rate-limit a move
+    the hardware makes instantly.
+
+    ``budget`` is a scrub budget, not a flat angle rate. What hurts is a
+    *rolling* wheel being dragged across its own direction; a wheel that is
+    barely turning can be re-aimed for free, and has to be, or the base could
+    never set off in a new direction from rest. So the per-module allowance is
+    ``slew_limit`` at or above ``free_speed`` of wheel speed and opens up
+    inversely below it, to at most ``free_ratio`` times the limit. Equivalent
+    statement: ``|v_i| * dtheta_i/dt <= free_speed * slew_limit``, floored at
+    the plain slew limit.
+    """
+
+    def __init__(self, slew_limit: float, free_speed: float,
+                 free_ratio: float, iterations: int = 12) -> None:
+        self.slew_limit = float(slew_limit)
+        self.free_speed = float(free_speed)
+        self.free_ratio = float(free_ratio)
+        self.iterations = int(iterations)
+
+        # Module arm vectors, written with base_motor's own expression so the
+        # two cannot drift: w_r = omega * arm_i.
+        w, l = float(_MODULE_HALF_WIDTH), float(_MODULE_HALF_LENGTH)
+        arm_x = np.array([+w, -w, -w, +w], dtype=float)[_MODULE_ROT_PERM]
+        arm_y = np.array([+l, +l, -l, -l], dtype=float)[_MODULE_ROT_PERM]
+        self._arm = np.stack([arm_x, arm_y], axis=1)                  # (4, 2)
+        self._trans_sign = np.where(
+            _MODULE_TRANS_MASK, -1.0, 1.0).astype(float)[:, None]     # (4, 1)
+
+        self._prev = np.zeros(3, dtype=float)
+        self._dir = np.tile(np.array([1.0, 0.0]), (_NUM_SWERVES, 1))
+        self.last_scale = 1.0
+
+    # ── geometry ────────────────────────────────────────────────────────────
+
+    def wheel_velocities(self, twist) -> np.ndarray:
+        """Body twist (forward, lateral, yaw) → per-module velocity vectors."""
+        q = np.asarray(twist, dtype=float).reshape(3)
+        return self._trans_sign * q[:2] + self._arm * q[2]
+
+    @staticmethod
+    def _travel(ref: np.ndarray, target: np.ndarray) -> np.ndarray:
+        """Steering travel from directions ``ref`` to ``target``, in [0, pi/2].
+
+        Modulo pi, because a reversal is served by the drive sign. A module
+        whose target vector is degenerate reads as zero travel, which is right:
+        it has no direction to be asked for.
+        """
+        cross = ref[:, 0] * target[:, 1] - ref[:, 1] * target[:, 0]
+        dot = ref[:, 0] * target[:, 0] + ref[:, 1] * target[:, 1]
+        ang = np.abs(np.arctan2(cross, dot))
+        return np.minimum(ang, math.pi - ang)
+
+    def _budget(self, speeds: np.ndarray, dt: float) -> np.ndarray:
+        limit = self.slew_limit * dt
+        if self.free_speed <= 0.0:
+            return np.full(_NUM_SWERVES, limit)
+        relax = np.clip(self.free_speed / np.maximum(speeds, 1e-9),
+                        1.0, max(self.free_ratio, 1.0))
+        return limit * relax
+
+    def _feasible(self, twist, budget: np.ndarray) -> bool:
+        w = self.wheel_velocities(twist)
+        return bool(np.all(self._travel(self._dir, w) <= budget))
+
+    # ── state ───────────────────────────────────────────────────────────────
+
+    def reset(self, module_angles=None) -> None:
+        """Forget the issued twist; optionally re-seed from measured angles.
+
+        Called whenever the base loses authority or halts. The *directions* are
+        deliberately kept unless measurements are supplied: the modules do not
+        move when the base is disarmed (base_motor leaves the steering
+        setpoints standing), so where they are pointing is still the right
+        reference for the tick that gets authority back.
+        """
+        self._prev = np.zeros(3, dtype=float)
+        self.last_scale = 1.0
+        if module_angles is None:
+            return
+        ang = np.asarray(module_angles, dtype=float).reshape(-1)
+        if ang.size != _NUM_SWERVES or not np.all(np.isfinite(ang)):
+            return
+        self._dir = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+
+    def _commit(self, twist: np.ndarray) -> None:
+        self._prev = np.array(twist, dtype=float)
+        w = self.wheel_velocities(self._prev)
+        speed = np.linalg.norm(w, axis=1)
+        moving = speed > _MODULE_ZERO_SPEED_EPS
+        if np.any(moving):
+            # Mirrors base_motor: a module asked for no speed holds its angle,
+            # so the reference for the next tick is where it is still pointing.
+            self._dir = np.where(moving[:, None],
+                                 w / np.maximum(speed[:, None], 1e-12),
+                                 self._dir)
+
+    # ── the shaper ──────────────────────────────────────────────────────────
+
+    def shape(self, twist, dt: float) -> np.ndarray:
+        """Largest step from the last issued twist toward ``twist``."""
+        want = np.asarray(twist, dtype=float).reshape(3)
+
+        # Disabled, no time step, or a full stop. Stopping is exempt for the
+        # same reason it is exempt from the acceleration limit: nothing may
+        # delay the base coming to rest, and a twist of exactly zero leaves
+        # base_motor holding the module angles rather than re-aiming them.
+        if self.slew_limit <= 0.0 or dt <= 0.0 or not np.any(want):
+            self.last_scale = 1.0
+            self._commit(want)
+            return want
+
+        # Budgeted on the speed the wheels are *already* carrying, not on the
+        # speed being asked for. Scrub is a rolling wheel dragged sideways, and
+        # a module that is stopped is not rolling: base_motor scales each drive
+        # by the cosine of its measured steering error, so a module commanded
+        # to a new angle and a new speed at once gets no drive until it has
+        # turned. Budgeting on the request instead would throttle every
+        # departure from rest -- it measured 0.0022 m/s issued against a
+        # 0.2 m/s strafe -- for a scrub that never happens.
+        budget = self._budget(
+            np.linalg.norm(self.wheel_velocities(self._prev), axis=1), dt)
+
+        if self._feasible(want, budget):
+            self.last_scale = 1.0
+            self._commit(want)
+            return want
+
+        lo, hi = 0.0, 1.0
+        delta = want - self._prev
+        for _ in range(self.iterations):
+            mid = 0.5 * (lo + hi)
+            if self._feasible(self._prev + mid * delta, budget):
+                lo = mid
+            else:
+                hi = mid
+
+        out = self._prev + lo * delta
+        self.last_scale = float(lo)
+        self._commit(out)
+        return out
 
 
 @dataclass
@@ -473,6 +680,33 @@ class WholeBodyHardwareConfig:
     # An exact zero is exempt: stopping is never delayed, so a deadbanded
     # command or a halt still takes effect immediately. Set to 0 to disable.
     base_max_accel: float = 1.5             # m/s^2
+    # ── Swerve module slew (SwerveTwistShaper) ──────────────────────────────
+    # The three limits above each bound one component of the twist. None of
+    # them bounds the four steering angles, which depend on all three at once
+    # -- so a twist that passes every one of them can still demand a 90 deg
+    # module swing in a single tick, and the drive/spin transition demands
+    # exactly that. See SwerveTwistShaper for the measurement.
+    #
+    # base_module_slew_limit is the ceiling on commanded module angular rate,
+    # in rad/s. Same number and same justification as
+    # base_heading_rate_limit -- modules measured at 265-353 deg/s, so 200
+    # deg/s leaves 1.3-1.8x margin -- but applied to the angle the module is
+    # actually given rather than to the translation heading alone. Set to 0 to
+    # disable the shaper entirely.
+    base_module_slew_limit: float = 3.49    # rad/s (200 deg/s)
+    # Wheel speed at or above which the full limit applies. Below it the
+    # allowance opens up inversely: a wheel that is barely rolling scrubs
+    # nothing when it is re-aimed, and has to be free to re-aim or the base
+    # could never set off in a new direction from a standstill. 0.03 m/s is
+    # about half base_vel_deadband's old value and well above the 1 mm/s
+    # base_motor treats as no direction at all.
+    base_module_free_speed: float = 0.03    # m/s
+    # How far that relaxation may go. 20x turns the 200 deg/s ceiling into
+    # 4000 deg/s at a standstill, i.e. effectively unlimited -- the module is
+    # then commanded straight to its new angle and base_motor's
+    # cos_error_scaling holds the drive back until it arrives, which is the
+    # correct "align, then go".
+    base_module_free_ratio: float = 20.0
     # ── Base pose PD ────────────────────────────────────────────────────────
     # Gains for BasePoseController (robot/base.py), which turns the solver's
     # base *pose* target into the velocity request the chain above shapes.
@@ -1300,6 +1534,8 @@ class _TrajectoryRecorder:
                 f"use_measured_arm_state={hw_config.use_measured_arm_state}",
                 f"base_pid={getattr(hw_config, 'base_pid_provenance', 'unknown')}",
                 f"base_heading_rate_limit={hw_config.base_heading_rate_limit}",
+                f"base_module_slew_limit={hw_config.base_module_slew_limit}",
+                f"base_module_free_speed={hw_config.base_module_free_speed}",
                 f"base_max_accel={hw_config.base_max_accel}",
                 f"base_yaw_deadband={hw_config.base_yaw_deadband}",
                 f"base_yaw_deadband_exit={hw_config.base_yaw_deadband_exit}",
@@ -1367,7 +1603,13 @@ class _TrajectoryRecorder:
                    "base_body_fwd", "base_body_lat", "base_body_yaw",
                    "base_sent_0", "base_sent_1", "base_sent_2",
                    "base_leash",
-                   "base_ff_fwd", "base_ff_lat", "base_ff_yaw"]
+                   "base_ff_fwd", "base_ff_lat", "base_ff_yaw",
+                   # Fraction of the shaped step SwerveTwistShaper allowed
+                   # this tick: 1.0 when the modules could follow, less when
+                   # the twist was walked toward the request instead of
+                   # jumping to it. Anything persistently below 1 is the
+                   # drive/spin transition being paid for over several ticks.
+                   "base_slew_scale"]
         # What Base itself was holding, so a mismatch against base_sent_*
         # localises to the relay or to a manual override stealing the base.
         header += ["swerve_enabled",
@@ -1448,6 +1690,7 @@ class _TrajectoryRecorder:
         row += self._vec(base.get("sent"), 3)
         row += [self._f(base.get("leash"))]
         row += self._vec(base.get("ff"), 3)
+        row += self._vec(base.get("slew_scale"), 1)
 
         swerve = swerve or {}
         row += [str(bool(swerve.get("motors_enabled", False)))]
@@ -1621,6 +1864,15 @@ class WholeBodyController:
         # Metres the base leash clamped off the solver's belief this tick, for
         # the trajectory log. Rewritten every tick by _leash_base.
         self._base_leash: float = 0.0
+        # Final stage of the base shaping chain: bounds the rate of change of
+        # the four *module angles*, which is the thing the wheels have to
+        # serve and the thing none of the per-component limiters above can
+        # see. See SwerveTwistShaper.
+        self._twist_shaper = SwerveTwistShaper(
+            slew_limit=self.config.base_module_slew_limit,
+            free_speed=self.config.base_module_free_speed,
+            free_ratio=self.config.base_module_free_ratio,
+        )
         self._lift_dispatch: dict = {}
         # The hardware sync already reads both arms once per control tick. Keep
         # those samples for dispatch instead of making two more blocking CAN
@@ -2238,6 +2490,25 @@ class WholeBodyController:
                 self.right_ee_target = out[1]
         return out[0], out[1]
 
+    def _measured_module_angles(self) -> Optional[np.ndarray]:
+        """Absolute steering angles, or None when the base cannot report them.
+
+        Only used to re-seed `SwerveTwistShaper` after a halt or an authority
+        change. Optional for the same reason `_swerve_telemetry` is: `Base` is
+        stubbed in tests, and a missing reading must cost the shaper its seed,
+        not the tick.
+        """
+        snapshot = self._swerve_telemetry()
+        if not snapshot:
+            return None
+        angles = snapshot.get("steer_meas_rad")
+        if angles is None:
+            return None
+        angles = np.asarray(angles, dtype=float).reshape(-1)
+        if angles.size != _NUM_SWERVES or not np.all(np.isfinite(angles)):
+            return None
+        return angles
+
     def _swerve_telemetry(self) -> Optional[dict]:
         """Module-level commanded/measured state, or None if unavailable.
 
@@ -2713,6 +2984,7 @@ class WholeBodyController:
             self._yaw_active = False
             self._lin_filt = (0.0, 0.0)
             self._lin_active = False
+            self._twist_shaper.reset(self._measured_module_angles())
             self.base_pose.reset()
             with self._lock:
                 self._last_base_velocity = np.zeros(3)
@@ -2736,6 +3008,23 @@ class WholeBodyController:
         forward, lateral = self._limit_accel(forward, lateral)
         yaw_rate = self._filter_yaw(yaw_rate)
 
+        # Last, and on all three components at once. Everything above shapes
+        # one component in isolation and so cannot see the module angles the
+        # combination implies -- including the deadbands, whose drop to
+        # exactly zero is a *step* in the geometry whenever the other channel
+        # is still live: (f, l, w) -> (0, 0, w) re-aims all four modules by up
+        # to 90 degrees in one tick, and passes the acceleration limiter
+        # untouched because that one exempts zero. Putting the shaper after
+        # them is what closes that hole.
+        shaped = self._twist_shaper.shape((forward, lateral, yaw_rate), self.dt)
+        forward, lateral, yaw_rate = (float(shaped[0]), float(shaped[1]),
+                                      float(shaped[2]))
+        # The acceleration limiter measures the next tick's change against
+        # what was actually issued, not against the value the shaper declined
+        # to send -- otherwise its budget is spent on motion that never
+        # happened.
+        self._base_vel_prev = (forward, lateral)
+
         command = self.config.base_axis_map.to_command(forward, lateral, yaw_rate)
         self._send_base_command(command)
 
@@ -2754,6 +3043,7 @@ class WholeBodyController:
             "sent": command.copy(),
             "leash": self._base_leash,
             "ff": self.base_pose.last_feedforward.copy(),
+            "slew_scale": float(self._twist_shaper.last_scale),
         }
 
         # Odometry integrates what was *commanded* after clamping, so the
@@ -2985,6 +3275,7 @@ class WholeBodyController:
             print(f"[wholebody] base halt failed: {exc}")
         self._last_base_command = np.zeros(3)
         self._base_vel_prev = (0.0, 0.0)
+        self._twist_shaper.reset(self._measured_module_angles())
         # A halt is a discontinuity in the measured pose as far as the PD is
         # concerned -- the base may be pushed, or simply stand still while the
         # solver's belief moves on. Damping the first cycle after a resume

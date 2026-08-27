@@ -486,6 +486,141 @@ def test_heading_rate_limit() -> None:
     check("limit 0 disables it", wbc._limit_heading_rate(0.0, 0.2) == (0.0, 0.2))
 
 
+def _module_travel(shaper, twist, ref=None) -> np.ndarray:
+    """Steering travel each module makes to serve ``twist``, in radians.
+
+    ``ref`` is where the modules were pointing beforehand. It has to be
+    snapshotted *before* ``shape`` runs -- the shaper advances its own
+    reference on commit, so reading it afterwards measures nothing.
+    """
+    if ref is None:
+        ref = shaper._dir
+    w = shaper.wheel_velocities(twist)
+    speed = np.linalg.norm(w, axis=1)
+    unit = w / np.maximum(speed[:, None], 1e-12)
+    return np.where(speed > 1e-3, shaper._travel(ref, unit), 0.0)
+
+
+def _worst_travel(shaper, twists, dt) -> float:
+    """Largest single-tick module travel while ``twists`` are issued."""
+    worst = 0.0
+    for twist in twists:
+        ref = shaper._dir.copy()
+        issued = shaper.shape(twist, dt)
+        worst = max(worst, float(_module_travel(shaper, issued, ref).max()))
+    return worst
+
+
+def test_module_slew_shaper() -> None:
+    """The drive/spin transition must be walked, not demanded in one tick.
+
+    A twist of (0, 0, omega) points the modules tangent to the chassis circle;
+    the tick a linear component appears they are asked to point somewhere else
+    entirely. Every other limiter in the dispatch chain shapes one component of
+    the twist in isolation and so cannot see this: the 2026-08-25/26 logs show
+    single-tick steering travel of 88-90 deg -- ~4400 deg/s against modules
+    that slew at 265-353 -- on 2.2-5.7 percent of commands.
+
+    SwerveTwistShaper bounds the thing the hardware actually serves. What it
+    holds back is deferred, not lost: `_dispatch_base` integrates what was
+    issued, so the residual reappears as pose error and the PD asks again.
+    """
+    print("\nswerve module slew shaper")
+    from robot.wholebody_control import SwerveTwistShaper, WholeBodyHardwareConfig
+
+    cfg = WholeBodyHardwareConfig()
+    dt = 1.0 / cfg.control_hz
+    limit = cfg.base_module_slew_limit
+    step = limit * dt
+
+    check("a module slew limit is configured under the slowest module (265 deg/s)",
+          0 < math.degrees(limit) < 265, f"{math.degrees(limit):.0f} deg/s")
+
+    def fresh():
+        return SwerveTwistShaper(limit, cfg.base_module_free_speed,
+                                 cfg.base_module_free_ratio)
+
+    # The reported failure, both ways round. Every module has to stay inside
+    # its budget on the transition tick and on every tick after it.
+    for label, settle, want in (
+        ("spin -> drive", (0.0, 0.0, 0.30), (0.12, 0.0, 0.30)),
+        ("drive -> spin", (0.20, 0.0, 0.00), (0.0, 0.0, 0.45)),
+        ("yaw reversal while driving", (0.15, 0.0, 0.35), (0.15, 0.0, -0.35)),
+    ):
+        sh = fresh()
+        for _ in range(10):
+            sh.shape(settle, dt)
+        worst = _worst_travel(sh, [want] * 60, dt)
+        check(f"{label}: no module is asked past its budget",
+              0.0 < worst <= step + 1e-9,
+              f"{math.degrees(worst):.2f} of {math.degrees(step):.2f} deg/tick")
+        issued = sh.shape(want, dt)
+        check(f"{label}: ...and it still converges on the request",
+              np.allclose(issued, want, atol=1e-6), f"{np.round(issued, 4)}")
+
+    # The unshaped demand really is out of reach -- otherwise the test above
+    # proves nothing about hardware.
+    sh = SwerveTwistShaper(0.0, cfg.base_module_free_speed, cfg.base_module_free_ratio)
+    for _ in range(10):
+        sh.shape((0.0, 0.0, 0.30), dt)
+    bare = float(_module_travel(sh, (0.12, 0.0, 0.30)).max()) / dt
+    check("...and unshaped, that same transition is beyond any module",
+          math.degrees(bare) > 353, f"{math.degrees(bare):.0f} deg/s")
+
+    # The deadband hole: dropping the linear channel to exactly zero while yaw
+    # is live is a step in the geometry, and it bypassed the acceleration
+    # limiter because that one exempts zero.
+    sh = fresh()
+    for _ in range(10):
+        sh.shape((0.06, 0.0, 0.25), dt)
+    worst = _worst_travel(sh, [(0.0, 0.0, 0.25), (0.06, 0.0, 0.25)] * 20, dt)
+    check("a deadbanded linear channel with yaw live is shaped, not stepped",
+          0.0 < worst <= step + 1e-9,
+          f"{math.degrees(worst):.2f} of {math.degrees(step):.2f} deg/tick")
+
+    # Setting off from rest must not be throttled: a stopped wheel scrubs
+    # nothing when it is re-aimed, and base_motor's cos_error_scaling holds the
+    # drive back until the module has turned.
+    check("a departure from rest is issued in full",
+          np.allclose(fresh().shape((0.0, 0.20, 0.0), dt), (0.0, 0.20, 0.0)),
+          f"{np.round(fresh().shape((0.0, 0.20, 0.0), dt), 5)}")
+
+    # Stopping is never delayed, for the same reason it is exempt from the
+    # acceleration limiter.
+    sh = fresh()
+    for _ in range(20):
+        sh.shape((0.25, 0.0, 0.40), dt)
+    check("a full stop goes straight through",
+          np.array_equal(sh.shape((0.0, 0.0, 0.0), dt), np.zeros(3)))
+
+    # A held command must track exactly. A rate limit that converges in finite
+    # time has no steady-state lag; a filter would.
+    sh = fresh()
+    for _ in range(80):
+        held = sh.shape((0.1, 0.05, 0.2), dt)
+    check("a held command is tracked exactly, with no residual lag",
+          np.allclose(held, (0.1, 0.05, 0.2), atol=1e-9) and sh.last_scale == 1.0,
+          f"{np.round(held, 6)} scale={sh.last_scale}")
+
+    # Disabling restores the old behaviour exactly.
+    off = SwerveTwistShaper(0.0, cfg.base_module_free_speed, cfg.base_module_free_ratio)
+    check("limit 0 disables the shaper",
+          np.array_equal(off.shape((0.1, 0.05, 0.2), dt), np.array([0.1, 0.05, 0.2])))
+
+    # The shaper predicts base_motor's angles, so it has to use base_motor's
+    # geometry. A restated copy that drifted would silently shape the wrong
+    # thing.
+    bare = bare_base()
+    sh = fresh()
+    for twist in ((0.2, 0.1, 0.3), (0.0, 0.0, 0.4), (-0.15, 0.05, -0.2)):
+        _, angles = bare._vehicle_velocity_to_angle_and_speed(
+            np.array(twist), cos_error_scaling=False)
+        w = sh.wheel_velocities(twist)
+        mine = np.arctan2(w[:, 1], w[:, 0])
+        agree = np.all(np.abs(np.sin(mine - angles)) < 1e-9)   # modulo the flip
+        check(f"the shaper's wheel vectors match base_motor for {twist}", agree)
+
+
 def test_deadband_keeps_the_base_out_of_the_bad_regime() -> None:
     print("\nlinear deadband value")
     from robot.wholebody_control import WholeBodyHardwareConfig
@@ -939,6 +1074,7 @@ def main() -> int:
         test_axis_map_is_not_crossed,
         test_linear_limits_preserve_direction,
         test_heading_rate_limit,
+        test_module_slew_shaper,
         test_deadband_keeps_the_base_out_of_the_bad_regime,
         test_drive_scale_travels_with_the_gain_set,
         test_steering_feedback_is_closed,
