@@ -126,6 +126,51 @@ DRIVE_VEL_SCALE = 2.0
 # velocity the base is ever asked for and safely above float noise.
 ZERO_SPEED_EPS_MPS = 1e-3
 
+# Ceiling on how fast a *measured* steering angle may plausibly change, used to
+# reject bad absolute-encoder samples in Base._update_state.
+#
+# The modules were measured at 265-353 deg/s (4.6-6.2 rad/s) turning flat out,
+# so anything past 7 rad/s did not happen mechanically -- it is a Period5 CAN
+# frame that arrived late, was dropped, or was decoded from a stale cache.
+# Measured on the 2026-08-27 wholebody runs: while the base was actually
+# driving, 11-12% of samples implied a rate above 12 rad/s, with jumps as large
+# as pi. Stationary the same figure is 0.11%, which is the tell -- a stale frame
+# is invisible when the true angle is not changing.
+#
+# That matters because steer_pos is not just telemetry. It decides the
+# shortest-path flip in _vehicle_velocity_to_angle_and_speed, it scales the
+# drive setpoint through cos_error_scaling, and it *becomes* the steering
+# command for a module below ZERO_SPEED_EPS_MPS. One bad sample therefore
+# jumped a module command by pi and reversed its drive velocity: the same runs
+# logged 386 pi-jumps and 228 drive sign reversals, every reversal on the same
+# tick as a jump, against a mean drive command of only 0.047 m/s.
+#
+# Deliberately a slew limit on the measurement, not a hysteresis band on the
+# flip test. The bad samples do not dither around the pi/2 flip threshold, they
+# teleport across it -- median error at the flip tick was 2.6 rad -- so the band
+# needed to reject them is wider than pi, which is the same as never flipping at
+# all and costs a 180 deg re-aim on every direction change. The defect is in the
+# measurement, so it is fixed in the measurement, once, for all three consumers.
+STEER_MAX_MEAS_RATE = 7.0  # rad/s
+
+# Ceiling on the travel budget the gate will let accrue between moves of its
+# estimate, as a time: 3 Period5 frame periods, the measured p90 gap between
+# frames (median 20 ms, p90 60 ms -- the occasional dropped frame).
+#
+# Without it the budget grows without bound while a module sits still, because
+# a reading identical to the estimate never moves it and so never restarts the
+# clock. Measured on the 2026-08-27 logs, a parked module holds a bit-identical
+# reading for up to 820 ms, which would have left 5.7 rad of budget waiting for
+# whatever sample came next -- and parked-then-moving is exactly when the base
+# sets off, which is exactly when the bad frames appear.
+#
+# Capping is sound because identical frames from a parked module corroborate
+# its position rather than hiding motion behind it: no travel is accumulating
+# unobserved, so no budget should accumulate either. Well clear of what real
+# motion needs -- a module at the 6.2 rad/s it can actually reach covers
+# 0.12 rad per frame against the 0.42 rad this allows.
+STEER_MAX_BUDGET_S = 0.060
+
 # ----------------------------
 # Base velocity ramp
 # ----------------------------
@@ -845,6 +890,18 @@ class Base:
 
         self.steer_pos = np.zeros(NUM_SWERVES)
         self.drive_vel = np.zeros(NUM_SWERVES)
+
+        # --- Steering measurement gate (see _gate_steer_measurement) ---
+        # `_gate_prev` is the current estimate, `_move_t` when each module's
+        # estimate last moved (the clock the rate budget accrues on), and
+        # `_rejects` a per-module count of clamped samples for the periodic
+        # health line. Seeded on the first read rather than here, because zero
+        # is a real angle and filtering toward it would fight startup homing.
+        self._steer_gate_seeded = False
+        self._steer_gate_prev = np.zeros(NUM_SWERVES)
+        self._steer_move_t = np.zeros(NUM_SWERVES)
+        self._steer_rejects = np.zeros(NUM_SWERVES, dtype=np.int64)
+        self._steer_gate_last_report = 0.0
         self.x = np.zeros(3)
         self.dx = np.zeros(3)
 
@@ -1314,6 +1371,7 @@ class Base:
                 m.heartbeat()
 
             self._update_state()
+            self._report_steer_gate(time.monotonic())
 
             self._motors_enabled = not disable_motors
 
@@ -1374,11 +1432,105 @@ class Base:
                                   10.0 * CONTROL_PERIOD))
         self._last_loop_time = now
 
-        for i, rm in enumerate(self.rotation_motors):
-            self.steer_pos[i] = rm.get_position_rad()
+        raw = np.array([rm.get_position_rad() for rm in self.rotation_motors],
+                       dtype=float)
+        self.steer_pos = self._gate_steer_measurement(raw, now)
 
         for i, dm in enumerate(self.drive_motors):
             self.drive_vel[i] = dm.get_velocity_raw()
+
+    def _gate_steer_measurement(self, raw: np.ndarray, now: float) -> np.ndarray:
+        """Reject absolute-encoder readings that imply non-physical motion.
+
+        Returns the angle the control path should believe. The estimate is
+        allowed to chase the encoder, but never faster than a module can
+        actually turn (see STEER_MAX_MEAS_RATE). One rule, applied per module::
+
+            budget = STEER_MAX_MEAS_RATE * (now - when this estimate last moved)
+            estimate += clip(diff_angle(reading, estimate), +/-budget)
+
+        Measuring the budget from the last time the *estimate* moved, rather
+        than per control tick, is what makes it fit the hardware. This loop runs
+        at CONTROL_FREQ while Period5 frames arrive around 50 Hz, so steer_pos
+        is a staircase: most ticks re-read an unchanged cache, then one tick
+        carries a whole frame period of real motion at once. A per-tick budget
+        would call that legitimate step implausible and clamp genuine slew.
+        Accruing it while the estimate sits idle between frames means that by
+        the time a frame lands there is exactly one frame period of travel
+        available to spend on it, so a module slewing flat out passes through
+        untouched and with no lag.
+
+        Everything else falls out of the same rule. An isolated bad frame moves
+        the estimate by at most one frame period of travel before the next good
+        one pulls it back, so a jump of pi costs a few degrees of excursion for
+        a few tens of milliseconds instead of reversing a wheel. And nothing
+        latches: a reading that persistently disagrees is converged on at the
+        physical rate, closing even a pi disagreement in under half a second, so
+        an estimate that is genuinely wrong -- a module back-driven by hand
+        while the base was disabled -- recovers on its own, with no timeout to
+        tune and no stale value the gate can get stuck on.
+
+        Angles are compared with diff_angle, so a module crossing +/-pi is a
+        small step and not a 2pi jump.
+        """
+        raw = np.asarray(raw, dtype=float)
+        raw = np.where(np.isfinite(raw), raw, self._steer_gate_prev)
+
+        # First sample after construction or a reset: seed, do not filter.
+        # Startup homing needs the true angle immediately, and there is no
+        # previous estimate for a rate to be meaningful against.
+        if not self._steer_gate_seeded:
+            self._steer_gate_seeded = True
+            self._steer_gate_prev = raw.copy()
+            self._steer_move_t = np.full(NUM_SWERVES, float(now))
+            return raw.copy()
+
+        prev = self._steer_gate_prev
+        step = diff_angle(raw, prev)
+
+        # Budget accrues from when each module's estimate last moved, not from
+        # the last tick -- see the docstring. An unchanged reading costs nothing
+        # and leaves the clock running, which is what pays for the next frame;
+        # STEER_MAX_BUDGET_S stops that running away while a module is parked.
+        max_step = float(STEER_MAX_MEAS_RATE) * np.clip(
+            now - self._steer_move_t, 0.0, STEER_MAX_BUDGET_S)
+
+        clamped = np.abs(step) > max_step
+        gated = prev + np.clip(step, -max_step, max_step)
+        # Wrap once at the end: prev+delta can leave [-pi, pi) even when both
+        # inputs were inside it.
+        gated = diff_angle(gated, 0.0)
+
+        self._steer_move_t = np.where(gated != prev, now, self._steer_move_t)
+        self._steer_rejects += clamped
+        self._steer_gate_prev = gated
+        return gated.copy()
+
+    def _report_steer_gate(self, now: float, report_every_s: float = 30.0) -> None:
+        """Print how much the steering gate is vetoing, at most twice a minute.
+
+        The gate is silent by construction -- it repairs the signal in place --
+        so without this there is no way to tell a healthy CAN bus from one the
+        gate is quietly papering over. A rising count on one module is the
+        symptom to chase; steady zeros mean the encoders are behaving and the
+        gate is costing nothing.
+        """
+        if now - self._steer_gate_last_report < report_every_s:
+            return
+        prev_t = self._steer_gate_last_report
+        self._steer_gate_last_report = now
+        if prev_t == 0.0:                    # first call: start the window
+            self._steer_rejects[:] = 0
+            return
+        n = self._steer_rejects.copy()
+        self._steer_rejects[:] = 0
+        if not n.any():
+            return
+        window = now - prev_t
+        per = ", ".join(f"{lbl} {int(c)}" for lbl, c in zip(MODULE_ORDER, n))
+        print(f"[YOR] base: steering gate rejected {int(n.sum())} sample(s) in "
+              f"{window:.0f}s ({per}) -- non-physical encoder steps above "
+              f"{STEER_MAX_MEAS_RATE:.0f} rad/s")
 
     def _update_velocity_ramp(self, v_target: np.ndarray, dt: float) -> np.ndarray:
         """Advance the jerk-limited ramp one tick toward ``v_target``.

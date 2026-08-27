@@ -557,6 +557,131 @@ def test_steering_feedback_is_closed() -> None:
           bool(np.all(np.abs(np.abs(speeds) - 0.25) < 1e-9)), str(np.round(speeds, 4)))
 
 
+def test_steering_gate_rejects_non_physical_jumps() -> None:
+    """The measurement gate in front of steer_pos.
+
+    Regression for the 2026-08-27 wholebody runs, where 11-12% of absolute
+    encoder samples taken while driving implied steering rates above 12 rad/s
+    -- late or dropped Period5 frames, not motion. Because steer_pos decides
+    the shortest-path flip, one such sample jumped a module command by pi and
+    reversed its drive velocity; the runs logged 386 pi-jumps and 228 drive
+    sign reversals, every reversal on the same tick as a jump.
+
+    What has to hold: real motion passes untouched at the staircase rate the
+    CAN bus actually delivers it, a teleport does not, an isolated glitch
+    leaves only a small brief excursion, and nothing latches -- a reading that
+    keeps disagreeing is converged on rather than refused forever.
+    """
+    def fresh_gate():
+        g = bm.Base.__new__(bm.Base)
+        g._steer_gate_seeded = False
+        g._steer_gate_prev = np.zeros(4)
+        g._steer_move_t = np.zeros(4)
+        g._steer_rejects = np.zeros(4, dtype=np.int64)
+        return g
+
+    base = fresh_gate()
+    tick = bm.CONTROL_PERIOD
+    frame = 0.020                       # Period5 arrives about every 20 ms
+
+    # Seeding must not filter: startup homing reads the true angle immediately.
+    seed = np.array([1.5, -0.4, 3.0, 0.0])
+    out = base._gate_steer_measurement(seed, 0.0)
+    check("gate seeds on the first sample instead of filtering toward it",
+          bool(np.allclose(out, seed)), str(np.round(out, 4)))
+
+    # The staircase: this loop runs at CONTROL_FREQ but the encoder updates at
+    # ~50 Hz, so a genuine 5 rad/s slew arrives as one 0.1 rad step per frame
+    # with several unchanged re-reads between. None of that may be clamped --
+    # this is the case a per-tick budget would have got wrong.
+    t = 0.0
+    truth = seed.copy()
+    for _ in range(40):
+        t += frame
+        truth = bm.diff_angle(truth + 5.0 * frame, 0.0)   # 5 rad/s, real motion
+        out = base._gate_steer_measurement(truth, t)      # the frame lands
+        for k in range(1, 6):                             # re-reads of it
+            out = base._gate_steer_measurement(truth, t + k * tick)
+    check("a real 5 rad/s slew delivered as a 50 Hz staircase is not clamped",
+          bool(np.allclose(out, truth)) and int(base._steer_rejects.sum()) == 0,
+          f"residual {np.max(np.abs(bm.diff_angle(out - truth, 0.0))):.2e} rad, "
+          f"{int(base._steer_rejects.sum())} rejects")
+
+    # A single-frame pi jump on one module is the actual failure mode.
+    t += frame
+    glitch = truth.copy()
+    glitch[0] = bm.diff_angle(np.array([truth[0] + math.pi]), 0.0)[0]
+    out = base._gate_steer_measurement(glitch, t)
+    moved = abs(_wrap(float(out[0]) - float(truth[0])))
+    check("a pi jump moves the estimate by only a frame's worth of travel",
+          moved <= bm.STEER_MAX_MEAS_RATE * frame + 1e-9,
+          f"moved {math.degrees(moved):.1f} deg of the {180.0:.0f} offered")
+    check("the glitch does not disturb the other three modules",
+          bool(np.allclose(out[1:], truth[1:])), str(np.round(out[1:] - truth[1:], 8)))
+    check("the clamped sample is counted for the health line",
+          int(base._steer_rejects[0]) == 1 and int(base._steer_rejects[1:].sum()) == 0,
+          str(base._steer_rejects))
+
+    # ...and good frames pull it straight back, so the excursion is brief.
+    back = None
+    for k in range(1, 8):
+        t += frame
+        out = base._gate_steer_measurement(truth, t)
+        if back is None and np.allclose(out, truth):
+            back = k
+    check("good frames pull the estimate back to the truth within a few frames",
+          back is not None and back <= 3, f"recovered after {back} frames")
+
+    # The budget must not run away while a module is parked: a reading that
+    # stays bit-identical never moves the estimate, so the clock keeps running.
+    base5 = fresh_gate()
+    base5._gate_steer_measurement(np.zeros(4), 0.0)
+    for k in range(1, 50):                       # ~1 s parked, reading identical
+        base5._gate_steer_measurement(np.zeros(4), k * frame)
+    jump = np.array([math.pi, 0.0, 0.0, 0.0])    # then one bad frame
+    out = base5._gate_steer_measurement(jump, 50 * frame)
+    ceiling = bm.STEER_MAX_MEAS_RATE * bm.STEER_MAX_BUDGET_S
+    check("a long park does not bank unlimited budget for the next sample",
+          abs(float(out[0])) <= ceiling + 1e-9,
+          f"moved {float(out[0]):.3f} rad, cap {ceiling:.3f}")
+
+    # Nothing latches: a reading that keeps disagreeing is converged on at the
+    # physical rate, with no timeout involved.
+    base2 = fresh_gate()
+    base2._gate_steer_measurement(np.zeros(4), 0.0)
+    stuck = np.array([3.0, 0.0, 0.0, 0.0])
+    tt, got = 0.0, None
+    while tt < 2.0 and got is None:
+        tt += frame
+        o = base2._gate_steer_measurement(stuck, tt)
+        if abs(float(o[0]) - 3.0) < 1e-9:
+            got = tt
+    check("a persistently disagreeing reading is converged on, not refused",
+          got is not None, f"converged at {got} s")
+    check("...at about the physical rate, not instantly",
+          got is not None and abs(got - 3.0 / bm.STEER_MAX_MEAS_RATE) <= 2 * frame,
+          f"{got} s vs 3.0/{bm.STEER_MAX_MEAS_RATE} = "
+          f"{3.0 / bm.STEER_MAX_MEAS_RATE:.3f} s")
+
+    # Wrapping: a module crossing +/-pi is a small step, not a 2pi jump.
+    base3 = fresh_gate()
+    near = np.full(4, math.pi - 0.001)
+    base3._gate_steer_measurement(near, 0.0)
+    across = np.full(4, -math.pi + 0.001)      # 0.002 rad away, across the seam
+    out = base3._gate_steer_measurement(across, frame)
+    check("crossing +/-pi is treated as a small step and passes",
+          bool(np.allclose(out, across)) and int(base3._steer_rejects.sum()) == 0,
+          str(np.round(out, 4)))
+
+    # A non-finite reading must not poison the estimate.
+    base4 = fresh_gate()
+    base4._gate_steer_measurement(np.full(4, 0.5), 0.0)
+    out = base4._gate_steer_measurement(np.array([np.nan, 0.5, 0.5, 0.5]), frame)
+    check("a NaN reading falls back to the last accepted angle",
+          bool(np.all(np.isfinite(out))) and abs(float(out[0]) - 0.5) < 1e-9,
+          str(np.round(out, 4)))
+
+
 def test_velocity_ramp_respects_its_limits() -> None:
     """The ramp's contract, which is not the S-curve's.
 
@@ -817,6 +942,7 @@ def main() -> int:
         test_deadband_keeps_the_base_out_of_the_bad_regime,
         test_drive_scale_travels_with_the_gain_set,
         test_steering_feedback_is_closed,
+        test_steering_gate_rejects_non_physical_jumps,
         test_velocity_ramp_respects_its_limits,
         test_controller_setup_is_applied_and_reported,
         test_control_loop_end_to_end,
