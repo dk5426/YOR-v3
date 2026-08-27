@@ -505,6 +505,71 @@ class YOR():
         return None
 
     @require_initialization
+    def set_base_pose_limits(self, max_lin_vel = None, max_ang_vel = None):
+        """Runtime speed ceiling for the POSE_TARGET servo.
+
+        BasePoseController defaults to 0.25 m/s because whole-body control
+        drives the chassis under an arm; navigation wants the drive's full
+        0.35. Set it per-session rather than editing the default, so the two
+        callers do not have to share one number.
+
+        Still clamped by whatever ceiling `Base` was constructed with -- that
+        limit is not enforced in the drive's control loop, so a controller
+        that ignored it would simply command past it. Returns what was
+        actually applied.
+        """
+        ctl = self.base_controller.pose_ctl
+        limits = getattr(ctl.base, "max_vel", None)
+        lin_cap = ang_cap = None
+        if limits is not None:
+            lim = np.asarray(limits, dtype=float).reshape(-1)
+            if lim.size >= 3:
+                lin_cap = float(min(abs(lim[0]), abs(lim[1])))
+                ang_cap = float(abs(lim[2]))
+        if max_lin_vel is not None:
+            v = float(max_lin_vel)
+            ctl.max_lin_vel = v if lin_cap is None else min(v, lin_cap)
+        if max_ang_vel is not None:
+            w = float(max_ang_vel)
+            ctl.max_ang_vel = w if ang_cap is None else min(w, ang_cap)
+        return {"max_lin_vel": float(ctl.max_lin_vel),
+                "max_ang_vel": float(ctl.max_ang_vel),
+                "drive_cap_lin": lin_cap, "drive_cap_ang": ang_cap}
+
+    @require_initialization
+    def set_base_pose_target(self, target = None):
+        """Stream a base pose setpoint, servo'd by BasePoseController.
+
+        `target` is [u, v, psi] in the CONTROL FRAME:
+            u   = world x
+            v   = -world z
+            psi = SLAM yaw, unflipped (NOT the +pi value get_nav_debug reports)
+
+        The caller sends the target already in this frame, so nothing is
+        transformed on the Pi. Call repeatedly to stream a moving setpoint;
+        it is stateless, each call just replaces the target.
+
+        Unlike follow_path(), heading comes from `psi` directly rather than
+        from the bearing to a lookahead point, so heading and translation stop
+        competing for the same job. Pass None to stop.
+        """
+        if self.wholebody is not None:
+            self.wholebody.notify_manual_base_command()
+        self.base_controller.slam_sub_init()
+        if target is None:
+            self.base_controller._pose_target = None
+            self.base_controller.pose_ctl.reset()
+            self.base_controller.mode = "BASE_VEL"
+            self.base_controller.target_velocity = np.zeros(3, dtype=float)
+            return
+        if self.base_controller.mode != "POSE_TARGET":
+            # New authority over the base: forget the damping history, or the
+            # first cycle damps against a velocity the base never had.
+            self.base_controller.pose_ctl.reset()
+        self.base_controller._pose_target = [float(v) for v in target][:3]
+        self.base_controller.mode = "POSE_TARGET"
+
+    @require_initialization
     def move_to(self, goal = None):
         if self.wholebody is not None:
             self.wholebody.notify_manual_base_command()

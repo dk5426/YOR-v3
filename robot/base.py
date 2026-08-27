@@ -660,6 +660,8 @@ class BaseController:
         self._vel_lock = threading.Lock()
         self.last_target_velocity = np.zeros(3, dtype=float)
         self.last_t = time.monotonic()
+        self._last_pid_pose = None          # pose the PIDs last stepped on
+        self._last_pid_out = (0.0, 0.0, 0.0)
         self.heading_gate = math.radians(25.0)
 
         self.vmin = 0.05
@@ -672,6 +674,25 @@ class BaseController:
         self.pid_x = PID(k_pos, ki_pos, kd_pos, i_limit=i_limit_lin)
         self.pid_y = PID(k_pos, ki_pos, kd_pos, i_limit=i_limit_lin)
         self.pid_th = PID(k_theta, ki_theta, kd_theta, i_limit=i_limit_yaw)
+
+        # POSE_TARGET mode: a streamed pose setpoint servo'd by
+        # BasePoseController instead of the pure-pursuit path follower.
+        #
+        # Why a pose and not the path: whatever the wheels fail to deliver on a
+        # tick -- the vector clamp, the deadband, the swerve slew, a module
+        # still turning -- is lost when a velocity command is overwritten, but
+        # survives in the error of a pose target. Measured on this base, yaw
+        # below 0.22 rad/s is delivered at only 28-66%, so that shortfall is
+        # real and currently invisible to the controller.
+        #
+        # heading_offset=0 because the caller works in the CONTROL FRAME:
+        #     u = world x,  v = -world z,  psi = SLAM yaw (unflipped)
+        # In that frame forward is +col0 and left is -col2, matching the axes
+        # measured on hardware by tools/odin_axis_cal.py. Verified against
+        # every heading, not assumed -- the whole-body default of -pi/2 is for
+        # a different frame and would be 90 degrees wrong here.
+        self.pose_ctl = BasePoseController(self.base, heading_offset=0.0)
+        self._pose_target = None
 
         self.mode = "BASE_VEL"
         self.target_velocity = np.zeros(3, dtype=float)
@@ -727,6 +748,8 @@ class BaseController:
         self.pid_th.reset()
         self.last_target_velocity = np.zeros(3, dtype=float)
         self.last_t = time.monotonic()
+        self._last_pid_pose = None          # pose the PIDs last stepped on
+        self._last_pid_out = (0.0, 0.0, 0.0)
 
     def get_nav_debug(self):
         with self._nav_lock:
@@ -781,9 +804,14 @@ class BaseController:
                 pose = get_pose(self.slam_sub)
                 self.yor.pose = pose
                 translation, theta, T_base = pose
+                # BasePoseController works in the control frame, which uses
+                # the SLAM yaw as-is. Capture it before the +pi display flip.
+                theta_slam = float(theta)
                 theta = _wrap_pi(theta + math.pi)
                 x = float(translation[0])
                 y = float(translation[2])
+                # Identity of THIS pose sample, for the PID gate below.
+                pose_sig = (x, y, theta)
             except Exception:
                 self.yor.pose = None
                 self.base.set_target_base_velocity(np.zeros(3, dtype=float), smooth=True)
@@ -889,8 +917,44 @@ class BaseController:
 
                     tth = math.atan2((tx - x), (ty - y))
 
+                case "POSE_TARGET":
+                    tgt = self._pose_target
+                    if tgt is None:
+                        self.base.set_target_base_velocity(
+                            np.zeros(3, dtype=float), smooth=True)
+                        self.rate.sleep()
+                        continue
+                    # Control frame, so v = -y. The caller sends the target
+                    # already in this frame; nothing is transformed here.
+                    cmd = self.pose_ctl.compute(
+                        (float(tgt[0]), float(tgt[1]), float(tgt[2])),
+                        (x, -y, theta_slam))
+                    self.target_velocity = np.asarray(cmd, dtype=float)
+                    self.base.set_target_base_velocity(self.target_velocity,
+                                                       smooth=True)
+                    with self._nav_lock:
+                        self._nav = {
+                            "mode": "POSE_TARGET",
+                            "path_world": None,
+                            "lookahead_xz": (float(tgt[0]), float(tgt[1])),
+                            "pose_xz": (float(x), float(y)),
+                            "yaw": float(theta),
+                            "yaw_des": float(tgt[2]),
+                            "rot_only": False,
+                            "d_fwd": float(self.pose_ctl.last_error[0]),
+                            "d_left": float(self.pose_ctl.last_error[1]),
+                            "d_theta_deg": math.degrees(
+                                float(self.pose_ctl.last_error[2])),
+                            "cmd_vx": float(cmd[0]),
+                            "cmd_vy": float(cmd[1]),
+                            "cmd_omega": float(cmd[2]),
+                        }
+                    self.rate.sleep()
+                    continue
+
                 case _:
-                    print("Nav mode set is not in [BASE_VEL, PATH_FOLLOWING, MOVE_TO]")
+                    print("Nav mode set is not in [BASE_VEL, PATH_FOLLOWING, "
+                          "MOVE_TO, POSE_TARGET]")
                     self.rate.sleep()
                     continue
 
@@ -942,18 +1006,42 @@ class BaseController:
             d_left = float(d_body[0])
 
             now = time.monotonic()
-            dt = max(1e-3, min(0.25, now - self.last_t))
-            self.last_t = now
 
-            if rotation_only:
-                self.pid_x.reset()
-                self.pid_y.reset()
-                vx, vy = 0.0, 0.0
+            # Step the PIDs only on a NEW pose.
+            #
+            # This loop runs at control_hz while the SLAM pose arrives slower
+            # (30 Hz vs ~20 Hz on the Odin). On a repeat tick the error is
+            # bit-identical to the previous one, so (e - prev_e)/dt is exactly
+            # zero, and the next fresh pose makes the derivative spike over a
+            # short dt. The D term then alternates between nothing and a jolt,
+            # which is what made kd_theta unusable and the pivots jerky.
+            #
+            # The previous ZED stack published pose at 30 Hz, matching
+            # control_hz exactly, so every tick was fresh and this never
+            # showed. It is a regression from the camera swap, not a new bug.
+            #
+            # dt is measured between PID steps, not between loop ticks, so the
+            # integral and derivative both see real elapsed time. Between
+            # updates the last command is held rather than recomputed from
+            # stale data.
+            fresh_pose = pose_sig != self._last_pid_pose
+            if fresh_pose:
+                dt = max(1e-3, min(0.25, now - self.last_t))
+                self.last_t = now
+                self._last_pid_pose = pose_sig
+
+                if rotation_only:
+                    self.pid_x.reset()
+                    self.pid_y.reset()
+                    vx, vy = 0.0, 0.0
+                else:
+                    vx = self.pid_x.step(d_fwd, dt)
+                    vy = self.pid_y.step(d_left, dt)
+
+                omega = self.pid_th.step(d_theta, dt)
+                self._last_pid_out = (vx, vy, omega)
             else:
-                vx = self.pid_x.step(d_fwd, dt)
-                vy = self.pid_y.step(d_left, dt)
-
-            omega = self.pid_th.step(d_theta, dt)
+                vx, vy, omega = self._last_pid_out
             def _soft_clip(v, v_min, v_max):
                 a_v = abs(v)
                 if a_v < 1e-4:
