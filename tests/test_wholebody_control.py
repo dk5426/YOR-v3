@@ -21,7 +21,8 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 from robot.wholebody_control import (  # noqa: E402
-    BaseAxisMap, BaseOdometry, WholeBodyController, WholeBodyHardwareConfig,
+    BaseAxisMap, BaseOdometry, SlamBaseFrame, SlamPoseListener,
+    WholeBodyController, WholeBodyHardwareConfig, _wrap_pi,
 )
 
 
@@ -101,6 +102,12 @@ def build(**cfg_kwargs):
     # Headless tests have no business writing real files into
     # artifacts/wholebody_logs/trajectories/ -- that's for live robot runs.
     cfg_kwargs.setdefault("record_trajectories", False)
+    # ...nor subscribing to the robot's SLAM publisher. It ships on, so
+    # without this every build() here opens a socket to Thor and, when the
+    # Odin happens to be up, silently drives the odometry these tests assert
+    # on from a robot standing in another room. Tests that want the
+    # correction drive it directly (see test_slam_base_pose_feedback).
+    cfg_kwargs.setdefault("enable_slam_base_pose", False)
     config = WholeBodyHardwareConfig(**cfg_kwargs)
     wbc = WholeBodyController(left, right, base, config=config)
     wbc.init()
@@ -596,6 +603,345 @@ def test_axis_map_and_odometry():
     check("odometry integrates", np.allclose(odo.pose, [0.5, 0.0, 0.0]), str(odo.pose))
 
 
+class FakeSlam:
+    """Stands in for SlamPoseListener: a pose the test controls outright.
+
+    `_correct_base_from_slam` only ever calls `latest()`, so nothing here
+    needs a thread, a socket, or a robot.
+    """
+
+    def __init__(self, pose, age: float = 0.0):
+        self.pose = np.asarray(pose, dtype=float).copy()
+        self.age = float(age)
+
+    def latest(self):
+        return self.pose.copy(), self.age
+
+
+def test_slam_base_pose_feedback():
+    """The Odin fix is what makes the base PD closed-loop on the floor.
+
+    Dead-reckoning integrates the velocity the base was *commanded*, so on its
+    own it reports success no matter what the wheels did -- the pose error
+    decays because odometry moved, not because the robot did. These checks are
+    about the difference that makes: with the correction on, a robot that is
+    commanded but does not move keeps generating error, which is the whole
+    point of closing the loop.
+    """
+    print("\nSLAM base pose feedback")
+
+    # ── frame algebra ───────────────────────────────────────────────────────
+    frame = SlamBaseFrame(yaw_sign=+1.0)
+    slam0 = np.array([2.0, -3.0, 0.7])
+    ik0 = np.array([0.5, 0.25, -1.1])
+    frame.align(slam0, ik0)
+    check("align is exact at the pair it was given",
+          np.allclose(frame.to_ik(slam0), ik0), str(frame.to_ik(slam0).round(6)))
+    check("alignment starts the correction at zero, so nothing jumps on the "
+          "first fix", np.allclose(frame.to_ik(slam0) - ik0, 0.0))
+
+    # A metre driven in the SLAM frame has to be a metre in the IK frame, or
+    # the correction would inject scale error the PD would chase forever.
+    for bearing in (0.0, 1.0, 2.5, -2.0):
+        slam1 = slam0 + np.array([math.cos(bearing), math.sin(bearing), 0.0])
+        d = frame.to_ik(slam1) - frame.to_ik(slam0)
+        if abs(math.hypot(d[0], d[1]) - 1.0) > 1e-9:
+            check("displacement length survives the mapping", False, f"bearing {bearing}")
+            break
+    else:
+        check("displacement length survives the mapping", True, "4 bearings")
+
+    flipped = SlamBaseFrame(yaw_sign=-1.0)
+    flipped.align(slam0, ik0)
+    check("the mirrored frame also aligns exactly",
+          np.allclose(flipped.to_ik(slam0), ik0), str(flipped.to_ik(slam0).round(6)))
+
+    # ── the 20-float slam/pose message ──────────────────────────────────────
+    def pose_msg(yaw=0.0, t=(0.0, 0.0, 0.0), conf=100.0):
+        msg = [0.0] * 20
+        msg[1], msg[3] = math.sin(yaw / 2.0), math.cos(yaw / 2.0)  # qy, qw
+        msg[4], msg[5], msg[6] = t
+        msg[19] = conf
+        return msg
+
+    planar = SlamPoseListener._planar_from_msg(pose_msg(t=(1.5, 0.8, -2.5)))
+    check("planar pose is (t_x, t_z, yaw) out of the Y-up message",
+          np.allclose(planar, [1.5, -2.5, 0.0]), str(planar))
+    planar = SlamPoseListener._planar_from_msg(pose_msg(yaw=0.6, t=(0.0, 0.0, 0.0)))
+    check("yaw about Y is recovered from the quaternion",
+          abs(planar[2] - 0.6) < 1e-9, f"{planar[2]:.6f}")
+    check("tracking too poor to trust is dropped, not averaged in",
+          SlamPoseListener._planar_from_msg(pose_msg(conf=5.0)) is None)
+    check("a truncated message is dropped",
+          SlamPoseListener._planar_from_msg([0.0, 0.0]) is None)
+
+    # ── the rate limit ──────────────────────────────────────────────────────
+    dt = 1.0 / 30.0
+    odo = BaseOdometry()
+    odo.apply_correction(np.array([1.0, 0.0, 0.0]), dt, 1.0, 2.0)
+    check("a loop-closure jump is bled in, not handed to the PD as a step",
+          abs(odo.pose[0] - 1.0 * dt) < 1e-12, f"moved {odo.pose[0]:.4f} m in one tick")
+
+    odo = BaseOdometry()
+    odo.apply_correction(np.array([0.005, 0.0, 0.0]), dt, 1.0, 2.0)
+    check("an ordinary correction lands whole in one tick",
+          abs(odo.pose[0] - 0.005) < 1e-12, f"{odo.pose[0]:.6f}")
+
+    # The linear clamp is on the vector, so a correction never changes bearing.
+    odo = BaseOdometry()
+    odo.apply_correction(np.array([3.0, 4.0, 0.0]), dt, 1.0, 2.0)
+    check("a clamped correction keeps its direction",
+          abs(math.atan2(odo.pose[1], odo.pose[0]) - math.atan2(4.0, 3.0)) < 1e-12,
+          str(odo.pose.round(5)))
+
+    # ── the loop actually closes ────────────────────────────────────────────
+    import mink
+
+    def drive(slam_pose):
+        """100 ticks toward an out-of-reach target; `slam_pose` = None means off."""
+        wbc, _l, _r, fake_base = build()
+        if slam_pose is not None:
+            wbc.config.enable_slam_base_pose = True
+            wbc.slam_pose = FakeSlam(slam_pose)
+        T_l, _ = wbc.forward_kinematics()
+        wbc.set_left_ee_target(mink.SE3.from_rotation_and_translation(
+            T_l.rotation(), T_l.translation() + np.array([0.0, -1.5, 0.0])))
+        for _ in range(100):
+            wbc._step()
+        return wbc, fake_base
+
+    # The robot never moves: every fix says it is exactly where it started.
+    stuck, stuck_base = drive(np.zeros(3))
+    free, _ = drive(None)
+
+    check("without the fix, odometry reports a move the robot never made",
+          np.linalg.norm(free.odometry.pose[:2]) > 1e-3,
+          f"pose {free.odometry.pose.round(3)}")
+    check("with it, the measured pose stays where the fix says the robot is",
+          np.linalg.norm(stuck.odometry.pose[:2]) < 0.02,
+          f"pose {stuck.odometry.pose.round(4)}")
+
+    # The point of all of it: a base that is not moving keeps producing error,
+    # so the controller keeps asking. Under dead-reckoning alone the error
+    # would have decayed to nothing while the robot sat still.
+    err = np.linalg.norm(stuck.base_pose.last_error[:2])
+    check("a stalled base still shows a pose error after 100 ticks",
+          err > 0.01, f"|err| {err:.4f} m")
+    late = np.array(stuck_base.velocity_commands[-10:])
+    check("...and the base is still being commanded, not declared arrived",
+          bool(np.any(np.abs(late) > 1e-6)), f"peak {np.abs(late).max(axis=0).round(4)}")
+
+    # ── graceful degradation ────────────────────────────────────────────────
+    stale, _ = build(), None
+    wbc = stale[0]
+    wbc.config.enable_slam_base_pose = True
+    wbc.slam_pose = FakeSlam(np.array([9.0, 9.0, 0.0]),
+                             age=wbc.config.slam_pose_max_age_s + 1.0)
+    wbc.odometry.reset(np.array([0.1, 0.2, 0.3]))
+    wbc._correct_base_from_slam()
+    check("a stale fix is ignored and the base coasts on dead-reckoning",
+          np.allclose(wbc.odometry.pose, [0.1, 0.2, 0.3]),
+          str(wbc.odometry.pose.round(4)))
+
+    wbc.slam_pose = None
+    wbc._correct_base_from_slam()
+    check("no publisher at all is survivable",
+          np.allclose(wbc.odometry.pose, [0.1, 0.2, 0.3]))
+
+
+def _slam_msg(yaw: float, x: float, z: float, conf: float = 100.0) -> list:
+    """A slam/pose message for a robot at (x, z), Y-up world, yaw about +Y.
+
+    Only the base block (0:7) is filled, because that is all
+    `_planar_from_msg` reads. The quaternion is a pure Ry, which is what
+    odin_pub_node publishes for a robot standing on a flat floor.
+    """
+    msg = [0.0] * 20
+    msg[1], msg[3] = math.sin(yaw / 2.0), math.cos(yaw / 2.0)   # qy, qw
+    msg[4], msg[5], msg[6] = x, 0.0, z
+    msg[19] = conf
+    return msg
+
+
+def _nose(yaw: float) -> np.ndarray:
+    """Body +X (the robot's nose) projected into the SLAM (t_x, t_z) plane."""
+    return np.array([math.cos(yaw), -math.sin(yaw)])
+
+
+def _left(yaw: float) -> np.ndarray:
+    """The robot's physical left, same plane. Body left is -Z (up x forward)."""
+    return np.array([-math.sin(yaw), -math.cos(yaw)])
+
+
+def _turn(a, b) -> float:
+    """Signed rotation a -> b, CCW positive, in whatever plane it is given."""
+    return math.degrees(math.atan2(a[0] * b[1] - a[1] * b[0], float(np.dot(a, b))))
+
+
+def test_slam_frame_handedness():
+    """`SlamBaseFrame` must hand the base PD a frame with the IK's handedness.
+
+    The SLAM planar frame is left-handed and the IK one is not, so the mapping
+    between them contains a reflection. `align()` cannot supply it -- it solves
+    a rotation and a translation, and neither changes handedness -- so it has
+    to come from `_reflect`, and getting it wrong is not a small error: the
+    correction then drags odometry toward a mirror image of the robot, the PD
+    reads an error pointing outward, and a small move runs away. Measured on
+    hardware 2026-08-26: a 5 cm move diverged to 1.9 m.
+
+    Until that date `_reflect` fired only when `yaw_sign < 0`, which is the
+    same flag `to_ik` uses to negate the yaw, so the two always cancelled and
+    *both* settings produced a mirrored frame. That is the specific shape this
+    pins: not "is the sign right" but "is either setting a rigid motion at
+    all", which no value of `slam_yaw_sign` could have fixed.
+    """
+    print("\nSLAM frame handedness")
+
+    # ── the premise, straight out of the message parser ──────────────────────
+    # Confirmed on the floor with tests/hardware/test_09_axis_match.py:
+    # commanding left moved the base -83.6 deg off the nose, against -90 here.
+    for yaw in (0.0, 0.7, -1.9):
+        p0 = SlamPoseListener._planar_from_msg(_slam_msg(yaw, 0.0, 0.0))
+        nose = _nose(yaw)
+        moved = SlamPoseListener._planar_from_msg(
+            _slam_msg(yaw, *(np.zeros(2) + nose)))
+        along = _turn(nose, moved[:2] - p0[:2])
+        if abs(along) > 1e-6 or abs(_turn(nose, _left(yaw)) + 90.0) > 1e-6:
+            check("the raw SLAM plane is left-handed (physical left at -90)",
+                  False, f"yaw {yaw}")
+            break
+    else:
+        check("the raw SLAM plane is left-handed (physical left at -90)",
+              True, "3 headings")
+
+    # ── what the IK frame requires ───────────────────────────────────────────
+    def traverse(frame, yaw0=0.4, step=1.0, turn=math.radians(20)):
+        """Drive forward, then left, then turn CCW. Returns the IK poses."""
+        yaw, pos = yaw0, np.zeros(2)
+        frame.align(SlamPoseListener._planar_from_msg(_slam_msg(yaw, *pos)),
+                    np.zeros(3))
+        out = [frame.to_ik(SlamPoseListener._planar_from_msg(_slam_msg(yaw, *pos)))]
+        for delta, dyaw in ((_nose(yaw) * step, 0.0), (None, 0.0), (None, turn)):
+            if delta is None and dyaw == 0.0:
+                delta = _left(yaw) * step
+            pos = pos + (delta if delta is not None else 0.0)
+            yaw = yaw + dyaw
+            out.append(frame.to_ik(
+                SlamPoseListener._planar_from_msg(_slam_msg(yaw, *pos))))
+        return out
+
+    for sign, mirrored in ((+1.0, False), (-1.0, True)):
+        pts = traverse(SlamBaseFrame(yaw_sign=sign))
+        fwd_to_left = _turn(pts[1][:2] - pts[0][:2], pts[2][:2] - pts[1][:2])
+        reported = math.degrees(_wrap_pi(pts[3][2] - pts[2][2]))
+        # A proper rigid motion: the path and the yaw must turn the same way.
+        # This is the invariant the coupled `_reflect` broke for BOTH signs.
+        check(f"yaw_sign={sign:+.0f} maps to a proper rigid motion, not a mirror",
+              abs(abs(fwd_to_left) - 90.0) < 1e-6
+              and math.copysign(1.0, fwd_to_left) == math.copysign(1.0, reported),
+              f"fwd->left {fwd_to_left:+.1f} deg, reported yaw {reported:+.1f} deg")
+        want = -90.0 if mirrored else +90.0
+        check(f"yaw_sign={sign:+.0f} is the "
+              f"{'mirror image' if mirrored else 'IK-handed'} one",
+              abs(fwd_to_left - want) < 1e-6, f"left at {fwd_to_left:+.1f} deg")
+
+    # The shipped default has to be the one that matches the IK frame, or the
+    # feature is wrong out of the box on a robot nobody has calibrated.
+    pts = traverse(SlamBaseFrame(yaw_sign=WholeBodyHardwareConfig().slam_yaw_sign))
+    check("the default slam_yaw_sign puts LEFT at +90, as the IK frame has it",
+          abs(_turn(pts[1][:2] - pts[0][:2], pts[2][:2] - pts[1][:2]) - 90.0) < 1e-6)
+    check("...and a physical CCW turn reports POSITIVE yaw",
+          math.degrees(_wrap_pi(pts[3][2] - pts[2][2])) > 0.0)
+
+    # ── the datum: does the mapped yaw agree with the mapped motion? ─────────
+    # `align()` makes both pose and yaw exact at the instant it is taken, so a
+    # frame can be badly wrong and still align perfectly. What separates them
+    # is *motion*: drive along the nose, and the mapped displacement has to
+    # point along the IK frame's own forward direction at the mapped yaw. This
+    # is what a 90-degree datum error in `align()` breaks, and it is invisible
+    # to every check above -- the handedness invariants all pass with it.
+    def travel_vs_heading(sign, slam_yaw, ik_yaw):
+        frame = SlamBaseFrame(yaw_sign=sign)
+        p0 = SlamPoseListener._planar_from_msg(_slam_msg(slam_yaw, 0.0, 0.0))
+        frame.align(p0, np.array([0.0, 0.0, ik_yaw]))
+        step = _nose(slam_yaw)
+        p1 = SlamPoseListener._planar_from_msg(_slam_msg(slam_yaw, *step))
+        a, b = frame.to_ik(p0), frame.to_ik(p1)
+        d = b[:2] - a[:2]
+        d = d / np.linalg.norm(d)
+        # The IK frame has the robot facing -Y, so its nose is at yaw - pi/2.
+        want = np.array([math.sin(b[2]), -math.cos(b[2])])
+        return math.degrees(math.acos(float(np.clip(d @ want, -1.0, 1.0))))
+
+    pairs = ((0.0, 0.0), (0.4, 0.4), (0.4, 1.1), (-1.2, 2.0), (2.9, -0.3))
+    for sign in (+1.0, -1.0):
+        worst = max(travel_vs_heading(sign, sy, iy) for sy, iy in pairs)
+        check(f"yaw_sign={sign:+.0f}: driving the nose moves the mapped pose along "
+              f"the mapped heading", worst < 1e-6, f"worst {worst:.4f} deg over "
+              f"{len(pairs)} align pairs")
+
+    # align() must still be exact, or the correction starts with a step in it.
+    frame = SlamBaseFrame(yaw_sign=+1.0)
+    slam_pt, ik_pt = np.array([2.0, -3.0, 0.7]), np.array([0.5, 0.25, -1.1])
+    frame.align(slam_pt, ik_pt)
+    check("the datum does not disturb align()'s exactness",
+          np.allclose(frame.to_ik(slam_pt), ik_pt), str(frame.to_ik(slam_pt).round(9)))
+
+    # ── the regression that actually bit: the closed loop ────────────────────
+    # A pose PD closing on SLAM-corrected odometry, ideal wheels, 5 cm and
+    # 30 deg away. With the mirrored frame this walked off to metres.
+    from robot.base import BasePoseController
+
+    def converge(correction_rate, ticks=240):
+        dt, offset = 1.0 / 30.0, -math.pi / 2.0
+        frame = SlamBaseFrame(yaw_sign=WholeBodyHardwareConfig().slam_yaw_sign)
+        pd, odo = BasePoseController(ff_gain=0.0), BaseOdometry()
+        opposed = []
+        target, true = np.array([0.0, -0.05, math.radians(30)]), np.zeros(3)
+        # Ground truth: the SLAM plane is the mirror of the IK plane, which is
+        # what the floor run established and what _reflect exists to undo.
+        # Ground truth relating the two frames for a real robot. Positions are
+        # mirrored (the SLAM plane is left-handed), AND the yaw datum differs
+        # by a quarter turn: the IK nose is at `yaw - pi/2` while the SLAM nose
+        # is at the yaw itself. Getting this model wrong is exactly how the
+        # datum bug survived its first regression test -- a model that maps
+        # yaw straight across cannot see an error in the yaw mapping.
+        as_slam = lambda p: _slam_msg(p[2] - math.pi / 2.0, p[0], -p[1])
+        frame.align(SlamPoseListener._planar_from_msg(as_slam(true)), odo.pose)
+        for _ in range(ticks):
+            before = odo.pose.copy()
+            if correction_rate:
+                odo.apply_correction(
+                    frame.to_ik(SlamPoseListener._planar_from_msg(as_slam(true))),
+                    dt, correction_rate, 2.0)
+            shift = odo.pose[:2] - before[:2]
+            fwd, lat, yaw_rate = pd.compute(target, odo.pose, dt=dt)
+            phi = true[2] + offset
+            v = np.array([math.cos(phi) * fwd - math.sin(phi) * lat,
+                          math.sin(phi) * fwd + math.cos(phi) * lat, yaw_rate])
+            # Does the correction fight the motion? On the floor this ran at
+            # 100% with a 90 deg datum error; healthy drift removal is ~0%.
+            if np.linalg.norm(v[:2]) > 0.02 and np.linalg.norm(shift) > 1e-9:
+                opposed.append(float(shift @ v[:2]) < 0.0)
+            true = true + v * dt
+            odo.update(v, dt)
+        return (float(np.linalg.norm(true[:2] - target[:2])),
+                abs(math.degrees(_wrap_pi(true[2] - target[2]))),
+                float(np.mean(opposed)) if opposed else 0.0)
+
+    off_pos, off_yaw, _ = converge(0.0)
+    on_pos, on_yaw, oppose_frac = converge(1.0)
+    check("the loop converges on dead-reckoning alone",
+          off_pos < 0.02 and off_yaw < 3.0, f"{off_pos*100:.1f} cm, {off_yaw:.1f} deg")
+    check("...and the SLAM correction does not destabilise it",
+          on_pos < 0.02 and on_yaw < 3.0, f"{on_pos*100:.1f} cm, {on_yaw:.1f} deg")
+    check("the correction does not oppose the commanded motion",
+          oppose_frac < 0.05, f"{oppose_frac*100:.1f}% of moving ticks opposed")
+    check("the correction costs nothing in steady state",
+          abs(on_pos - off_pos) < 0.005 and abs(on_yaw - off_yaw) < 1.0,
+          f"off {off_pos*100:.1f} cm / on {on_pos*100:.1f} cm")
+
+
 def test_state_snapshot():
     print("\nRPC state snapshot")
     wbc, *_ = build()
@@ -802,6 +1148,8 @@ def main() -> int:
         test_manual_override,
         test_emergency_stop_resume,
         test_axis_map_and_odometry,
+        test_slam_base_pose_feedback,
+        test_slam_frame_handedness,
         test_state_snapshot,
         test_posture_fix_gates,
         test_trajectory_log,

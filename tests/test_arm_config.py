@@ -182,8 +182,9 @@ def test_wholebody_clamp() -> None:
           cfg.arm_interpolation_steps == 3, str(cfg.arm_interpolation_steps))
     check("arm sub-target minimum trajectory duration is 10.8 ms",
           cfg.arm_preview_time == 0.0108, str(cfg.arm_preview_time))
-    check("WBC arm deadband matches the 50 mrad nerolib home tolerance",
-          cfg.arm_joint_deadband_rad == 0.05,
+    check("WBC arm deadband is a chatter guard, well under the 50 mrad "
+          "nerolib home tolerance it was originally borrowed from",
+          cfg.arm_joint_deadband_rad == 0.005,
           str(cfg.arm_joint_deadband_rad))
     check("WBC arm-state feedback is open-loop after startup",
           cfg.use_measured_arm_state is False,

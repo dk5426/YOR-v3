@@ -32,18 +32,28 @@ joint commands rather than one coarse command per solve tick.
 
 Three things are worth knowing before running this on the robot:
 
-* **Base odometry is dead-reckoned from the commanded velocity**, optionally
-  corrected by SLAM. By default nothing absolute feeds this loop, so the IK's
-  notion of where the chassis is drifts from reality over time. That is
-  tolerable because teleop targets are generated relative to the *current* EE
-  pose, but absolute world-frame targets get less accurate the longer the base
-  drives.
+* **Base odometry is dead-reckoned from the commanded velocity, and
+  corrected by SLAM.** Integrating the commanded velocity is exact with
+  respect to what the solver asked for and says nothing whatever about the
+  floor: slip, a push, or a module that never reached its angle all move the
+  robot without moving odometry. Used alone as the base PD's measurement --
+  which is what `_dispatch_base` does with it -- that makes the loop an echo
+  chamber, because the error decays when odometry moves whether or not the
+  robot did.
 
-  Setting `enable_slam_base_pose` attaches the Odin pose (`slam/pose`, from
-  robot/odin_pub_node.py) as a **drift correction**: dead-reckoning remains the
-  primary, always-available signal and the SLAM pose is bled in under a rate
-  limit, so loop-closure jumps never reach the IK as a step. It ships off
-  because `slam_yaw_sign` has to be calibrated first — see docs/RUNNING.md.
+  `enable_slam_base_pose` (**on** by default) closes that loop on the Odin
+  VIO+lidar fix (`slam/pose`, from robot/odin_pub_node.py). Dead-reckoning
+  still carries the estimate between fixes -- it is smooth and available at
+  loop rate, which a 20 Hz absolute pose is not -- but every tick it is pulled
+  toward the fix under a rate limit, so what the PD measures is where the
+  robot actually is and a loop-closure jump is absorbed over ~1 s rather than
+  arriving as a step. A dropout costs only the correction: the pose ages out
+  and the base coasts on dead-reckoning.
+
+  One value is not solved for and can be wrong: `slam_yaw_sign`, the
+  handedness of the SLAM planar frame against the IK one. If
+  `slam_base_correction_m` in `get_state()` grows steadily as you drive, flip
+  it — see docs/RUNNING.md and tests/hardware/test_06_slam_pose.py.
 
 * **The base is driven by a pose, not by a velocity.** `_dispatch_base` hands
   the solver's `base_position` -- where the IK believes the chassis should
@@ -191,10 +201,12 @@ class WholeBodyHardwareConfig:
     # margin used at the former 108 Hz single-loop rate, now applied to the
     # 90 Hz arm dispatch tick.
     arm_preview_time: float = 0.0108
-    # Match nerolib's resetToHome acceptance band: a joint target must differ
-    # from the WBC arm reference by more than 0.05 rad before it is dispatched.
-    # The band is applied independently to all seven joints.
-    arm_joint_deadband_rad: float = 0.05
+    # A joint target must differ from the WBC arm reference by more than this
+    # before it is dispatched. The band is applied independently to all seven
+    # joints. 0.05 was nerolib's resetToHome acceptance band, borrowed here
+    # and far coarser than a streamed target needs; 0.005 keeps the chatter
+    # guard an order of magnitude below it. Default since 2026-08-26.
+    arm_joint_deadband_rad: float = 0.005
     # Hard cap on how far ahead of measured state a streamed joint target may
     # sit. This is a bounded look-ahead, not a per-cycle step: if the WBC stream
     # stops, Ruckig safely comes to rest at a target no farther than
@@ -272,8 +284,8 @@ class WholeBodyHardwareConfig:
     # limits skew the commanded direction toward whichever axis saturates
     # first; the same reasoning is already written down for the SLAM
     # correction in BaseOdometry.apply_correction.
-    base_max_lin_vel: float = 0.25   # m/s, magnitude of (forward, lateral)
-    base_max_ang_vel: float = 0.60   # rad/s
+    base_max_lin_vel: float = 0.35   # m/s, magnitude of (forward, lateral)
+    base_max_ang_vel: float = 1.60   # rad/s
     # Velocities below this are sent as zero, so solver noise doesn't leave the
     # swerve modules humming at a standstill. Also applied to the linear
     # velocity as a vector: deadbanding forward and lateral independently
@@ -370,6 +382,49 @@ class WholeBodyHardwareConfig:
     # Anything above 0 is therefore a deliberate trade, and init() says so out
     # loud. This is why the belief must free-run for pose control to work.
     base_feedback_alpha: float = 0.0
+    # ── Base leash ──────────────────────────────────────────────────────────
+    # Cap on how far the solver's belief of the chassis pose may sit from the
+    # dead-reckoned pose. The solver advances that belief every tick, but the
+    # chassis only ever delivers part of it -- the clamp, the deadband, the
+    # acceleration ramp -- and nothing bounded the difference. Under a
+    # sustained request (an operator holding a direction, which is most of a
+    # teleop session) the gap grows at the whole velocity deficit: 0.25 m/s
+    # asked for and 60% delivered is 0.1 m/s of divergence, ~200 mm after two
+    # seconds. Two things follow, and only the second is obvious:
+    #
+    #   * the arms are solved against a chassis pose that has not happened, so
+    #     the solver retracts them on the assumption the base closed the
+    #     distance, and the EE falls short by exactly the gap;
+    #   * the base keeps crawling after the operator stops, chasing a target
+    #     still out in front of it.
+    #
+    # The clamped pose is written back into the IK configuration, so the
+    # excess is *forgotten* rather than banked -- the same construct
+    # target_leash_m applies to the EE targets one level up, and the
+    # write-back is what makes it a leash rather than a rate limiter. Held
+    # next to odometry, the belief lets the solver see that the target is
+    # still far away, so it reaches with the arms instead: the base's
+    # shortfall gets compensated without measuring anything new.
+    #
+    # A limit on the per-tick step would not do this. The divergence is not
+    # spiky, it is a slow one-directional bleed in which every individual tick
+    # is entirely reasonable.
+    #
+    # 0 disables. Sizing: the leash is the standing EE shortfall accepted in
+    # exchange for the solver noticing, so it wants to be short enough to feel
+    # and long enough not to bind while the base is keeping up. `base_leash`
+    # in the trajectory log is the metres clamped off each tick -- non-zero on
+    # most moving ticks means this is too short. 0.2 since 2026-08-26: at
+    # 0.1 the leash clamped on most moving ticks; at 0.2 it engages on
+    # 0.4-1.3% of them, which is the intended "only when the base is truly
+    # falling behind".
+    base_leash_m: float = 0.2
+    # The same leash on yaw. Off by default: yaw diverges proportionally
+    # faster than translation (base_max_ang_vel / base_max_lin_vel = 2.4), so
+    # the equivalent of 0.1 m is about 0.24 rad -- but that ratio is arithmetic
+    # rather than measurement until `base_leash` in the log says how far yaw
+    # actually runs. Try 0.24.
+    base_leash_rad: float = 0.0
     # One-pole low-pass on the yaw request, applied before the deadband.
     # It merges one-tick pulses into either a sustained rotation or nothing,
     # and flattens the solver's occasional absurd spikes (12 rad/s for one
@@ -447,6 +502,17 @@ class WholeBodyHardwareConfig:
     # raw sample-to-sample difference of a 30 Hz pose is more artefact than
     # velocity.
     base_pose_derivative_tau: float = 0.10  # s
+    # Reference feedforward for BasePoseController -- see its `ff_gain`.
+    # 1.0 (the whole target rate fed forward) by default since 2026-08-26;
+    # 0 disables. It pairs with base_leash_m: the two only stop fighting
+    # once speed comes from the reference rate rather than from accumulated
+    # pose error.
+    base_pose_ff_gain: float = 1.0
+    base_pose_ff_max_frac: float = 0.8
+    # Low-pass on the feedforward -- see BasePoseController.ff_tau. The
+    # feedforward differentiates the reference, so it amplifies solver jitter;
+    # this is the knob that buys the twitch back down. Try 0.04-0.06.
+    base_pose_ff_tau: float = 0.0
     # Where the chassis' nose points at yaw 0, in the IK world frame. The
     # description has the robot facing -Y with +X to its left, so the forward
     # axis sits a quarter turn behind the yaw axis. Same convention as
@@ -474,9 +540,10 @@ class WholeBodyHardwareConfig:
     # through singular regions on a re-engage jump. 0 disables (current
     # behaviour). Sizing: at 30 Hz a leash of 0.15 m still permits
     # 0.15 m / 33 ms of *new* lead per tick, far above any real hand
-    # speed, so tracking latency is unaffected -- only wind-up is.
-    target_leash_m: float = 0.0
-    target_leash_rad: float = 0.0
+    # speed, so tracking latency is unaffected -- only wind-up is. On by
+    # default since 2026-08-26.
+    target_leash_m: float = 0.15
+    target_leash_rad: float = 0.8
 
     # ── Manual override ─────────────────────────────────────────────────────
     # Direct base / lift commands (joystick, nav, RPC) suspend the whole-body
@@ -484,12 +551,31 @@ class WholeBodyHardwareConfig:
     # so the two controllers never fight over the same actuator.
     manual_override_timeout_s: float = 0.5
 
-    # ── SLAM base pose (drift correction) ───────────────────────────────────
-    # OFF by default, and it must stay off until `slam_yaw_sign` is calibrated
-    # — feeding a mis-signed absolute pose into the IK is worse than the
-    # dead-reckoning it replaces, because the error then grows as you drive
-    # instead of staying bounded. See docs/RUNNING.md for the 30-second check.
-    enable_slam_base_pose: bool = False
+    # ── SLAM base pose (PD feedback) ─────────────────────────────────────────
+    # What closes the base pose loop on the floor instead of on the command.
+    #
+    # `_dispatch_base` measures with `self.odometry.pose`, and that pose is
+    # dead-reckoned by integrating the velocity the base was *commanded*
+    # (BaseOdometry.update). Left alone that makes the PD an echo chamber: the
+    # error decays because odometry moved, whether or not the robot did. Wheel
+    # slip, a push, a module that never reached its angle and a stalled drive
+    # are all invisible to it, by construction.
+    #
+    # With this on, `_correct_base_from_slam` pulls that same pose toward the
+    # Odin VIO+lidar fix (`slam/pose`, robot/odin_pub_node.py) every tick, so
+    # what the PD measures is where the robot actually is. Dead-reckoning still
+    # carries the estimate between fixes -- it is smooth, available at loop
+    # rate, and exact with respect to the solver's intent -- but it no longer
+    # gets to be wrong for free.
+    #
+    # This is the same signal robot/base.py's navigation modes have always
+    # closed on; only the whole-body loop was running open.
+    #
+    # Frame handling is in SlamBaseFrame: `align()` pins the SLAM frame onto
+    # the odometry pose at the first usable fix, so the correction starts at
+    # exactly zero and only ever removes error accumulated after that. The one
+    # value it cannot solve for is `slam_yaw_sign`, below.
+    enable_slam_base_pose: bool = True
     # Where odin_pub_node publishes. Whole-body runs on the Pi, SLAM on Thor;
     # this mirrors THOR_IP in robot/base.py.
     slam_pose_host: str = "192.168.1.11"
@@ -504,14 +590,33 @@ class WholeBodyHardwareConfig:
     # metre with correction enabled and watch `slam_base_correction_m` in
     # get_state() — it should stay small. If it grows steadily, flip the sign.
     slam_yaw_sign: float = +1.0
-    # Rate limits on the correction. The SLAM pose steps discontinuously on
-    # loop closure; applied directly at the WBC rate the solver would see the
-    # end effectors teleport and command a large arm velocity on the next tick.
-    # Bleeding the offset in at these rates keeps the IK configuration
-    # continuous — 10 cm of accumulated drift is removed in ~1 s, while a 1 m
-    # loop-closure jump is absorbed over ~10 s.
-    slam_correction_max_lin_rate: float = 0.10   # m/s
-    slam_correction_max_yaw_rate: float = 0.20   # rad/s
+    # How fast the correction may pull odometry toward the SLAM fix.
+    #
+    # These are the knob that decides whether this is *feedback* or merely
+    # drift removal, so they are sized against the error rather than against
+    # taste. The worst case is a command the floor refuses entirely -- full
+    # speed ordered, robot stationary -- and then the gap between odometry and
+    # truth opens at base_max_lin_vel (0.25 m/s) and base_max_ang_vel
+    # (0.60 rad/s). A correction slower than that loses the race: odometry
+    # stays wrong for as long as the slip lasts, which is exactly the interval
+    # the PD needed to see it. These are ~4x and ~3.3x those ceilings, so the
+    # correction always wins and the measured pose tracks the fix to within
+    # about a tick's worth of motion.
+    #
+    # They are still limits, not a hard assignment, and that is what keeps a
+    # loop closure survivable: the SLAM pose steps discontinuously when the
+    # map snaps, and a step handed straight to the PD is a step in its error.
+    # At these rates a 1 m jump is taken up over ~1 s instead of in one tick,
+    # which the base can actually drive; sub-centimetre corrections, the
+    # common case, are absorbed in a single tick and never rate-limited at all.
+    #
+    # Raised from 0.10 / 0.20 when this became the PD's measurement. Those
+    # values were chosen when the correction only had to bleed off slow drift
+    # *and* had to keep the IK configuration continuous, because odometry fed
+    # it. It no longer does at base_feedback_alpha = 0 (the default), which is
+    # what makes the faster rate safe -- see the warning in init().
+    slam_correction_max_lin_rate: float = 1.00   # m/s
+    slam_correction_max_yaw_rate: float = 2.00   # rad/s
     # Warn once if the standing offset exceeds this — it means dead-reckoning
     # and SLAM have diverged far more than drift explains (wrong yaw_sign,
     # wheel slip, or the robot was picked up).
@@ -605,13 +710,18 @@ class LiftVelocityPD:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BaseOdometry:
-    """Dead-reckoned (x, y, theta) of the chassis in the IK world frame.
+    """The chassis pose (x, y, theta) the base PD measures, IK world frame.
 
-    Integrates the velocity that was actually *commanded* to the base, which
-    is exact with respect to the solver's intent and free of unit guesswork,
-    but open-loop with respect to the floor. Replace `update` with the
-    SLAM/EKF-derived estimate when one is trusted; nothing else in this file
-    needs to change.
+    `update` integrates the velocity that was actually *commanded* to the
+    base: exact with respect to the solver's intent, free of unit guesswork,
+    and completely open-loop with respect to the floor. `apply_correction`
+    is the other half -- it pulls that estimate toward an absolute fix, and
+    `_correct_base_from_slam` drives it from the Odin pose once per tick.
+
+    The two halves are not interchangeable. Dead-reckoning supplies rate:
+    smooth, at loop rate, never missing. The fix supplies truth, at 20 Hz and
+    with steps in it. Running on either alone gives up something the base PD
+    needs, which is why this holds one pose that both write to.
     """
 
     def __init__(self) -> None:
@@ -704,6 +814,14 @@ class SlamBaseFrame:
     """
 
     yaw_sign: float = +1.0
+    # Where the IK frame's nose points at yaw 0, relative to its yaw axis. The
+    # SLAM frame has no such offset -- its yaw *is* the nose direction -- so
+    # this is the whole of the difference between the two yaw conventions, and
+    # `align` needs it to turn a yaw difference into an axis rotation. Same
+    # number and same meaning as BasePoseController.heading_offset and
+    # base_pose_heading_offset; the controller and this must agree or the
+    # correction and the PD would be working in frames a quarter turn apart.
+    heading_offset: float = -math.pi / 2.0
     _rot: float = 0.0        # rotation from SLAM planar axes to IK planar axes
     _tx: float = 0.0
     _ty: float = 0.0
@@ -718,15 +836,62 @@ class SlamBaseFrame:
         self._aligned = False
 
     def _reflect(self, sx: float, sy: float) -> tuple[float, float]:
-        # yaw_sign < 0 means the planar frames have opposite handedness, which
-        # is a reflection about the first axis — not just a rotation.
-        return (sx, sy) if self.yaw_sign >= 0 else (sx, -sy)
+        """Flip the planar position so the frame handedness matches the IK one.
+
+        The SLAM planar frame is left-handed. Its position axes are (t_x, t_z)
+        of a Y-up pose and its yaw is about +Y, so the nose sits at
+        (cos yaw, -sin yaw): increasing yaw rotates the heading *clockwise* in
+        those coordinates, and the robot's physical left is at -90 degrees, not
+        +90. Measured on the floor 2026-08-26 with
+        tests/hardware/test_09_axis_match.py: commanding left moved the base
+        -83.6 degrees off the nose, against the model's exact -90. The IK frame
+        is the ordinary right-handed one (left at +90), so mapping one to the
+        other needs a reflection, and `align()` cannot supply it -- it solves a
+        rotation and a translation, and neither changes handedness.
+
+        Exactly one of the two halves must flip. Until 2026-08-26 this returned
+        the reflection only when `yaw_sign < 0`, which is the same flag `to_ik`
+        uses to negate the yaw -- so the two always fired together and
+        cancelled, and *both* settings produced a mirrored frame in which the
+        path turned one way while the reported yaw turned the other. Neither
+        value worked, so no amount of calibrating `slam_yaw_sign` could fix it:
+        with the correction feeding the base PD, a 5 cm move diverged to 1.9 m.
+
+        Reflecting whenever `yaw_sign >= 0` decouples them. `+1` now means
+        "reflect the position, keep the yaw" and `-1` means "keep the position,
+        negate the yaw" -- two proper rigid motions that are mirror images of
+        each other, which is what a handedness knob should select between. +1
+        is the value the floor run calls for.
+        """
+        return (sx, -sy) if self.yaw_sign >= 0 else (sx, sy)
 
     def align(self, slam_pose: np.ndarray, ik_pose: np.ndarray) -> None:
-        """Solve the transform so that `slam_pose` maps exactly onto `ik_pose`."""
+        """Solve the transform so that `slam_pose` maps exactly onto `ik_pose`.
+
+        `_rot` has to rotate the *position* axes, so it must be the angle
+        between the two frames' axes -- and that is not the difference of the
+        two yaw numbers, because the two conventions measure yaw against
+        different body axes. In the SLAM frame the nose sits at the yaw angle
+        itself (body +X is forward). In the IK frame the robot faces -Y, so
+        its nose sits at `yaw + heading_offset`, a quarter turn behind.
+
+        Equating the yaw numbers, which is what this did until 2026-08-26,
+        therefore leaves `_rot` short by exactly `heading_offset` and rotates
+        every mapped position 90 degrees away from the heading it is paired
+        with. Alignment still looked perfect -- both pose and yaw map exactly
+        at the instant it is taken, because `_tx`/`_ty` absorb the position
+        error -- and the frame only revealed itself once the robot *moved*:
+        driving forward moved the corrected pose sideways, so the correction
+        opposed the motion on 100% of moving ticks at 1.5x the commanded
+        speed, and the base drove at its ceiling without ever arriving.
+
+        Matching the nose *directions* instead is what makes it a real rigid
+        motion:  ik_nose = slam_nose + _rot, i.e.
+        `pyaw + heading_offset = yaw_sign * syaw + _rot`.
+        """
         sx, sy, syaw = (float(v) for v in slam_pose)
         px, py, pyaw = (float(v) for v in ik_pose)
-        self._rot = _wrap_pi(pyaw - self.yaw_sign * syaw)
+        self._rot = _wrap_pi(pyaw + self.heading_offset - self.yaw_sign * syaw)
         rx, ry = self._reflect(sx, sy)
         c, s = math.cos(self._rot), math.sin(self._rot)
         self._tx = px - (c * rx - s * ry)
@@ -741,7 +906,10 @@ class SlamBaseFrame:
         return np.array([
             c * rx - s * ry + self._tx,
             s * rx + c * ry + self._ty,
-            _wrap_pi(self.yaw_sign * syaw + self._rot),
+            # Inverse of the datum in `align`: the position rotation carries
+            # the heading-convention offset, so the yaw has to take it back
+            # out or the two halves would disagree by that same quarter turn.
+            _wrap_pi(self.yaw_sign * syaw + self._rot - self.heading_offset),
         ], dtype=float)
 
 
@@ -1119,6 +1287,8 @@ class _TrajectoryRecorder:
                 f"base_vel_deadband_exit={hw_config.base_vel_deadband_exit}",
                 f"base_vel_filter_tau={hw_config.base_vel_filter_tau}",
                 f"base_feedback_alpha={hw_config.base_feedback_alpha}",
+                f"base_leash_m={hw_config.base_leash_m}",
+                f"base_leash_rad={hw_config.base_leash_rad}",
                 f"enable_lift_motion={hw_config.enable_lift_motion}",
                 f"lift_kp={hw_config.lift_kp}",
                 f"lift_kd={hw_config.lift_kd}",
@@ -1141,9 +1311,25 @@ class _TrajectoryRecorder:
                 f"base_pose_deadband_m={hw_config.base_pose_deadband_m}",
                 f"base_pose_yaw_deadband_rad={hw_config.base_pose_yaw_deadband_rad}",
                 f"base_pose_derivative_tau={hw_config.base_pose_derivative_tau}",
+                f"base_pose_ff_gain={hw_config.base_pose_ff_gain}",
+                f"base_pose_ff_max_frac={hw_config.base_pose_ff_max_frac}",
+                f"base_pose_ff_tau={hw_config.base_pose_ff_tau}",
                 f"arm_joint_deadband_rad={hw_config.arm_joint_deadband_rad}",
                 f"target_leash_m={getattr(hw_config, 'target_leash_m', 0.0)}",
                 f"target_leash_rad={getattr(hw_config, 'target_leash_rad', 0.0)}",
+                # Whether the base PD closed on SLAM or on dead-reckoning
+                # alone, and under what frame convention. Without these a
+                # finished run does not say which it was: the only trace the
+                # correction leaves in the rows is that odometry stops being
+                # the integral of the commanded velocity, which has to be
+                # reconstructed from base_x/base_y minus the pose error before
+                # you can even tell the feature was on. Two runs that differ
+                # only in `slam_yaw_sign` are otherwise indistinguishable.
+                f"enable_slam_base_pose={hw_config.enable_slam_base_pose}",
+                f"slam_yaw_sign={hw_config.slam_yaw_sign}",
+                f"slam_correction_max_lin_rate={hw_config.slam_correction_max_lin_rate}",
+                f"slam_correction_max_yaw_rate={hw_config.slam_correction_max_yaw_rate}",
+                f"slam_pose_max_age_s={hw_config.slam_pose_max_age_s}",
             ])
 
         header = ["t"]
@@ -1169,11 +1355,19 @@ class _TrajectoryRecorder:
         #         frame.
         # sent_*: the 3-vector handed to Base.set_target_base_velocity, in the
         #         axis order BaseAxisMap produces (not forward/lateral/yaw).
+        # ff_*:   the reference feedforward the PD added, chassis frame. req_*
+        #         already includes it; subtract to see the feedback alone.
+        # leash:  metres the base leash clamped off the solver's belief on
+        #         this tick -- 0 when it did not bind, nan when the base was
+        #         not being driven. Non-zero on most moving ticks means
+        #         base_leash_m is too short.
         header += ["base_active",
                    "base_err_fwd", "base_err_lat", "base_err_yaw",
                    "base_req_fwd", "base_req_lat", "base_req_yaw",
                    "base_body_fwd", "base_body_lat", "base_body_yaw",
-                   "base_sent_0", "base_sent_1", "base_sent_2"]
+                   "base_sent_0", "base_sent_1", "base_sent_2",
+                   "base_leash",
+                   "base_ff_fwd", "base_ff_lat", "base_ff_yaw"]
         # What Base itself was holding, so a mismatch against base_sent_*
         # localises to the relay or to a manual override stealing the base.
         header += ["swerve_enabled",
@@ -1252,6 +1446,8 @@ class _TrajectoryRecorder:
         row += self._vec(base.get("req"), 3)
         row += self._vec(base.get("body"), 3)
         row += self._vec(base.get("sent"), 3)
+        row += [self._f(base.get("leash"))]
+        row += self._vec(base.get("ff"), 3)
 
         swerve = swerve or {}
         row += [str(bool(swerve.get("motors_enabled", False)))]
@@ -1357,7 +1553,10 @@ class WholeBodyController:
 
         self.odometry = BaseOdometry()
         # SLAM drift correction — inert unless enable_slam_base_pose is set.
-        self.slam_frame = SlamBaseFrame(yaw_sign=self.config.slam_yaw_sign)
+        self.slam_frame = SlamBaseFrame(
+            yaw_sign=self.config.slam_yaw_sign,
+            heading_offset=self.config.base_pose_heading_offset,
+        )
         self.slam_pose: Optional[SlamPoseListener] = None
         self._slam_offset_m = 0.0
         self._slam_pose_age = float("inf")
@@ -1390,6 +1589,9 @@ class WholeBodyController:
             max_ang_vel=self.config.base_max_ang_vel,
             derivative_tau=self.config.base_pose_derivative_tau,
             heading_offset=self.config.base_pose_heading_offset,
+            ff_gain=self.config.base_pose_ff_gain,
+            ff_max_frac=self.config.base_pose_ff_max_frac,
+            ff_tau=self.config.base_pose_ff_tau,
         )
         self.lift_pd = LiftVelocityPD(
             kp=self.config.lift_kp,
@@ -1416,6 +1618,9 @@ class WholeBodyController:
         self._base_heading: Optional[float] = None
         # Last dispatched linear velocity, for the acceleration limiter.
         self._base_vel_prev: tuple[float, float] = (0.0, 0.0)
+        # Metres the base leash clamped off the solver's belief this tick, for
+        # the trajectory log. Rewritten every tick by _leash_base.
+        self._base_leash: float = 0.0
         self._lift_dispatch: dict = {}
         # The hardware sync already reads both arms once per control tick. Keep
         # those samples for dispatch instead of making two more blocking CAN
@@ -1539,6 +1744,26 @@ class WholeBodyController:
                 f"{100.0 * kp_dt / (alpha + kp_dt):.0f}% of the speed the "
                 f"solver asks for — see base_feedback_alpha"
             )
+        if self.config.enable_slam_base_pose:
+            print(
+                f"[wholebody] base: pose loop closes on the Odin SLAM fix "
+                f"({self.config.slam_pose_host}:{self.config.slam_pose_port}, "
+                f"yaw_sign={self.config.slam_yaw_sign:+.0f}) — watch "
+                f"slam_base_correction_m in get_state()"
+            )
+            if alpha > 0.0:
+                # The correction rates are sized for a PD measurement, which
+                # is several times faster than the IK configuration wants to
+                # be moved. At alpha 0 that is free, because odometry does not
+                # reach the configuration at all; above 0 it does, and a loop
+                # closure then arrives at the solver as an end-effector jump.
+                print(
+                    f"[wholebody] base: base_feedback_alpha={alpha} feeds the "
+                    f"SLAM-corrected odometry into the IK configuration at "
+                    f"{self.config.slam_correction_max_lin_rate:.2f} m/s — a "
+                    f"loop closure will move the EE targets. Use alpha 0, or "
+                    f"lower slam_correction_max_lin_rate"
+                )
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1681,6 +1906,22 @@ class WholeBodyController:
         if not self.config.enable_base_motion:
             self._halt_base()
         return self.config.enable_base_motion
+
+    @property
+    def _base_authority(self) -> bool:
+        """Is the whole-body loop the thing driving the chassis right now?
+
+        `_sync_from_hardware` and `_dispatch_base` must agree on this to the
+        tick. If dispatch stands down while sync still lets the solver's base
+        belief free-run, the belief keeps travelling while the robot is being
+        driven by someone else, and the first tick that takes authority back
+        measures the whole divergence as pose error and drives at it.
+        """
+        return bool(
+            self.config.enable_base_motion
+            and not self.ik.fix_base
+            and not self.base_manually_overridden
+        )
 
     def relatch_elbow_swivel(self, side: Optional[str] = None) -> bool:
         """[S5c] Accept the elbow branch each arm is currently in.
@@ -1860,6 +2101,10 @@ class WholeBodyController:
         self._nullspace_monitor["left"].sample(result.left_arm_q, T_l_actual)
         self._nullspace_monitor["right"].sample(result.right_arm_q, T_r_actual)
 
+        # After the monitor, which wants the solve's own numbers, and before
+        # the base target is read out of `result` by dispatch and the log.
+        self._leash_base(result)
+
         # A subsystem that is switched off still gets a row, marked inactive,
         # rather than carrying the last active tick's numbers forward.
         self._base_dispatch = {"active": False,
@@ -1885,6 +2130,69 @@ class WholeBodyController:
                 lift=self._lift_dispatch,
                 solver_diag=getattr(self.ik, "diagnostics", None),
             )
+
+    def _leash_base(self, result) -> None:
+        """Pull the solver's belief of the base pose back onto the leash.
+
+        The reference is the dead-reckoned pose, so what this bounds is how
+        far the solver's chassis can run ahead of the chassis the wheels were
+        actually asked for. See `base_leash_m` for why that gap grows and what
+        it costs; the short version is that an unbounded belief makes the
+        solver retract the arms for base motion that never happened.
+
+        The clamped pose replaces both the target dispatch reads and the pose
+        held in the IK configuration, so the next solve starts from the
+        leashed value and the excess is *forgotten* rather than banked. That
+        write-back is the whole mechanism: without it this would rate-limit
+        the symptom and leave the belief drifting.
+
+        Translation is clamped on the magnitude of the xy error rather than
+        per axis, so the direction the solver asked for survives it -- the
+        same reasoning as `_limit_linear` and `BaseOdometry.apply_correction`.
+
+        No-op when both gates are 0, and while the base is not being driven:
+        `fix_base` already stops the belief moving, and a disabled or
+        manually overridden base freezes odometry, which is then not a
+        reference worth leashing against.
+        """
+        self._base_leash = 0.0
+
+        if (not self.config.enable_base_motion
+                or self.ik.fix_base
+                or self.base_manually_overridden):
+            return
+
+        leash_m = float(self.config.base_leash_m)
+        leash_rad = float(self.config.base_leash_rad)
+        if leash_m <= 0.0 and leash_rad <= 0.0:
+            return
+
+        belief = np.asarray(result.base_position, dtype=float).reshape(-1)[:3]
+        ref = self.odometry.pose
+        leashed = belief.copy()
+        changed = False
+
+        if leash_m > 0.0:
+            dx = float(belief[0] - ref[0])
+            dy = float(belief[1] - ref[1])
+            dist = math.hypot(dx, dy)
+            if dist > leash_m:
+                scale = leash_m / dist
+                leashed[0] = ref[0] + dx * scale
+                leashed[1] = ref[1] + dy * scale
+                self._base_leash = dist - leash_m
+                changed = True
+
+        if leash_rad > 0.0:
+            dth = _wrap_pi(float(belief[2]) - float(ref[2]))
+            if abs(dth) > leash_rad:
+                leashed[2] = _wrap_pi(float(ref[2])
+                                      + math.copysign(leash_rad, dth))
+                changed = True
+
+        if changed:
+            result.base_position = leashed
+            self.ik.set_measured_state(base=leashed)
 
     def _leash_targets(self, T_l: mink.SE3, T_r: mink.SE3) -> tuple[mink.SE3, mink.SE3]:
         """[S2] Pull each EE target back onto the leash around the current pose.
@@ -1966,7 +2274,15 @@ class WholeBodyController:
         # open-loop run still starts at the robot's actual pose, mirroring
         # the one-time encoder snapshot the arms get.
         alpha = float(self.config.base_feedback_alpha)
-        if force_arm_read or alpha >= 1.0:
+        if force_arm_read or alpha >= 1.0 or not self._base_authority:
+            # Hard-seed while someone else has the chassis (joystick, nav,
+            # fix_base, base motion off). The belief must not free-run through
+            # a stretch it is not commanding: with the pose loop closed on
+            # SLAM, odometry follows the robot wherever it is driven, so a
+            # belief that kept integrating would hand the first tick after the
+            # override a pose error the size of however far the operator went
+            # -- and the base would drive back at full speed to answer it.
+            # Seeding every inactive tick keeps that error at zero instead.
             base = np.asarray(self.odometry.pose, dtype=float)
         else:
             belief = self.ik.configuration.q[self.ik.base_qpos_adrs]
@@ -1978,13 +2294,26 @@ class WholeBodyController:
         )
 
     def _correct_base_from_slam(self) -> None:
-        """Bleed dead-reckoning drift out of the base pose using the SLAM pose.
+        """Pull the pose the base PD measures toward the Odin fix.
 
-        Deliberately a *correction* rather than a replacement. Dead-reckoning
-        stays the primary signal because it is smooth, always available and
-        exact with respect to what the solver commanded; SLAM only supplies the
-        absolute reference that stops it drifting. A dropout therefore costs
-        nothing but the correction itself.
+        This runs first in `_step`, before the solve and before
+        `_dispatch_base`, so the pose the PD closes on this tick already
+        carries the correction rather than lagging it by one.
+
+        Deliberately a *correction* rather than a replacement, even though it
+        is now fast enough to be feedback. Dead-reckoning is what carries the
+        estimate between fixes: it is smooth, available at loop rate, and
+        exact with respect to what the solver commanded, none of which a 20 Hz
+        absolute fix is. SLAM supplies the one thing it cannot -- a statement
+        about the floor -- and the rate limit is what stops a loop-closure
+        step from reaching the PD as a step. A dropout costs nothing but the
+        correction: `latest()` ages out, this returns early, and the base
+        coasts on dead-reckoning exactly as it did before.
+
+        Nothing here is conditional on the base being enabled or overridden.
+        The estimate has to stay true while a human drives the chassis by
+        joystick, or the first whole-body tick after the override lapses would
+        measure from a pose that stopped tracking when authority changed hands.
         """
         if self.slam_pose is None:
             return
@@ -2358,11 +2687,14 @@ class WholeBodyController:
         """Drive the chassis toward the base *pose* the solver asked for.
 
         `result.base_position` is the IK's own belief about where the base
-        should be; the dead-reckoned pose is where it is. `BasePoseController`
-        (robot/base.py) closes a PD on the difference and returns a body-frame
-        velocity request, which then goes through exactly the chain the
-        solver's velocity used to: heading-rate limit, acceleration limit,
-        yaw filter, axis map, and the same relay.
+        should be; `self.odometry.pose` is where it is -- dead-reckoned at
+        loop rate and, with `enable_slam_base_pose`, corrected toward the Odin
+        fix every tick by `_correct_base_from_slam`, so the difference the PD
+        closes is a real one and not just the part of the command the wheels
+        admitted to. `BasePoseController` (robot/base.py) closes a PD on that
+        difference and returns a body-frame velocity request, which then goes
+        through exactly the chain the solver's velocity used to: heading-rate
+        limit, acceleration limit, yaw filter, axis map, and the same relay.
 
         Nothing about authority changes. A disabled base, `fix_base`, or a
         live manual override still stops the base and now also resets the PD,
@@ -2371,9 +2703,7 @@ class WholeBodyController:
         """
         target = np.asarray(result.base_position, dtype=float).reshape(-1)[:3]
 
-        if (not self.config.enable_base_motion
-                or self.ik.fix_base
-                or self.base_manually_overridden):
+        if not self._base_authority:
             if np.any(self._last_base_command):
                 self._halt_base()
             # Forget the filters along with the motion: resuming later must
@@ -2422,6 +2752,8 @@ class WholeBodyController:
             "req": request,
             "body": np.array([forward, lateral, yaw_rate], dtype=float),
             "sent": command.copy(),
+            "leash": self._base_leash,
+            "ff": self.base_pose.last_feedforward.copy(),
         }
 
         # Odometry integrates what was *commanded* after clamping, so the

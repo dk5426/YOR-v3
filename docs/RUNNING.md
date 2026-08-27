@@ -501,38 +501,71 @@ validated and must stay a separate commissioning experiment; drive `Kd` is
 deliberately zero, because a tested value of 10 produced an audibly harsh
 100 Hz torque ripple.
 
-### Feeding the SLAM pose into whole-body IK (optional)
+### Closing the base pose loop on the SLAM pose
 
-By default the solver's base pose is dead-reckoned from the velocity it
-commanded, so it drifts. `WholeBodyHardwareConfig.enable_slam_base_pose` wires
-the Odin pose in as a **drift correction** — dead-reckoning stays primary and
-the absolute pose is bled in under a rate limit, so a loop-closure jump never
-reaches the IK as a step.
+**On by default** (`WholeBodyHardwareConfig.enable_slam_base_pose`, or
+`--no-slam-base-pose` to turn it off).
 
-It ships **off**, because one value has to be calibrated first: `slam_yaw_sign`
-(+1 or −1), the handedness of the SLAM planar frame relative to the IK one.
-Everything else — rotation and translation between the frames — is solved
-automatically from the first pose pair, so the correction always starts at zero.
+`_dispatch_base` drives the chassis with a PD from the solver's base *pose*
+target to the pose it measures, and what it measures is `odometry.pose` —
+dead-reckoned by integrating the velocity the base was **commanded**. On its
+own that makes the loop an echo chamber: the error decays because odometry
+moved, whether or not the robot did. Wheel slip, a push, a module that never
+reached its angle and a stalled drive are all invisible to it by construction,
+so the base reports arrival while sitting still.
 
-Calibration, about 30 seconds:
+With this on, `_correct_base_from_slam` pulls that same pose toward the Odin
+VIO+lidar fix (`slam/pose`, `:6000`) once per tick, before the solve, so the
+PD measures where the robot actually is. Dead-reckoning still carries the
+estimate between fixes — it is smooth and available at loop rate, which a
+20 Hz absolute pose is not — but it no longer gets to be wrong for free.
 
-```python
-cfg = WholeBodyHardwareConfig(enable_slam_base_pose=True, slam_yaw_sign=+1.0)
-```
+The correction is rate-limited rather than assigned
+(`slam_correction_max_lin_rate` / `..._yaw_rate`, default 1.0 m/s and
+2.0 rad/s, or `--slam-correction-rate LIN YAW`). Those defaults are sized
+**above** the base's own ceilings (0.25 m/s, 0.60 rad/s) so the correction
+always wins the race against a slipping wheel — that is what makes this
+feedback rather than slow drift removal. They are still limits, which is what
+keeps a loop closure survivable: a 1 m map snap is taken up over ~1 s instead
+of arriving at the PD as a step, while an ordinary sub-centimetre correction
+lands whole in a single tick.
 
-1. Start `odin_pub_node` and `yor.py`. Watch for `[wholebody] SLAM base
-   correction aligned` — no message means no pose is arriving.
+Dropouts cost only the correction. A pose older than `slam_pose_max_age_s`
+(0.5 s) is ignored and the base coasts on dead-reckoning; so is a fix whose
+confidence (message index 19) is below 10.
+
+#### The one value that can be wrong: `slam_yaw_sign`
+
+Rotation and translation between the SLAM and IK frames are solved
+automatically from the first pose pair — `SlamBaseFrame.align()` pins the SLAM
+frame onto the odometry pose at the first usable fix, so the correction starts
+at exactly zero and only ever removes error accumulated after that. The
+handedness is not solved for. Check it once per robot, about 30 seconds:
+
+1. Start `odin_pub_node` and `yor.py`. Watch for `[wholebody] base: pose loop
+   closes on the Odin SLAM fix` and then `[wholebody] SLAM base correction
+   aligned` — no second message means no pose is arriving.
 2. Drive the base forward ~1 m with the joystick.
 3. Poll `get_state()["slam_base_correction_m"]`.
    - **Stays small** (a few cm, not trending): sign is right.
-   - **Grows steadily** with distance: flip `slam_yaw_sign` to −1.0 and repeat.
+   - **Grows steadily** with distance: restart with `--slam-yaw-sign=-1`.
 
-A wrong sign is worse than leaving the feature off — the error then grows as you
-drive instead of staying bounded, which is why the default is disabled.
+A wrong sign is worse than turning the feature off, because the error then
+grows as you drive instead of staying bounded — the base would be steered by
+it. `tests/hardware/test_06_slam_pose.py` determines the sign directly if you
+would rather not eyeball it.
 
 `get_state()` also reports `slam_base_pose_age` (seconds since the last pose,
 `None` when the feature is off). If it exceeds `slam_pose_max_age_s` the
 correction pauses and the loop coasts on dead-reckoning.
+
+#### Interaction with `base_feedback_alpha`
+
+The fast correction rates are safe **because** `base_feedback_alpha` is 0, so
+odometry does not reach the IK configuration at all — it is only the base PD's
+measurement. Above 0 it does reach the configuration, and a loop closure then
+arrives at the solver as an end-effector jump. `init()` warns when both are
+set; use alpha 0, or lower `slam_correction_max_lin_rate`.
 
 Two things that make this less obvious than it looks:
 
@@ -624,8 +657,8 @@ loop), then `resume_wholebody()`.
 
 | Limitation | Consequence |
 |---|---|
-| The base pose loop closes on dead-reckoned odometry, not on the floor | The PD makes the chassis converge on the pose the *solver* asked for, measured in the solver's own frame. It removes the accumulated command lag the velocity path had, but it cannot see wheel slip or a push: both move the robot without moving odometry, so neither shows up as an error. Absolute accuracy still depends on the SLAM correction below. |
-| The *solver's* base odometry is dead-reckoned from the commanded velocity | The solver's idea of where the chassis is drifts. Fine for clutch-based teleop (targets are relative to the current EE pose); absolute world-frame targets degrade the longer the base drives. Fixable — see "Feeding the SLAM pose into whole-body IK" above — but off until `slam_yaw_sign` is calibrated, so it drifts by default. |
+| The base pose loop closes on the SLAM pose, not on wheel encoders | With `enable_slam_base_pose` on (the default) the PD measures a dead-reckoned pose corrected toward the Odin fix each tick, so slip and pushes *do* show up as error. What it inherits instead is the Odin's own failure modes: a bad or low-confidence fix steers the base. Below `slam_pose_max_age_s` of silence it falls back to dead-reckoning, which cannot see slip at all — see "Closing the base pose loop" above. |
+| The *solver's* base belief free-runs from its own commands | `base_feedback_alpha` is 0, so the IK's idea of where the chassis is integrates the solver's own base motion and is never read back from odometry — that is deliberate, and required for pose control to track at full speed. The PD is what ties it to the floor. While the base is overridden, fixed or disabled the belief is re-seeded from the measured pose every tick, so taking authority back does not hand the base a pose error the size of wherever the operator drove it. |
 | The Odin's `slam/pcd` cloud is unordered | `pcd_source: slam` reshapes it to `(1,N,4)`, so mapping's 3×3 flying-pixel rejection spans unrelated points and is effectively inert. Acceptable because the Odin filters on-device, but do not read that filter as active. |
 | `BaseAxisMap` signs are unverified | Checked against the conventions in `base.py`, not against the physical robot. Do step 1 of the checklist. |
 | The lift PD is not a velocity loop | The host commands a velocity and the firmware shapes it, but nothing measures column velocity, so a stalled or slipping column is only visible as height that stops changing. The 5 mm deadband is the practical holding accuracy. |
