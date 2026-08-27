@@ -65,9 +65,17 @@ def test_projector_and_reduction():
     arm unable to move at all on a 10 cm target.
     """
     print("\nnull-space projector and posture-only reduction")
+    # The hand-derived step below is the *unconstrained* damped inverse at a
+    # flat lambda with no row scaling, so the three knobs that change that
+    # step are pinned off: constrained_primary solves a QP against the
+    # joint/collision inequalities instead, dls_task_weighting rescales the
+    # rows of J and b, and adaptive damping ramps lambda with sigma_min.
+    # Each is a different step by construction, not a broken one -- the
+    # identity being pinned here is the projector's.
     ik = build(nullspace_posture_weight=1.0, nullspace_continuity_weight=0.0,
                nullspace_swivel_weight=0.0, enable_manipulability=False,
-               nullspace_regularization=1e-12)
+               nullspace_regularization=1e-12, constrained_primary=False,
+               dls_task_weighting=False, dls_adaptive_damping_sigma=0.0)
     T_l, T_r = targets(ik, [0.05, 0.0, 0.03])
     ik.left_ee_task.set_target(T_l)
     ik.right_ee_task.set_target(T_r)
@@ -190,6 +198,20 @@ def test_swivel_jacobian_matches_finite_difference():
         return
     jac_phi, phi, _ = row
 
+    # _swivel_row freezes the transported reference through its own finite
+    # differences (see its docstring), so the numerical check has to
+    # differentiate the same angle -- with swivel_parallel_ref on, the
+    # default z/x construction is a different function of q entirely.
+    ref = None
+    if ik.config.swivel_parallel_ref:
+        S_, _E, W_ = ik._swivel_points("right")
+        axis = W_ - S_
+        a_norm = float(np.linalg.norm(axis))
+        if a_norm > 1e-9:
+            r_ = ik._swivel_reference("right", axis / a_norm)
+            if r_ is not None:
+                ref = (float(r_[0]), float(r_[1]), float(r_[2]))
+
     h = 1e-6
     fd = np.zeros(idx.size)
     for k, dof in enumerate(idx):
@@ -200,7 +222,7 @@ def test_swivel_jacobian_matches_finite_difference():
             qp = q.copy()          # always perturb the *base* pose, not the
             qp[adr] += sign * h    # one the previous sign already wrote back
             ik.configuration.update(qp)
-            a, _ = ik._swivel_from_points(*ik._swivel_points("right"))
+            a, _ = ik._swivel_from_points(*ik._swivel_points("right"), ref=ref)
             if sign > 0:
                 hi = a
             else:
@@ -458,8 +480,20 @@ def test_manipulability_gated_base_weight() -> None:
     # Gate disabled = base expensive on ALL three DOFs. Since the per-axis
     # split, yaw has its own weight (default 1.0 = cheap), so pinning only
     # the linear floor would leave the chassis a yaw route to keep helping.
-    flat = push(base_motion_weight_min=100.0, base_motion_weight_yaw=100.0)
-    gated = push()                                      # shipped defaults
+    #
+    # Both arms of the comparison also pin off the four other mechanisms
+    # that now ship on and independently keep this reach out of the
+    # singularity: the null-space home attractor, base recentering, adaptive
+    # damping (which softens exactly where mu collapses) and the
+    # parallel-transported swivel reference (measured on its own it takes
+    # the flat baseline's min mu from 1.2e-5 to 2.5e-3). Leaving any of them
+    # in measures "does anything rescue the posture" rather than "does the
+    # manipulability gate rescue it", which is the claim in the docstring.
+    isolate = dict(nullspace_home_gain=0.0, base_recenter_gain=0.0,
+                   dls_adaptive_damping_sigma=0.0, swivel_parallel_ref=False)
+    flat = push(base_motion_weight_min=100.0, base_motion_weight_yaw=100.0,
+                **isolate)
+    gated = push(**isolate)                             # gate on, nothing else
     check("without the gate the arms reach a singularity",
           flat.min() < 1e-3, f"min mu {flat.min():.6f}")
     check("with it they do not",

@@ -286,6 +286,9 @@ class BasePoseController:
         max_lin_vel: float = 0.25,
         max_ang_vel: float = 0.60,
         derivative_tau: float = 0.10,
+        ff_gain: float = 0.0,
+        ff_max_frac: float = 0.8,
+        ff_tau: float = 0.0,
         max_gap_s: float = 0.25,
         heading_offset: float = -math.pi / 2.0,
     ) -> None:
@@ -301,6 +304,48 @@ class BasePoseController:
         self.derivative_tau = float(derivative_tau)
         self.max_gap_s = float(max_gap_s)
         self.heading_offset = float(heading_offset)
+        # Feedforward on the *reference*: d(target)/dt, added to the PD output.
+        #
+        # Without it the only source of speed is standing pose error -- at
+        # kp_xy 1.5 the base does not reach max_lin_vel until it is 0.167 m
+        # behind, and that standing error is lag by construction. It is also
+        # what makes a short leash and a responsive base fight each other:
+        # bounding the error bounds the speed at kp * leash. Feeding the
+        # reference rate forward decouples the two, so speed comes from what
+        # the target is doing and the PD only has to correct the residual.
+        #
+        # Clamped to `ff_max_frac` of the velocity limits rather than the whole
+        # budget, so feedback always keeps authority: a saturated feedforward
+        # would otherwise swamp the correction term inside the total clamp.
+        # The clamp matters less for solver noise than for discontinuities --
+        # a clutch reseed, a SLAM correction, or authority coming back after an
+        # override moves the target metres in one tick, and the derivative of
+        # that is meaningless. reset() drops the history for the same reason.
+        #
+        # 0 disables, which is the default: this changes how the base feels,
+        # so it wants to be switched on deliberately and tuned on the floor.
+        self.ff_gain = float(ff_gain)
+        self.ff_max_frac = float(ff_max_frac)
+        # One-pole low-pass on the feedforward, applied *after* its clamp.
+        #
+        # A derivative amplifies whatever tick-to-tick noise is in the
+        # reference, and the solver has plenty: on the 2026-08-26 runs turning
+        # the feedforward on tripled the base's yaw sign-flip rate (0.4 -> 1.1
+        # per second) and doubled the median heading churn. That reads as
+        # twitch to an operator even though the amplitude is small -- only a
+        # few percent of ticks exceeded the heading-rate limit.
+        #
+        # Filtering after the clamp rather than before follows the same
+        # reasoning as `_limit_linear` one level up: a one-tick spike then
+        # charges the filter with at most one tick of the cap instead of the
+        # whole spike. Filtering a convex combination of clamped inputs cannot
+        # exceed the clamp, so no re-clamp is needed afterwards.
+        #
+        # The cost is onset lag on the feedforward, which has to be weighed
+        # against what it replaced: 40 mm of standing pose error at kp 1.5 is
+        # ~27 ms of equivalent lag, so a tau of 40-60 ms still leaves the base
+        # ahead of where it was without any feedforward at all. 0 disables.
+        self.ff_tau = float(ff_tau)
 
         # Never ask for more than the drive is configured to allow. Base takes
         # its own per-axis ceiling ([vx, vy, omega]) at construction and does
@@ -328,10 +373,17 @@ class BasePoseController:
         """
         self._last_pose: Optional[np.ndarray] = None
         self._last_time: Optional[float] = None
+        # Reference history for the feedforward. Cleared alongside the
+        # measurement history: the first tick after a discontinuity must not
+        # differentiate across it.
+        self._last_target: Optional[np.ndarray] = None
+        self._last_target_time: Optional[float] = None
+        self._ff_filt = np.zeros(3, dtype=float)
         # Body-frame [forward, left, yaw] of the *measurement*, low-passed.
         self._vel_filt = np.zeros(3, dtype=float)
         self.last_error = np.zeros(3, dtype=float)
         self.last_command = np.zeros(3, dtype=float)
+        self.last_feedforward = np.zeros(3, dtype=float)
 
     @property
     def measured_velocity(self) -> np.ndarray:
@@ -364,6 +416,13 @@ class BasePoseController:
         err_yaw = _wrap_pi(float(target[2]) - float(current[2]))
         self.last_error = np.array([err_fwd, err_left, err_yaw], dtype=float)
 
+        # The feedforward sits *outside* the deadbands. They exist to stop the
+        # correction term chattering when the base is already where it was
+        # asked to be, which is exactly the case where a moving reference
+        # still has to be followed -- suppressing it there would reintroduce
+        # the lag this is here to remove.
+        ff_fwd, ff_lat, ff_yaw = self._feedforward(target, current, now, dt)
+
         # Deadband on the magnitude of the XY error vector, so the direction
         # the caller asked for survives it or nothing does.
         if math.hypot(err_fwd, err_left) <= self.xy_deadband:
@@ -371,13 +430,16 @@ class BasePoseController:
         else:
             forward = self.kp_xy * err_fwd - self.kd_xy * float(self._vel_filt[0])
             lateral = self.kp_xy * err_left - self.kd_xy * float(self._vel_filt[1])
-            forward, lateral = self._clamp_linear(forward, lateral)
+        # Clamped once, on the sum, so the total keeps the direction it asked
+        # for -- clamping the two terms separately would turn the command.
+        forward, lateral = self._clamp_linear(forward + ff_fwd, lateral + ff_lat)
 
         if abs(err_yaw) <= self.yaw_deadband:
             yaw_rate = 0.0
         else:
             yaw_rate = self.kp_yaw * err_yaw - self.kd_yaw * float(self._vel_filt[2])
-            yaw_rate = float(np.clip(yaw_rate, -self.max_ang_vel, self.max_ang_vel))
+        yaw_rate = float(np.clip(yaw_rate + ff_yaw,
+                                 -self.max_ang_vel, self.max_ang_vel))
 
         self.last_command = np.array([forward, lateral, yaw_rate], dtype=float)
         return self.last_command.copy()
@@ -427,6 +489,73 @@ class BasePoseController:
             scale = self.max_lin_vel / speed
             forward, lateral = forward * scale, lateral * scale
         return float(forward), float(lateral)
+
+    def _feedforward(
+        self, target: np.ndarray, current: np.ndarray, now: float,
+        dt: Optional[float],
+    ) -> tuple[float, float, float]:
+        """Body-frame d(target)/dt, gained and clamped. See `ff_gain`.
+
+        Mirrors `_update_derivative`, but differentiates the *reference*
+        rather than the measurement, and keeps its own history so the two
+        cannot be desynchronised by the order they are called in.
+
+        Returns (0, 0, 0) whenever the derivative would be meaningless: the
+        term disabled, no previous target, time not advancing, or a gap large
+        enough that the loop stalled. `_last_target` is still updated in every
+        one of those cases, so the tick *after* a skipped one differentiates
+        across one step rather than across the gap.
+        """
+        last, last_t = self._last_target, self._last_target_time
+        self._last_target = target.copy()
+        self._last_target_time = float(now)
+        self.last_feedforward = np.zeros(3, dtype=float)
+
+        # A skipped tick must not leave the filter charged: the tick that
+        # resumes would blend against a value from before the discontinuity.
+        if self.ff_gain <= 0.0 or last is None or last_t is None:
+            self._ff_filt[:] = 0.0
+            return 0.0, 0.0, 0.0
+
+        step = (float(now) - last_t) if dt is None else float(dt)
+        if step <= 0.0 or step > self.max_gap_s:
+            self._ff_filt[:] = 0.0
+            return 0.0, 0.0, 0.0
+
+        # Rotated by the *current* heading, matching how the error above is
+        # taken into the body frame, so the two terms are in the same frame.
+        fwd, left = self._to_body(
+            (float(target[0]) - float(last[0])) / step,
+            (float(target[1]) - float(last[1])) / step,
+            current[2],
+        )
+        yaw = _wrap_pi(float(target[2]) - float(last[2])) / step
+
+        fwd *= self.ff_gain
+        left *= self.ff_gain
+        yaw *= self.ff_gain
+
+        # Vector clamp on the pair, per-axis on yaw -- same split as the
+        # command clamps, and for the same reason.
+        lin_lim = max(0.0, self.ff_max_frac) * self.max_lin_vel
+        speed = math.hypot(fwd, left)
+        if speed > lin_lim and speed > 1e-12:
+            scale = lin_lim / speed
+            fwd, left = fwd * scale, left * scale
+        ang_lim = max(0.0, self.ff_max_frac) * self.max_ang_vel
+        yaw = float(np.clip(yaw, -ang_lim, ang_lim))
+
+        if self.ff_tau > 0.0:
+            alpha = step / (self.ff_tau + step)
+            self._ff_filt += alpha * (
+                np.array([fwd, left, yaw], dtype=float) - self._ff_filt)
+            fwd, left, yaw = (float(self._ff_filt[0]), float(self._ff_filt[1]),
+                              float(self._ff_filt[2]))
+        else:
+            self._ff_filt = np.array([fwd, left, yaw], dtype=float)
+
+        self.last_feedforward = np.array([fwd, left, yaw], dtype=float)
+        return float(fwd), float(left), float(yaw)
 
     def _update_derivative(
         self, current: np.ndarray, now: float, dt: Optional[float]

@@ -1124,11 +1124,21 @@ def main():
              "'base motion is emergent' true: the arms absorb high-frequency error and "
              "the base moves only when they run out of reach.")
     parser.add_argument(
+        "--base-motion-weight-yaw", type=float, default=None, metavar="W",
+        help="cost of base YAW alone, independent of --base-motion-weight "
+             "(which covers base_x/base_y). Default 1.0 makes yaw ~100x "
+             "cheaper than driving, so the solver reaches for yaw first and "
+             "the chassis alternates between rotating and driving. Raise it "
+             "to make yaw less of a hair trigger; what matters is the ratio "
+             "to the linear weight, not the absolute value.")
+    parser.add_argument(
         "--base-motion-weight-min", type=float, default=None, metavar="W",
         help="what --base-motion-weight falls to when the arms run out of posture "
-             "(default 1.0, i.e. no penalty). The cost is gated on arm manipulability, "
-             "so the chassis moves to keep the arms working rather than only after they "
-             "have contorted. Set equal to --base-motion-weight to disable the gate.")
+             "(default 10, which keeps the linear DOFs above --base-motion-weight-yaw "
+             "so yaw stays the cheap route into the base). The cost is gated on arm "
+             "manipulability, so the chassis moves to keep the arms working rather "
+             "than only after they have contorted. Set equal to --base-motion-weight "
+             "to disable the gate.")
     parser.add_argument(
         "--base-weight-gate", type=float, nargs=2, default=None, metavar=("ON", "FULL"),
         help="manipulability band the base cost ramps across (default 0.045 0.025). "
@@ -1171,7 +1181,9 @@ def main():
              "from the base, at GAIN * distance m/s, capped at MAXVEL, with "
              "the arms counter-moving so the hands stay put. Symmetric --  "
              "not gated by arm reach, so it pulls the base home on retract "
-             "as well as reach. Default 0.5 0.15; 0 0 disables.")
+             "as well as reach. Default 1.5 0.15 (raised from 0.5 on "
+             "2026-08-26 -- see WholeBodyIKConfig.base_recenter_gain); "
+             "0 0 disables.")
     parser.add_argument(
         "--base-yaw-filter-tau", type=float, default=None, metavar="TAU",
         help="one-pole low-pass time constant on the base yaw request, s "
@@ -1179,6 +1191,29 @@ def main():
              "was removed). 0.08 is the old light setting; 0.25 measured "
              "well in replay but felt clearly worse on the floor; "
              "0 disables.")
+    parser.add_argument(
+        "--slam-base-pose", action=argparse.BooleanOptionalAction, default=None,
+        help="close the whole-body base pose loop on the Odin VIO+lidar fix "
+             "(slam/pose on :6000) instead of on dead-reckoning alone (default: "
+             "on). --no-slam-base-pose runs the base open-loop with respect to "
+             "the floor: slip and pushes stop being visible to the PD.")
+    parser.add_argument(
+        "--slam-yaw-sign", type=float, default=None, choices=(1.0, -1.0),
+        metavar="SIGN",
+        help="handedness of the SLAM planar frame against the IK one, +1 or -1 "
+             "(default: +1). Wrong means the correction grows as you drive "
+             "instead of staying small -- watch slam_base_correction_m in "
+             "get_state(), or run tests/hardware/test_06_slam_pose.py.")
+    parser.add_argument(
+        "--slam-correction-rate", type=float, nargs=2, default=None,
+        metavar=("LIN", "YAW"),
+        help="ceiling on how fast the SLAM correction may move the measured "
+             "base pose, m/s and rad/s (default: 1.0 2.0). Sized above the "
+             "base's own speed ceilings so the correction always wins; lower "
+             "it toward 0.1/0.2 to go back to bleeding off drift only.")
+    parser.add_argument(
+        "--slam-pose-host", type=str, default=None, metavar="HOST",
+        help="where odin_pub_node publishes slam/pose (default: 192.168.1.11)")
     parser.add_argument(
         "--swerve-log", action=argparse.BooleanOptionalAction, default=True,
         help="record per-module swerve telemetry (commanded and measured steer angle, "
@@ -1334,16 +1369,48 @@ def main():
         "--target-leash-m", type=float, default=None, metavar="M",
         help="[S2] cap how far an EE target may sit from the current EE "
              "pose; excess is forgotten each tick, killing clutch wind-up "
-             "at the server (default: 0 = off; try 0.15)")
+             "at the server (default 0.15; 0 = off)")
     parser.add_argument(
         "--target-leash-rad", type=float, default=None, metavar="RAD",
         help="[S2] same leash for orientation, along the geodesic "
-             "(default: 0 = off; try 0.8)")
+             "(default 0.8; 0 = off)")
+    parser.add_argument(
+        "--base-leash-m", type=float, default=None, metavar="M",
+        help="cap how far the solver's belief of the chassis pose may sit "
+             "from the dead-reckoned pose; the excess is forgotten each tick, "
+             "so the solver sees the base falling behind and reaches with the "
+             "arms instead (default: keep config value, currently 0.2; "
+             "0 = off)")
+    parser.add_argument(
+        "--base-leash-rad", type=float, default=None, metavar="RAD",
+        help="the same leash on yaw (default: keep config value, currently "
+             "0 = off; try 0.24)")
+    parser.add_argument(
+        "--base-pose-kp-xy", type=float, default=None, metavar="KP",
+        help="proportional gain of the base pose PD, in (m/s)/m. At the "
+             "default 1.5 the base does not reach base_max_lin_vel until it "
+             "is 0.167 m behind, and that standing error is felt as lag; "
+             "raising it shortens the error needed for a given speed "
+             "(default: keep config value, currently 1.5; try 3.0)")
+    parser.add_argument(
+        "--base-pose-ff-tau", type=float, default=None, metavar="TAU",
+        help="low-pass on the base pose feedforward, seconds. The "
+             "feedforward differentiates the target, so it amplifies solver "
+             "jitter -- on 2026-08-26 it tripled the base yaw sign-flip rate "
+             "(0.4 -> 1.1 /s), felt as twitch. This buys that back for some "
+             "onset lag (default: keep config value, currently 0 = off; "
+             "try 0.05)")
+    parser.add_argument(
+        "--base-pose-ff-gain", type=float, default=None, metavar="GAIN",
+        help="feed the base pose target's own rate forward into the PD, so "
+             "speed stops depending on accumulated error -- this is what lets "
+             "a short --base-leash-m coexist with a responsive base "
+             "(default: keep config value, currently 1.0; 0 = off)")
     parser.add_argument(
         "--nullspace-home-gain", type=float, default=None, metavar="GAIN",
         help="[S1] null-space pull of the arm joints toward the home "
              "posture, in (rad/s per rad of error); the missing recovery "
-             "force for contorted poses. 0 = off (default; try 0.3)")
+             "force for contorted poses. Default 0.3; 0 = off")
     parser.add_argument(
         "--nullspace-home-weight", type=float, default=None, metavar="W",
         help="[S1] weight of the home attractor in the secondary stack "
@@ -1353,37 +1420,43 @@ def main():
         help="[S1] per-joint cap on the home-attractor desire in rad/s "
              "(default: config 0.3)")
     parser.add_argument(
-        "--constrained-primary", action="store_true",
+        "--constrained-primary", action=argparse.BooleanOptionalAction,
+        default=True,
         help="[S3] solve the primary EE step subject to the joint/collision "
              "inequalities instead of clipping afterwards, so blocked arm "
              "motion reroutes through base/lift (the backward-motion fix). "
              "Falls back to the unconstrained step on any QP failure. "
-             "Costs ~1 extra small QP per iteration.")
+             "Costs ~1 extra small QP per iteration. On by default; "
+             "--no-constrained-primary restores the clip.")
     parser.add_argument(
-        "--dls-task-weighting", action="store_true",
+        "--dls-task-weighting", action=argparse.BooleanOptionalAction,
+        default=True,
         help="[S4a] apply ee_position_cost/ee_orientation_cost row scaling "
              "inside dls_projector (off, those knobs are silently ignored "
-             "and 1 m weighs the same as 1 rad)")
+             "and 1 m weighs the same as 1 rad). On by default; "
+             "--no-dls-task-weighting restores the unweighted stack.")
     parser.add_argument(
         "--dls-adaptive-damping", type=float, default=None, metavar="SIGMA",
         help="[S4b] sigma_min threshold below which lambda ramps from "
              "--dls-damping up to --dls-damping-max; keeps rotation crisp "
-             "away from singularity, softens only near it (default: 0 = "
-             "off; try 0.05)")
+             "away from singularity, softens only near it (default 0.05; "
+             "0 = off)")
     parser.add_argument(
         "--dls-damping-max", type=float, default=None, metavar="LAM",
         help="[S4b] lambda at sigma_min = 0 with --dls-adaptive-damping "
              "(default: config 0.2)")
     parser.add_argument(
-        "--swivel-parallel-ref", action="store_true",
+        "--swivel-parallel-ref", action=argparse.BooleanOptionalAction,
+        default=True,
         help="[S5a] parallel-transported swivel reference: removes the "
              "reference-frame step at |u_z| = 0.9 that yanks the elbow "
-             "during high/low reaches (off = current z/x convention)")
+             "during high/low reaches. On by default; "
+             "--no-swivel-parallel-ref restores the z/x convention.")
     parser.add_argument(
         "--swivel-relatch-err", type=float, default=None, metavar="RAD",
         help="[S5b] if the swivel error stays above this for "
              "--swivel-relatch-time, accept the branch the arm is actually "
-             "in instead of fighting it (default: 0 = off; try 1.57)")
+             "in instead of fighting it (default 1.57; 0 = off)")
     parser.add_argument(
         "--swivel-relatch-time", type=float, default=None, metavar="S",
         help="[S5b] dwell before a re-latch (default: config 1.0 s)")
@@ -1420,6 +1493,25 @@ def main():
            else {"target_leash_m": args.target_leash_m}),
         **({} if args.target_leash_rad is None
            else {"target_leash_rad": args.target_leash_rad}),
+        **({} if args.base_leash_m is None
+           else {"base_leash_m": args.base_leash_m}),
+        **({} if args.base_leash_rad is None
+           else {"base_leash_rad": args.base_leash_rad}),
+        **({} if args.base_pose_kp_xy is None
+           else {"base_pose_kp_xy": args.base_pose_kp_xy}),
+        **({} if args.base_pose_ff_gain is None
+           else {"base_pose_ff_gain": args.base_pose_ff_gain}),
+        **({} if args.base_pose_ff_tau is None
+           else {"base_pose_ff_tau": args.base_pose_ff_tau}),
+        **({} if args.slam_base_pose is None
+           else {"enable_slam_base_pose": args.slam_base_pose}),
+        **({} if args.slam_yaw_sign is None
+           else {"slam_yaw_sign": args.slam_yaw_sign}),
+        **({} if args.slam_correction_rate is None
+           else {"slam_correction_max_lin_rate": args.slam_correction_rate[0],
+                 "slam_correction_max_yaw_rate": args.slam_correction_rate[1]}),
+        **({} if args.slam_pose_host is None
+           else {"slam_pose_host": args.slam_pose_host}),
     )
 
     # Same base tuning WholeBodyController would build internally (see its
@@ -1447,6 +1539,8 @@ def main():
            else {"base_motion_weight": args.base_motion_weight}),
         **({} if args.base_motion_weight_min is None
            else {"base_motion_weight_min": args.base_motion_weight_min}),
+        **({} if args.base_motion_weight_yaw is None
+           else {"base_motion_weight_yaw": args.base_motion_weight_yaw}),
         **({} if args.base_weight_gate is None
            else {"base_weight_gate_on": args.base_weight_gate[0],
                  "base_weight_gate_full": args.base_weight_gate[1]}),
@@ -1488,15 +1582,21 @@ def main():
         (f"arm_deadband={args.arm_joint_deadband}", args.arm_joint_deadband is not None),
         (f"leash_m={args.target_leash_m}", args.target_leash_m is not None),
         (f"leash_rad={args.target_leash_rad}", args.target_leash_rad is not None),
+        (f"base_leash_m={args.base_leash_m}", args.base_leash_m is not None),
+        (f"base_leash_rad={args.base_leash_rad}", args.base_leash_rad is not None),
+        (f"base_kp_xy={args.base_pose_kp_xy}", args.base_pose_kp_xy is not None),
+        (f"base_ff_gain={args.base_pose_ff_gain}", args.base_pose_ff_gain is not None),
+        (f"base_ff_tau={args.base_pose_ff_tau}", args.base_pose_ff_tau is not None),
+        (f"base_yaw_weight={args.base_motion_weight_yaw}", args.base_motion_weight_yaw is not None),
         (f"home_gain={args.nullspace_home_gain}", args.nullspace_home_gain is not None),
-        ("constrained_primary", args.constrained_primary),
-        ("dls_task_weighting", args.dls_task_weighting),
+        ("NO constrained_primary", not args.constrained_primary),
+        ("NO dls_task_weighting", not args.dls_task_weighting),
         (f"adaptive_damping={args.dls_adaptive_damping}", args.dls_adaptive_damping is not None),
-        ("swivel_parallel_ref", args.swivel_parallel_ref),
+        ("NO swivel_parallel_ref", not args.swivel_parallel_ref),
         (f"swivel_relatch={args.swivel_relatch_err}", args.swivel_relatch_err is not None),
     ) if on]
-    print("[yor] experiment gates: "
-          + (", ".join(gates_on) if gates_on else "all off (pre-gate behaviour)"))
+    print("[yor] overrides: "
+          + (", ".join(gates_on) if gates_on else "none (config defaults)"))
     print(
         f"[yor] posture-fix: stiffen_joint7={args.posture_stiffen_joint7}"
         + (f" (scale={args.posture_joint7_scale:g}x)" if args.posture_stiffen_joint7 else "")

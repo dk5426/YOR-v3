@@ -372,7 +372,14 @@ class WholeBodyIKConfig:
     # own weight rather than riding the hold-still one. gain = 0 disables.
     # x/y only; yaw recentering was deliberately left out -- yaw is already
     # cheap in the primary solve.
-    base_recenter_gain: float = 0.5       # 1/s: m/s of desire per metre offset
+    #
+    # Gain raised 0.5 -> 1.5 on 2026-08-26 from a three-way hardware
+    # comparison of ~2.5 min teleop runs (traj_20260826_182603 /
+    # _183018 / _183916). Against gain 0.5 it cuts peak arm extension
+    # 0.68/0.74 m -> 0.60/0.67 m and the time spent with sigma_min < 0.05
+    # from 8.9% to ~2%, which is where the EE error actually lives: error
+    # above sigma_min 0.1 is ~1.5 mm in every run, below 0.05 it is 12-26 mm.
+    base_recenter_gain: float = 1.5       # 1/s: m/s of desire per metre offset
     base_recenter_max_vel: float = 0.15   # m/s cap on the recentering desire
     base_recenter_weight: float = 100.0   # null-space weight of the desire
 
@@ -430,7 +437,7 @@ class WholeBodyIKConfig:
     # as a comfortable one. The desire is min(gain * error, max_vel) per
     # joint, self-attenuating near home, applied on the first solver
     # iteration only (like base recentering). gain = 0 disables.
-    nullspace_home_gain: float = 0.0       # 1/s: rad/s of desire per rad of error
+    nullspace_home_gain: float = 0.3       # 1/s: rad/s of desire per rad of error
     nullspace_home_max_vel: float = 0.3    # rad/s per-joint cap on the desire
     nullspace_home_weight: float = 1.0     # weight in the secondary stack
 
@@ -443,21 +450,21 @@ class WholeBodyIKConfig:
     # serves the EE task. Falls back to the unconstrained step + clip on
     # any QP failure, so it can never make the solve less robust than the
     # gate-off behaviour. Costs roughly one extra small QP per iteration.
-    constrained_primary: bool = False
+    constrained_primary: bool = True
 
     # [S4a] Apply the FrameTask cost weighting (ee_position_cost /
     # ee_orientation_cost, as row scaling on J and b -- mink's own
     # _weighted_residual convention) inside the dls_projector stack. Off,
     # those two knobs are silently ignored in dls mode and position metres
     # weigh the same as orientation radians.
-    dls_task_weighting: bool = False
+    dls_task_weighting: bool = True
 
     # [S4b] Adaptive damping: when the smallest singular value of the
     # (weighted) task Jacobian falls below this threshold, lambda ramps
     # smoothly from dls_damping up to dls_damping_max at sigma = 0.
     # Keeps tracking crisp in well-conditioned poses and only softens near
     # singularity, instead of paying the flat lambda everywhere. 0 = off.
-    dls_adaptive_damping_sigma: float = 0.0
+    dls_adaptive_damping_sigma: float = 0.05
     dls_damping_max: float = 0.2
 
     # [S5a] Parallel-transported swivel reference: the elbow swivel angle
@@ -470,14 +477,14 @@ class WholeBodyIKConfig:
     # transport), which is continuous everywhere. Slow reference drift over
     # closed axis loops (sphere holonomy) is possible; the re-latch policy
     # below is the backstop.
-    swivel_parallel_ref: bool = False
+    swivel_parallel_ref: bool = True
 
     # [S5b] Swivel re-latch policy: if the swivel error stays above this
     # threshold for swivel_relatch_after_s continuously, accept the branch
     # the arm is actually in (re-latch the target to the measured angle)
     # instead of fighting it across a region it may not be able to cross.
-    # 0 = off (current behaviour: fight forever, recover only by homing).
-    swivel_relatch_err_rad: float = 0.0
+    # 0 = off (fight forever, recover only by homing).
+    swivel_relatch_err_rad: float = 1.57
     swivel_relatch_after_s: float = 1.0
 
     # [S7] Per-solve diagnostics (sigma_min / manipulability per arm, swivel
