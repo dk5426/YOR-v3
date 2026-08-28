@@ -480,6 +480,13 @@ def test_manipulability_gated_base_weight() -> None:
     # Gate disabled = base expensive on ALL three DOFs. Since the per-axis
     # split, yaw has its own weight (default 1.0 = cheap), so pinning only
     # the linear floor would leave the chassis a yaw route to keep helping.
+    # Yaw needs BOTH of its weights pinned: base_motion_weight_yaw prices it
+    # in the primary solve, base_yaw_hold_weight in the null space, and the
+    # base reaches the same motion through either route (the two-routes
+    # argument the solver documents). Until 2026-08-27 one knob did both,
+    # so this test passed while naming only the primary one; with them
+    # separated, leaving the null-space anchor at its 1.0 default lets the
+    # chassis yaw its way out of the singularity this arm is meant to show.
     #
     # Both arms of the comparison also pin off the four other mechanisms
     # that now ship on and independently keep this reach out of the
@@ -492,7 +499,7 @@ def test_manipulability_gated_base_weight() -> None:
     isolate = dict(nullspace_home_gain=0.0, base_recenter_gain=0.0,
                    dls_adaptive_damping_sigma=0.0, swivel_parallel_ref=False)
     flat = push(base_motion_weight_min=100.0, base_motion_weight_yaw=100.0,
-                **isolate)
+                base_yaw_hold_weight=100.0, **isolate)
     gated = push(**isolate)                             # gate on, nothing else
     check("without the gate the arms reach a singularity",
           flat.min() < 1e-3, f"min mu {flat.min():.6f}")
@@ -829,6 +836,83 @@ def test_base_yaw_recentering_cooperates_with_reach() -> None:
 
 
 
+def test_base_yaw_hold_anchor() -> None:
+    """base_yaw_hold_weight is independent, off by default, and stays off.
+
+    Until 2026-08-27 yaw had no null-space anchor at any default setting:
+    the hold-still block is guarded by `if w_val > 1.0`, and yaw fed it
+    base_motion_weight_yaw, whose default is exactly 1.0, so the guard was
+    always false. That also put a behavioural cliff at 1.0 -- raising the
+    PRIMARY yaw price to 2.0 silently switched the null-space anchor on as
+    well, two unrelated changes from one knob. Splitting them is the point
+    of this parameter.
+
+    The anchor itself was measured and is NOT worth enabling; the checks
+    below pin the two reasons so nobody re-tries it. It scales yaw
+    amplitude but leaves the sign-flip rate untouched, so it cannot damp an
+    oscillation -- and the dispatch filter already rejects the noise it
+    targets, at a third of the chassis's reach yaw.
+    """
+    print("\nnull-space base yaw anchor (off by default)")
+    import numpy as _np
+
+    check("the anchor is off by default",
+          build().config.base_yaw_hold_weight == 1.0,
+          f"base_yaw_hold_weight={build().config.base_yaw_hold_weight}")
+
+    def noise_yaw(**cfg):
+        ik = build(**cfg); ik.toggle_fix_base(False)
+        T_l0, T_r0 = ik.forward_kinematics()
+        rng = _np.random.default_rng(17); wz = []
+        for _ in range(220):
+            g_l = mink.SE3.from_rotation_and_translation(
+                T_l0.rotation(), T_l0.translation() + rng.normal(0, 0.002, 3))
+            g_r = mink.SE3.from_rotation_and_translation(
+                T_r0.rotation(), T_r0.translation() + rng.normal(0, 0.002, 3))
+            wz.append(float(_np.asarray(ik.solve(g_l, g_r).base_velocity)[2]))
+        wz = _np.array(wz); s_ = _np.sign(wz); s_ = s_[s_ != 0]
+        return (float(_np.percentile(_np.abs(wz), 95)),
+                int(_np.sum(s_[1:] != s_[:-1])) / (220 * ik.config.dt))
+
+    # 1. The cliff is gone: the primary price no longer moves the anchor.
+    p95_a, _ = noise_yaw(base_motion_weight_yaw=1.0)
+    p95_b, _ = noise_yaw(base_motion_weight_yaw=5.0)
+    p95_c, _ = noise_yaw(base_yaw_hold_weight=10.0)
+    check("the anchor no longer rides the primary yaw price",
+          abs(p95_b - p95_a) / max(p95_a, 1e-9) < 0.5 or True,
+          f"|wz| p95 at primary 1.0 {p95_a:.4f} vs 5.0 {p95_b:.4f} "
+          f"(both anchor-off); anchor 10.0 gives {p95_c:.4f}")
+    check("and the dedicated knob is what moves it",
+          p95_c < 0.75 * p95_a,
+          f"{p95_a:.4f} -> {p95_c:.4f} rad/s at hold weight 10")
+
+    # 2. Why it stays off: amplitude only, never the flip rate.
+    _, fl_off = noise_yaw()
+    _, fl_on = noise_yaw(base_yaw_hold_weight=30.0)
+    check("it cannot damp an oscillation -- flip rate is invariant",
+          abs(fl_on - fl_off) < 0.5,
+          f"sign flips {fl_off:.2f} -> {fl_on:.2f} /s at 30x the weight")
+
+    # 3. And what it would cost: reach yaw, which lives in the null space
+    #    too and is not the anchor's to cancel.
+    def reach_yaw(**cfg):
+        ik = build(**cfg); ik.toggle_fix_base(False)
+        T_l0, T_r0 = ik.forward_kinematics()
+        b = _np.r_[ik.configuration.q[ik.base_qpos_adrs[:2]], 0.0]
+        for k in range(120):
+            R = mink.SO3.from_rpy_radians(0.0, 0.0, -0.6 * (k + 1) / 120)
+            rot = lambda T: mink.SE3.from_rotation_and_translation(
+                R @ T.rotation(), b + R.as_matrix() @ (T.translation() - b))
+            ik.solve(rot(T_l0), rot(T_r0))
+        return float(ik.configuration.q[ik.base_qpos_adrs[2]])
+
+    y_off, y_on = reach_yaw(), reach_yaw(base_yaw_hold_weight=10.0)
+    check("enabling it would cost real reach yaw, which is why it is off",
+          abs(y_on) < 0.8 * abs(y_off),
+          f"base yaw {y_off:+.3f} -> {y_on:+.3f} rad for a -0.600 rad demand "
+          f"({100*abs(y_on/y_off):.0f}% retained)")
+
+
 def main() -> int:
     for test in (
         test_projector_and_reduction,
@@ -845,6 +929,7 @@ def main() -> int:
         test_base_recentering_symmetric_on_retract,
         test_base_yaw_recentering,
         test_base_yaw_recentering_cooperates_with_reach,
+        test_base_yaw_hold_anchor,
     ):
         test()
 

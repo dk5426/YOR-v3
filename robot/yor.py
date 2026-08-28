@@ -1250,6 +1250,20 @@ def main():
              "2026-08-26 -- see WholeBodyIKConfig.base_recenter_gain); "
              "0 0 disables.")
     parser.add_argument(
+        "--base-yaw-hold-weight", type=float, default=None, metavar="W",
+        help="null-space weight of 'prefer not to yaw the chassis', "
+             "independent of --base-motion-weight-yaw (which prices yaw in "
+             "the primary solve). Default 1 = off, and measured not worth "
+             "raising: it scales yaw amplitude but leaves the sign-flip "
+             "rate identical at every weight, so it cannot damp an "
+             "oscillation, and the 0.15 s dispatch filter already cuts "
+             "noise-driven yaw to 1.4% of ticks. Weight 10 buys that last "
+             "1.4 points for a third of the chassis's reach yaw. Exposed "
+             "because before 2026-08-27 the anchor could only be switched "
+             "on by raising the primary price, so --base-motion-weight-yaw "
+             "2.0 silently did two unrelated things; runs at that setting "
+             "had an anchor of 2.0 and need this passed to reproduce.")
+    parser.add_argument(
         "--base-recenter-yaw", type=float, nargs=2, default=None,
         metavar=("GAIN", "MAXVEL"),
         help="null-space base YAW recentering: the rotational twin of "
@@ -1628,6 +1642,8 @@ def main():
            else {"base_motion_weight_min": args.base_motion_weight_min}),
         **({} if args.base_motion_weight_yaw is None
            else {"base_motion_weight_yaw": args.base_motion_weight_yaw}),
+        **({} if args.base_yaw_hold_weight is None
+           else {"base_yaw_hold_weight": args.base_yaw_hold_weight}),
         **({} if args.base_weight_gate is None
            else {"base_weight_gate_on": args.base_weight_gate[0],
                  "base_weight_gate_full": args.base_weight_gate[1]}),

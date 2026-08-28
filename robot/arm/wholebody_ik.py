@@ -339,6 +339,65 @@ class WholeBodyIKConfig:
     # dispatch filter instead of pricing it out here.)
     base_motion_weight_yaw: float = 1.0
 
+    # Null-space weight of "prefer not to yaw the chassis", independent of
+    # the primary price above. Both are needed and they are not the same
+    # lever -- exactly the two-routes argument this file already makes for
+    # the linear axes: the base can reach a given motion through the
+    # primary solve or through the null space, and blocking one route
+    # simply hands the job to the other.
+    #
+    # Until 2026-08-27 yaw had NO null-space anchor at any default setting.
+    # The hold-still block below is guarded by `if w_val > 1.0`, and yaw
+    # fed it base_motion_weight_yaw, which defaults to exactly 1.0 -- so
+    # the guard was always false and the term never built. That also put a
+    # behavioural cliff at 1.0 that the parameter name gives no hint of:
+    # raising base_motion_weight_yaw to 2.0 does not merely make yaw 2x
+    # pricier in the primary, it switches the null-space anchor on for the
+    # first time.
+    #
+    # Why it matters: the manipulability gate is fully open (value p50
+    # 0.95-1.00) through every hardware run measured on 2026-08-27, so
+    # base_motion_weight sits at its min-10 floor rather than 100, and the
+    # chassis is permanently in its cheap regime. Translation is still
+    # anchored there -- by the recentering objective, whose desire goes to
+    # ~zero at the latched offset and which therefore doubles as a
+    # null-space anchor. Yaw recentering used to do the same job for yaw,
+    # until its dead zone (added the same day) made it contribute exactly
+    # nothing inside +/-0.25 rad. Yaw was then cheap in the primary AND
+    # unanchored in the null space, free to chase tracker noise with the
+    # arms compensating -- the suspected mechanism behind the ~4 Hz arm
+    # limit cycle in traj_20260827_204403 (j5/j6 moving 3.8-4.0 rad with
+    # ~0 net displacement and 7.9 sign reversals/s, hands stationary).
+    #
+    # DEFAULT 1.0 = anchor off, and it stays off, because the anchor was
+    # measured and does not pay. Sweep under 2 mm EE noise, against the
+    # reach yaw retained on a -0.6 rad rotation demand:
+    #
+    #   weight   |wz| p95   raw flips/s   post-filter >0.05   reach kept
+    #      1.0     0.2918         20.32               1.4%         100%
+    #      2.0     0.2695         20.32               0.5%          95%
+    #      5.0     0.2192         20.32               0.5%          76%
+    #     10.0     0.1672         20.32               0.0%          66%
+    #     30.0     0.0864         20.32               0.0%          58%
+    #
+    # Two things kill it. The flip rate is INVARIANT -- identical to two
+    # decimals at every weight, before and after the dispatch filter -- so
+    # the anchor scales yaw amplitude and cannot change how often the
+    # request reverses. It therefore cannot damp an oscillation, which was
+    # the whole reason it was built (the ~4 Hz arm limit cycle above). And
+    # base_vel_filter_tau/base_yaw_filter_tau at 0.15 s already reject the
+    # noise on their own: unanchored, only 1.4% of filtered ticks clear the
+    # old 0.05 entry threshold. Weight 10 buys that last 1.4 points for a
+    # third of the chassis's reach yaw.
+    #
+    # Kept as a knob, and kept independent, for the cliff alone: before
+    # this the anchor could only be switched on by raising the PRIMARY
+    # price, so --base-motion-weight-yaw 2.0 silently did two unrelated
+    # things at once. Runs from 2026-08-27 at that setting had an anchor of
+    # 2.0; to reproduce them now, pass base_yaw_hold_weight=2.0 as well.
+    # The block subtracts 1.0, matching the linear axes.
+    base_yaw_hold_weight: float = 1.0
+
     # Null-space base recentering: continuously prefer rolling the chassis
     # toward the pose that restores the hands' latched home-pose offset from
     # the base, at gain * distance, capped at max_vel, instead of preferring
@@ -1385,9 +1444,16 @@ class WholeBodyIK:
         # the cost the primary term just relaxed -- the two-routes problem
         # above, applied to the fix for it.
         #
+        # Yaw takes base_yaw_hold_weight, NOT the primary's
+        # base_motion_weight_yaw: the two roles are independent, and tying
+        # them together left yaw unanchored at every default setting. See
+        # base_yaw_hold_weight.
+        #
         if not self.fix_base:
-            for dof_ids, w_val in ((self.base_dof_ids[:2], base_weight),
-                                   (self.base_dof_ids[2:3], yaw_weight)):
+            for dof_ids, w_val in (
+                    (self.base_dof_ids[:2], base_weight),
+                    (self.base_dof_ids[2:3],
+                     float(self.config.base_yaw_hold_weight))):
                 if w_val > 1.0:
                     slots = np.flatnonzero(np.isin(free_ids, dof_ids))
                     if slots.size:

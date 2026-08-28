@@ -1494,6 +1494,7 @@ class _TrajectoryRecorder:
             f"base_motion_weight={ik_config.base_motion_weight}",
             f"base_motion_weight_min={ik_config.base_motion_weight_min}",
             f"base_motion_weight_yaw={ik_config.base_motion_weight_yaw}",
+            f"base_yaw_hold_weight={ik_config.base_yaw_hold_weight}",
             f"base_weight_gate_on={ik_config.base_weight_gate_on}",
             f"base_weight_gate_full={ik_config.base_weight_gate_full}",
             f"base_recenter_gain={ik_config.base_recenter_gain}",
