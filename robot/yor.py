@@ -1250,6 +1250,28 @@ def main():
              "2026-08-26 -- see WholeBodyIKConfig.base_recenter_gain); "
              "0 0 disables.")
     parser.add_argument(
+        "--base-recenter-yaw", type=float, nargs=2, default=None,
+        metavar=("GAIN", "MAXVEL"),
+        help="null-space base YAW recentering: the rotational twin of "
+             "--base-recenter. Continuously turns the chassis so it carries "
+             "the heading the shoulders are holding, at GAIN * the mean "
+             "shoulder-yaw drift from home rad/s, capped at MAXVEL rad/s, "
+             "with the arms counter-rotating so the hands stay put. "
+             "Symmetric and ungated, like the translation term, and driven "
+             "by the shoulder load rather than the hands' bearing so it "
+             "cannot cancel the yaw the primary solve spends on reach -- "
+             "see WholeBodyIKConfig.base_recenter_yaw_gain. "
+             "Default 1.0 0.30; 0 0 disables.")
+    parser.add_argument(
+        "--base-recenter-yaw-deadzone", type=float, default=None, metavar="RAD",
+        help="shoulder-yaw drift ignored by --base-recenter-yaw, radians "
+             "(default 0.25). Working off to one side is a comfortable "
+             "posture, not a fault: without this the chassis tracked the "
+             "operator's arms like a turret (2026-08-27, 3.45 rad of net "
+             "wander in one 106 s run). Ordinary working load measured p95 "
+             "0.15-0.25 rad, genuine wind-up 0.5-0.66. 0 disables the dead "
+             "zone.")
+    parser.add_argument(
         "--base-yaw-filter-tau", type=float, default=None, metavar="TAU",
         help="one-pole low-pass time constant on the base yaw request, s "
              "(default 0.15; the only yaw smoothing since the yaw deadband "
@@ -1612,6 +1634,11 @@ def main():
         **({} if args.base_recenter is None
            else {"base_recenter_gain": args.base_recenter[0],
                  "base_recenter_max_vel": args.base_recenter[1]}),
+        **({} if args.base_recenter_yaw is None
+           else {"base_recenter_yaw_gain": args.base_recenter_yaw[0],
+                 "base_recenter_yaw_max_vel": args.base_recenter_yaw[1]}),
+        **({} if args.base_recenter_yaw_deadzone is None
+           else {"base_recenter_yaw_deadzone": args.base_recenter_yaw_deadzone}),
         nullspace_swivel_weight=args.nullspace_swivel_weight,
         elbow_swivel_gain=args.elbow_swivel_gain,
         elbow_swivel_targets=(

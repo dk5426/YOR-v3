@@ -370,8 +370,11 @@ class WholeBodyIKConfig:
     # base term and the posture term's penalty on the arms' counter-motion,
     # so it lands at a fraction of the desire, which is why this has its
     # own weight rather than riding the hold-still one. gain = 0 disables.
-    # x/y only; yaw recentering was deliberately left out -- yaw is already
-    # cheap in the primary solve.
+    # x/y and yaw are separate objectives with separate gains: the
+    # translation one below, and base_recenter_yaw_gain. Yaw was originally
+    # left out on the reasoning that it is already cheap in the primary
+    # solve -- but "cheap when asked" is not the same as "asked at all",
+    # which is the whole point of a recentering term.
     #
     # Gain raised 0.5 -> 1.5 on 2026-08-26 from a three-way hardware
     # comparison of ~2.5 min teleop runs (traj_20260826_182603 /
@@ -382,6 +385,111 @@ class WholeBodyIKConfig:
     base_recenter_gain: float = 1.5       # 1/s: m/s of desire per metre offset
     base_recenter_max_vel: float = 0.15   # m/s cap on the recentering desire
     base_recenter_weight: float = 100.0   # null-space weight of the desire
+
+    # Null-space base YAW recentering: the rotational twin of the three
+    # parameters above. Where those keep the chassis standing under the
+    # hands, this keeps it FACING the way the arms are working, so the
+    # shoulders do not sit holding a heading the chassis could hold for
+    # free.
+    #
+    # The error is deliberately NOT the hands' bearing from the chassis,
+    # which is the obvious construction and is wrong. Measured on the
+    # asymmetric reach in test_manipulability_gated_base_weight (left hand
+    # dragged 0.60 m sideways, right hand held), a bearing term *fights the
+    # primary solve*: the chassis translates to follow the hand midpoint,
+    # which restores the midpoint's bearing on its own, so the extra yaw the
+    # primary spends buying reach for the stretched arm reads as bearing
+    # error and the null-space term cancels it. The chassis then stayed
+    # square while the left arm stretched into a singularity -- worst-case
+    # manipulability over that reach 3.0e-2 -> 1.3e-5. That conflict is
+    # exactly why yaw was left out of recentering originally: yaw is the
+    # cheap DOF in the primary solve (base_motion_weight_yaw 1.0 vs 100 for
+    # x/y), so a null-space preference against it is a veto, not a bias.
+    #
+    # The error used instead is the SHOULDER YAW LOAD: how far the two
+    # shoulder-yaw joints have drifted from the values latched with the
+    # offset above, averaged over the arms. Measured on this model, base
+    # yaw and both joint1s trade one-for-one and in the same sense (base
+    # yaw +0.15 rad moves left/right joint1 by -0.162 / -0.173 rad with the
+    # hands held fixed), so "the chassis turns, the shoulders unwind" is a
+    # single well-conditioned exchange, and the desire is simply
+    # gain * mean(q1 - q1_latched).
+    #
+    # Being built on that exchange makes the term cooperative with the
+    # primary rather than opposed to it: yaw the primary spends buying
+    # reach unwinds the shoulders, which shrinks this desire instead of
+    # provoking it. Everything the translation half documents still holds --
+    # null-space only (the arms counter-rotate, EE tracking untouched by
+    # construction), ungated (manipulability answers "is the arm
+    # stretched", not "are the shoulders wound up"), symmetric in both
+    # directions, self-attenuating in the error, and applied on the first
+    # solver iteration only so the per-tick desire is
+    # min(gain * |err|, max_vel) * dt and not that times max_iters.
+    #
+    # The cap is 0.30 rad/s, inside the 0.2-0.45 rad/s band the 2026-08-24
+    # runs measured for real commanded rotation, so recentering can never be
+    # the fastest yaw on the robot. gain = 0 disables.
+    #
+    # DEAD ZONE, added 2026-08-27 after the first hardware runs (traj
+    # 20260827_1735..1750). The mechanism measured correct there -- the
+    # sign is right (corr(shoulder load, commanded yaw) +0.32..+0.84 across
+    # the runs, versus ~0 before) and it does its job (shoulders ended at
+    # 0.02-0.08 rad, where the 16:19 run before the change left them stuck
+    # at 0.659) -- but with no dead zone it acted on ANY drift, and working
+    # naturally off to one side is a comfortable posture, not a fault. The
+    # chassis ended up tracking the operator's arms like a turret: yaw rate
+    # while the hands moved rose from 0.05-0.11 to 0.148 rad/s and one
+    # 106 s run wandered 3.45 rad (~198 deg) net, against <= 0.86 rad for
+    # every run before it. Since the chassis heading is the frame
+    # everything else is referenced against, that reads as the robot
+    # turning away underneath you.
+    #
+    # 0.25 rad splits the two populations those runs measured cleanly:
+    # ordinary working load sits at p95 0.15-0.25 rad, genuine wind-up at
+    # 0.5-0.66. Subtracted rather than compared, so the desire enters
+    # continuously at the edge instead of stepping. 0 = no dead zone.
+    #
+    # Verified on traj_20260827_193853 (238 s of teleop, dead zone 0.25).
+    # The defect the first runs showed was a PHASE one: commanded yaw
+    # tracked the shoulder load tightly but lagged the operator's hand
+    # motion by 1.0-2.1 s, which on a few-seconds gesture is past
+    # anti-phase, so the chassis turned a beat late and therefore against
+    # the hands. The dead zone removed the small-signal response that
+    # carried that lag. Measured, against the same runs without it:
+    #
+    #   lag, hand motion -> commanded yaw   1.0-2.1 s  ->  0.07 s
+    #   corr(shoulder load, commanded yaw)  0.32-0.84  ->  0.18
+    #   net yaw wander                      3.45 rad   ->  0.44 rad
+    #                                       (over 106 s)   (over 238 s)
+    #   |wz| while the hands move           <= 0.148   ->  0.074 rad/s
+    #   shoulder load at end of run         0.02-0.51  ->  0.081 rad
+    #
+    # and the term is not thereby dormant: it is past the dead zone 11.2%
+    # of that run, commanding 0.069 rad/s when engaged against 0.010 when
+    # not, with the load never exceeding 0.496 rad.
+    #
+    # A metric NOT to be misled by, having been: "fraction of active-yaw
+    # ticks whose sign opposes the hand-bearing rate" reads 55% here and
+    # looks damning until you take the baseline -- runs with no yaw
+    # recentering at all sit at 48-70%, median ~60%. Chassis yaw has never
+    # followed hand bearing, by design (see above: a bearing-follower is
+    # the construction this term deliberately avoids), so that number does
+    # not isolate this term at all.
+    #
+    # Note the term is NOT gated on the hands holding still, even though
+    # the logs show it acts mostly while they move. That was the other
+    # candidate fix considered for the phase problem, and the dead zone
+    # made it unnecessary: shoulder wind-up is worst exactly while the
+    # operator is working, and a pause-only term would arrive after the
+    # posture had already degraded -- the same mistake as gating
+    # recentering on manipulability, one axis over. If the phase problem
+    # ever returns at loads past the dead zone, that gate is the next
+    # thing to try, since a corrector that cannot keep up with what it is
+    # correcting is better off trimming in the gaps.
+    base_recenter_yaw_gain: float = 1.0      # 1/s: rad/s per rad of shoulder load
+    base_recenter_yaw_max_vel: float = 0.30  # rad/s cap on the desire
+    base_recenter_yaw_deadzone: float = 0.25  # rad of shoulder load ignored
+    base_recenter_yaw_weight: float = 100.0  # null-space weight of the desire
 
     nullspace_regularization: float = 1e-8
 
@@ -719,8 +827,14 @@ class WholeBodyIK:
         # [S1] Home-keyframe arm posture (14 values, left 1-7 then right
         # 1-7), latched by init_from_keyframe/init_from_qpos.
         self._home_arm_q: Optional[np.ndarray] = None
+        self._recenter_offset_body: Optional[np.ndarray] = None
+        self._shoulder_yaw_home: Optional[np.ndarray] = None
         self._arm_qpos_adrs_all = np.concatenate(
             [self._left_arm_qpos_adrs, self._right_arm_qpos_adrs])
+        # The two shoulder-yaw joints, whose drift from the latched values
+        # is the error base_recenter_yaw_gain hands back to the chassis.
+        self._shoulder_yaw_qadrs = np.array(
+            [self._left_arm_qpos_adrs[0], self._right_arm_qpos_adrs[0]])
         self._arm_dof_ids_arr = np.asarray(self.arm_dof_ids)
         # [S7] Published per-solve diagnostics; {} when disabled or before
         # the first solve. `_last_swivel` is written by the swivel objective
@@ -782,6 +896,11 @@ class WholeBodyIK:
         -- at a comfortable posture the hands sit well in front of the
         chassis. It drives the base to wherever restores this offset,
         expressed in the base frame so it rotates with the chassis.
+
+        The shoulder-yaw values the yaw half of recentering restores
+        (base_recenter_yaw_gain) are latched here too, so both halves of
+        "where do the hands belong relative to the chassis" come from the
+        same measurement and can never disagree about what home means.
         """
         T_l, T_r = self.forward_kinematics()
         mid_xy = 0.5 * (T_l.translation()[:2] + T_r.translation()[:2])
@@ -791,6 +910,8 @@ class WholeBodyIK:
         world = mid_xy - base_xy
         self._recenter_offset_body = np.array(
             [c * world[0] + s * world[1], -s * world[0] + c * world[1]])
+        self._shoulder_yaw_home = self.configuration.q[
+            self._shoulder_yaw_qadrs].copy()
 
     def update_configuration(self, qpos: np.ndarray) -> None:
         """Sync IK with current robot state (call each control cycle)."""
@@ -1298,40 +1419,79 @@ class WholeBodyIK:
         # arms' counter-motion, which is the dominant attenuation.
         # First iteration only, like every velocity-shaped term, so the
         # per-tick desire is not multiplied by the iteration count.
+        hand_xy = [
+            task.transform_target_to_world.translation()[:2]
+            for task in (self.left_ee_task, self.right_ee_task)
+            if task.transform_target_to_world is not None
+        ]
         gain = float(self.config.base_recenter_gain)
-        if gain > 0.0 and self._first_iteration and not self.fix_base:
-            hand_xy = [
-                task.transform_target_to_world.translation()[:2]
-                for task in (self.left_ee_task, self.right_ee_task)
-                if task.transform_target_to_world is not None
-            ]
-            if hand_xy:
-                base_xy = self.configuration.q[self.base_qpos_adrs[:2]]
-                # Where the base would sit if the hands kept their
-                # home-pose offset from the chassis (offset latched at
-                # init, rotated by the current yaw) -- NOT under the
-                # hands, which would pull forward even at rest.
-                yaw = float(self.configuration.q[self.base_qpos_adrs[2]])
-                c, s = np.cos(yaw), np.sin(yaw)
-                off = self._recenter_offset_body
-                off_world = np.array([c * off[0] - s * off[1],
-                                      s * off[0] + c * off[1]])
-                goal_xy = np.mean(hand_xy, axis=0) - off_world
-                v = gain * (goal_xy - base_xy)
-                speed = float(np.linalg.norm(v))
-                cap = float(self.config.base_recenter_max_vel)
-                if 0.0 < cap < speed:
-                    v *= cap / speed
-                dq_recenter = v * self.config.dt
-                slots = np.flatnonzero(
-                    np.isin(free_ids, self.base_dof_ids[:2]))
-                if slots.size and dq_recenter.any():
-                    w = float(np.sqrt(self.config.base_recenter_weight))
-                    order = np.searchsorted(
-                        np.asarray(self.base_dof_ids[:2]), free_ids[slots])
+        if (gain > 0.0 and hand_xy and self._first_iteration
+                and not self.fix_base
+                and self._recenter_offset_body is not None):
+            base_xy = self.configuration.q[self.base_qpos_adrs[:2]]
+            # Where the base would sit if the hands kept their
+            # home-pose offset from the chassis (offset latched at
+            # init, rotated by the current yaw) -- NOT under the
+            # hands, which would pull forward even at rest.
+            yaw = float(self.configuration.q[self.base_qpos_adrs[2]])
+            c, s = np.cos(yaw), np.sin(yaw)
+            off = self._recenter_offset_body
+            off_world = np.array([c * off[0] - s * off[1],
+                                  s * off[0] + c * off[1]])
+            goal_xy = np.mean(hand_xy, axis=0) - off_world
+            v = gain * (goal_xy - base_xy)
+            speed = float(np.linalg.norm(v))
+            cap = float(self.config.base_recenter_max_vel)
+            if 0.0 < cap < speed:
+                v *= cap / speed
+            dq_recenter = v * self.config.dt
+            slots = np.flatnonzero(
+                np.isin(free_ids, self.base_dof_ids[:2]))
+            if slots.size and dq_recenter.any():
+                w = float(np.sqrt(self.config.base_recenter_weight))
+                order = np.searchsorted(
+                    np.asarray(self.base_dof_ids[:2]), free_ids[slots])
+                blocks_A.append(w * N[slots, :])
+                blocks_r.append(
+                    w * (dq_recenter[order] - dq_primary[slots]))
+
+        # ── Base recentering, yaw ────────────────────────────────────────────
+        # The rotational twin of the block above: among all solutions that
+        # serve the end effectors equally, prefer the one that hands the
+        # shoulders' accumulated yaw back to the chassis. See
+        # base_recenter_yaw_gain for why the error is the shoulder-yaw load
+        # and not the hands' bearing -- the bearing version cancels the yaw
+        # the primary solve spends on reach, because yaw is the cheap DOF
+        # there and a null-space preference against a cheap DOF is a veto.
+        #
+        # Sign: base yaw and both shoulder-yaw joints trade one-for-one in
+        # the same sense with the hands held fixed, so turning the chassis
+        # by +d unwinds a +d load. The gain absorbs the ~1.1 rad/rad of
+        # that exchange; it is not a separate calibration.
+        ygain = float(self.config.base_recenter_yaw_gain)
+        if (ygain > 0.0 and self._first_iteration and not self.fix_base
+                and self._shoulder_yaw_home is not None):
+            slots = np.flatnonzero(np.isin(free_ids, self.base_dof_ids[2:3]))
+            if slots.size:
+                load = float(np.mean(
+                    self.configuration.q[self._shoulder_yaw_qadrs]
+                    - self._shoulder_yaw_home))
+                # Dead zone: an ordinary working posture is not a fault, so
+                # ignore drift below it. Subtracted, not compared, so the
+                # desire enters continuously at the edge rather than
+                # stepping to gain * deadzone. See the config field.
+                dz = float(self.config.base_recenter_yaw_deadzone)
+                if dz > 0.0:
+                    load = float(np.sign(load) * max(abs(load) - dz, 0.0))
+                wz = ygain * load
+                ycap = float(self.config.base_recenter_yaw_max_vel)
+                if ycap > 0.0:
+                    wz = float(np.clip(wz, -ycap, ycap))
+                dq_yaw = wz * self.config.dt
+                if dq_yaw != 0.0:
+                    w = float(np.sqrt(self.config.base_recenter_yaw_weight))
                     blocks_A.append(w * N[slots, :])
-                    blocks_r.append(
-                        w * (dq_recenter[order] - dq_primary[slots]))
+                    blocks_r.append(w * (dq_yaw - dq_primary[slots]))
 
         # ── [S1] Arm home attractor, always on when gated in ─────────────────
         # The recovery force refresh_posture_target=True removed: among all

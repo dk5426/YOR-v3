@@ -1498,6 +1498,10 @@ class _TrajectoryRecorder:
             f"base_weight_gate_full={ik_config.base_weight_gate_full}",
             f"base_recenter_gain={ik_config.base_recenter_gain}",
             f"base_recenter_max_vel={ik_config.base_recenter_max_vel}",
+            f"base_recenter_yaw_gain={ik_config.base_recenter_yaw_gain}",
+            f"base_recenter_yaw_max_vel={ik_config.base_recenter_yaw_max_vel}",
+            f"base_recenter_yaw_deadzone={ik_config.base_recenter_yaw_deadzone}",
+            f"base_recenter_yaw_weight={ik_config.base_recenter_yaw_weight}",
             # Gated experiments -- a run is uninterpretable without these.
             f"nullspace_home_gain={getattr(ik_config, 'nullspace_home_gain', 0.0)}",
             f"nullspace_home_weight={getattr(ik_config, 'nullspace_home_weight', 1.0)}",

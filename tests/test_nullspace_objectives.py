@@ -681,6 +681,154 @@ def test_base_recentering_symmetric_on_retract() -> None:
           f"rolled out {out_dist*1000:.0f} mm, stranded {residual*1000:.0f} mm")
 
 
+def test_base_yaw_recentering() -> None:
+    """A heading the shoulders are holding must be handed to the chassis.
+
+    The rotational twin of test_base_recentering, and it exists for the same
+    reason: this is a velocity IK, so a wound-up shoulder only unwinds while
+    the operator's hands are moving. Rotate both hand targets rigidly about
+    the base's yaw axis -- a pose the chassis could serve at zero shoulder
+    cost simply by turning -- then FREEZE them. With the term on the chassis
+    must keep turning until the shoulders are back at their latched values;
+    with it off it must sit there holding the twist in the arms. The hands
+    must not move either way.
+
+    Runs with a small dead zone so the mechanism itself is what is under
+    test; the shipped 0.25 rad dead zone is checked separately below, and
+    it is deliberately wide enough to swallow this rotation.
+    """
+    print("\nnull-space base yaw recentering")
+    import numpy as _np
+
+    def rotate_about_base(ik, T, phi):
+        """T rigidly rotated by phi about the base's vertical axis."""
+        b = _np.r_[ik.configuration.q[ik.base_qpos_adrs[:2]], 0.0]
+        R = mink.SO3.from_rpy_radians(0.0, 0.0, phi)
+        return mink.SE3.from_rotation_and_translation(
+            R @ T.rotation(), b + R.as_matrix() @ (T.translation() - b))
+
+    def load_of(ik):
+        return float(_np.mean(
+            ik.configuration.q[ik._shoulder_yaw_qadrs] - ik._shoulder_yaw_home))
+
+    def run(phi=-0.5, steps=90, **cfg):
+        # Translation and its recentering pinned off: this test is about the
+        # yaw DOF alone (the mirror image of the yaw pin in
+        # test_base_recentering, which pins yaw to measure translation).
+        cfg.setdefault("base_motion_weight", 1000.0)
+        cfg.setdefault("base_motion_weight_min", 1000.0)
+        cfg.setdefault("base_recenter_gain", 0.0)
+        cfg.setdefault("base_recenter_yaw_deadzone", 0.05)
+        ik = build(**cfg)
+        ik.toggle_fix_base(False)
+        T_l0, T_r0 = ik.forward_kinematics()
+        g_l = rotate_about_base(ik, T_l0, phi)
+        g_r = rotate_about_base(ik, T_r0, phi)
+        for k in range(30):                       # ramp on, arms take it up
+            f = (k + 1) / 30
+            ik.solve(rotate_about_base(ik, T_l0, f * phi),
+                     rotate_about_base(ik, T_r0, f * phi))
+        load0 = load_of(ik)
+        held_w, held_err = [], []
+        for _ in range(steps):                    # targets frozen
+            res = ik.solve(g_l, g_r)
+            held_w.append(abs(float(_np.asarray(res.base_velocity)[2])))
+            T_now, _ = ik.forward_kinematics()
+            held_err.append(float(_np.linalg.norm(
+                T_now.translation() - g_l.translation())))
+        return (_np.array(held_w), _np.array(held_err), load0, load_of(ik),
+                float(ik.configuration.q[ik.base_qpos_adrs[2]]))
+
+    w_on, err_on, load0_on, load1_on, yaw_on = run()
+    w_off, _, load0_off, load1_off, yaw_off = run(base_recenter_yaw_gain=0.0)
+
+    check("the ramp really does wind the shoulders up",
+          abs(load0_off) > 0.15, f"load {load0_off:+.3f} rad")
+    check("with stationary targets, yaw recentering keeps the base turning",
+          _np.median(w_on) > 5 * max(_np.median(w_off), 1e-6),
+          f"median |wz| on {_np.median(w_on):.4f} vs "
+          f"off {_np.median(w_off):.4f} rad/s")
+    check("and it turns the way that unloads the shoulders",
+          abs(load1_on) < 0.35 * abs(load0_on),
+          f"shoulder load {load0_on:+.3f} -> {load1_on:+.3f} rad "
+          f"(off: {load0_off:+.3f} -> {load1_off:+.3f})")
+    check("the chassis ends up carrying the heading the arms were holding",
+          abs(yaw_on - (-0.5)) < 0.15, f"base yaw {yaw_on:+.3f} rad "
+          f"for a -0.500 rad target rotation (off: {yaw_off:+.3f})")
+    check("the desire respects its speed cap (+small numerical slack)",
+          w_on.max() <= build().config.base_recenter_yaw_max_vel * 1.2,
+          f"max {w_on.max():.3f} rad/s")
+    check("EE tracking is untouched while the base yaws",
+          _np.median(err_on) < 2e-3,
+          f"median err {_np.median(err_on)*1000:.2f} mm")
+
+    # The shipped dead zone. This same rotation leaves ~0.16 rad of
+    # shoulder load, which is an ordinary working posture (hardware p95
+    # 0.15-0.25 rad on 2026-08-27) and must cost the chassis nothing --
+    # without it the base tracked the operator's arms like a turret.
+    w_dz, _, _, load1_dz, yaw_dz = run(
+        base_recenter_yaw_deadzone=build().config.base_recenter_yaw_deadzone)
+    check("an ordinary working posture sits inside the dead zone",
+          abs(load1_dz) < build().config.base_recenter_yaw_deadzone,
+          f"load {load1_dz:+.3f} rad vs dead zone "
+          f"{build().config.base_recenter_yaw_deadzone:.2f}")
+    check("and so costs the chassis no yaw",
+          _np.median(w_dz) < 0.25 * _np.median(w_on) + 1e-3,
+          f"median |wz| {_np.median(w_on):.4f} -> {_np.median(w_dz):.4f} rad/s "
+          f"(base yaw {yaw_on:+.3f} -> {yaw_dz:+.3f} rad)")
+
+
+def test_base_yaw_recentering_cooperates_with_reach() -> None:
+    """It must never cancel the yaw the primary solve spends on reach.
+
+    Regression for the construction this term was NOT built on. The obvious
+    reading of "yaw recentering" is the rotational copy of the translation
+    half: restore the hands' bearing from the chassis. It is wrong, and
+    measurably so. On an asymmetric reach the chassis translates to follow
+    the hand midpoint, which restores the midpoint's bearing by itself, so
+    the extra yaw the primary spends buying reach for the stretched arm
+    reads as pure bearing error -- and because yaw is the CHEAP DOF in the
+    primary solve, a null-space preference against it is a veto rather than
+    a bias. The bearing version held the chassis square while the left arm
+    stretched into a singularity (worst-case mu over the reach 3.0e-2 ->
+    1.3e-5, i.e. worse than no gate at all).
+
+    The shipped term is built on the shoulder-yaw load instead, which the
+    primary's reach yaw *unwinds*, so the two cooperate by construction.
+    This drives the same reach as test_manipulability_gated_base_weight and
+    demands the term cost nothing there.
+    """
+    print("\nbase yaw recentering cooperates with reach yaw")
+    import numpy as _np
+
+    def mu_of(ik):
+        d = ik.configuration.data
+        return min(float(_np.exp(ik._log_manipulability(ik._arm_jacobian(s_, d))))
+                   for s_ in ("left", "right"))
+
+    def push(**cfg):
+        ik = build(**cfg); ik.toggle_fix_base(False)
+        T_l0, T_r0 = ik.forward_kinematics()
+        mus = []
+        for k in range(90):
+            g = mink.SE3.from_rotation_and_translation(
+                T_l0.rotation(),
+                T_l0.translation() + _np.array([0.0, -0.60 * (k + 1) / 90, 0.0]))
+            ik.solve(g, T_r0)
+            mus.append(mu_of(ik))
+        return _np.array(mus)
+
+    on = push()
+    off = push(base_recenter_yaw_gain=0.0)
+    check("the reach keeps its posture with the term on",
+          on.min() > 0.5 * off.min() and on.min() > 5e-3,
+          f"min mu off {off.min():.5f} -> on {on.min():.5f}")
+    check("and is no worse throughout, not just at the worst moment",
+          _np.median(on) > 0.75 * _np.median(off),
+          f"median mu off {_np.median(off):.5f} -> on {_np.median(on):.5f}")
+
+
+
 def main() -> int:
     for test in (
         test_projector_and_reduction,
@@ -695,6 +843,8 @@ def main() -> int:
         test_manipulability_gated_base_weight,
         test_base_recentering,
         test_base_recentering_symmetric_on_retract,
+        test_base_yaw_recentering,
+        test_base_yaw_recentering_cooperates_with_reach,
     ):
         test()
 
