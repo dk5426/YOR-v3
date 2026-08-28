@@ -16,7 +16,7 @@ This runs a straight line on the floor and answers both halves in one go:
      view of the motor.
   2. **Does a commanded m/s equal a real m/s?**  The distance the chassis
      actually covered against the distance the command implies. This is the
-     one that matters, because `BaseOdometry` integrates the *commanded*
+     one that matters, because `FakeBaseOdometry` integrates the *commanded*
      velocity -- if the two differ, the IK plans against a chassis pose that
      is wrong by exactly that ratio.
 
@@ -324,7 +324,7 @@ def main(argv=None) -> int:
 
     print(f"\n[drive-scale] over the driving phase the command implies "
           f"{cmd_distance:.3f} m of travel")
-    print(f"[drive-scale]   (this is exactly what BaseOdometry integrates)")
+    print(f"[drive-scale]   (this is exactly what FakeBaseOdometry integrates)")
     print(f"[drive-scale] the wheels report {meas_distance:.3f} m")
     actual = _ask_float("\n[drive-scale] tape-measure the distance travelled, in metres "
                         "(blank to skip): ")
@@ -340,7 +340,7 @@ def main(argv=None) -> int:
               "the scale is right for these gains.")
     else:
         over = "over" if truth < 1.0 else "under"
-        print(f"[drive-scale]   -> commanded m/s is NOT true m/s. BaseOdometry {over}-reports "
+        print(f"[drive-scale]   -> commanded m/s is NOT true m/s. FakeBaseOdometry {over}-reports "
               f"distance by {abs(1.0 / truth - 1.0) * 100:.0f}%.")
         # actual = k * commanded * scale, so truth = k * scale and the scale
         # that makes commanded m/s true is 1/k = scale / truth. Dividing, not

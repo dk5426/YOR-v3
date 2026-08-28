@@ -21,7 +21,7 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 from robot.wholebody_control import (  # noqa: E402
-    BaseAxisMap, BaseOdometry, SlamBaseFrame, SlamPoseListener,
+    BaseAxisMap, FakeBaseOdometry, SlamBaseFrame, SlamPoseListener,
     WholeBodyController, WholeBodyHardwareConfig, _wrap_pi,
 )
 
@@ -132,7 +132,7 @@ def test_init():
     T_l, T_r = wbc.forward_kinematics()
     check("targets seeded from FK", wbc.left_ee_target is not None)
     check("home poses latched", wbc._home_left is not None and wbc._home_right is not None)
-    check("odometry starts at origin", np.allclose(wbc.odometry.pose, 0))
+    check("odometry starts at origin", np.allclose(wbc.fake_odom.pose, 0))
     check("lift range from description", wbc.ik.lift_range == (0.0, 0.900),
           str(wbc.ik.lift_range))
     check("model sees measured lift", abs(
@@ -300,8 +300,8 @@ def test_base_motion():
           f"{peak[:2].round(3)} vs {wbc.config.base_max_lin_vel}")
     check("angular command within clamp", peak[2] <= wbc.config.base_max_ang_vel + 1e-9,
           f"{peak[2]:.3f} vs {wbc.config.base_max_ang_vel}")
-    check("odometry advanced", np.linalg.norm(wbc.odometry.pose[:2]) > 1e-3,
-          f"pose {wbc.odometry.pose.round(3)}")
+    check("odometry advanced", np.linalg.norm(wbc.fake_odom.pose[:2]) > 1e-3,
+          f"pose {wbc.fake_odom.pose.round(3)}")
 
 
 def test_yaw_filter_and_hysteresis():
@@ -392,7 +392,7 @@ def test_base_pose_dispatch():
         base_position = np.array([0.0, -0.5, 0.4])
         base_velocity = np.zeros(3)
 
-    wbc.odometry.reset(np.zeros(3))
+    wbc.fake_odom.reset(np.zeros(3))
     wbc.base_pose.reset()
     base.velocity_commands.clear()
     wbc._dispatch_base(_R())
@@ -407,7 +407,7 @@ def test_base_pose_dispatch():
     # The pose controller must resolve the error in the same frame the rest of
     # this file uses; a disagreement would drive the base sideways.
     for yaw in (0.0, 0.6, -2.4):
-        wbc.odometry.reset(np.array([0.0, 0.0, yaw]))
+        wbc.fake_odom.reset(np.array([0.0, 0.0, yaw]))
         world = np.array([0.3, -0.2])
         fwd, lat, _ = wbc._world_to_body(np.array([world[0], world[1], 0.0]))
         err = wbc.base_pose._to_body(world[0], world[1], yaw)
@@ -417,12 +417,12 @@ def test_base_pose_dispatch():
 
     # Closed loop: odometry integrates what was commanded, so repeated
     # dispatch against a standing target has to converge onto it.
-    wbc.odometry.reset(np.zeros(3))
+    wbc.fake_odom.reset(np.zeros(3))
     wbc.base_pose.reset()
     base.velocity_commands.clear()
     for _ in range(400):
         wbc._dispatch_base(_R())
-    pose = wbc.odometry.pose
+    pose = wbc.fake_odom.pose
     lin_err = float(np.hypot(*(_R.base_position[:2] - pose[:2])))
     yaw_err = abs(float(pose[2] - _R.base_position[2]))
     check("the base converges onto the pose the solver asked for",
@@ -442,7 +442,7 @@ def test_base_pose_dispatch():
         ("a manual override", wbc.notify_manual_base_command,
          lambda: setattr(wbc, "_manual_base_until", 0.0)),
     ):
-        wbc.odometry.reset(np.zeros(3))
+        wbc.fake_odom.reset(np.zeros(3))
         wbc._dispatch_base(_R())          # give the PD some history
         take_authority()
         wbc._dispatch_base(_R())
@@ -598,7 +598,7 @@ def test_axis_map_and_odometry():
     rt = wbc._body_to_world(*wbc._world_to_body(np.array([0.3, -0.2, 0.1])))
     check("body/world round-trip is exact", np.allclose(rt, [0.3, -0.2, 0.1]), str(rt.round(4)))
 
-    odo = BaseOdometry()
+    odo = FakeBaseOdometry()
     odo.update(np.array([1.0, 0.0, 0.0]), 0.5)
     check("odometry integrates", np.allclose(odo.pose, [0.5, 0.0, 0.0]), str(odo.pose))
 
@@ -677,18 +677,18 @@ def test_slam_base_pose_feedback():
 
     # ── the rate limit ──────────────────────────────────────────────────────
     dt = 1.0 / 30.0
-    odo = BaseOdometry()
+    odo = FakeBaseOdometry()
     odo.apply_correction(np.array([1.0, 0.0, 0.0]), dt, 1.0, 2.0)
     check("a loop-closure jump is bled in, not handed to the PD as a step",
           abs(odo.pose[0] - 1.0 * dt) < 1e-12, f"moved {odo.pose[0]:.4f} m in one tick")
 
-    odo = BaseOdometry()
+    odo = FakeBaseOdometry()
     odo.apply_correction(np.array([0.005, 0.0, 0.0]), dt, 1.0, 2.0)
     check("an ordinary correction lands whole in one tick",
           abs(odo.pose[0] - 0.005) < 1e-12, f"{odo.pose[0]:.6f}")
 
     # The linear clamp is on the vector, so a correction never changes bearing.
-    odo = BaseOdometry()
+    odo = FakeBaseOdometry()
     odo.apply_correction(np.array([3.0, 4.0, 0.0]), dt, 1.0, 2.0)
     check("a clamped correction keeps its direction",
           abs(math.atan2(odo.pose[1], odo.pose[0]) - math.atan2(4.0, 3.0)) < 1e-12,
@@ -715,11 +715,11 @@ def test_slam_base_pose_feedback():
     free, _ = drive(None)
 
     check("without the fix, odometry reports a move the robot never made",
-          np.linalg.norm(free.odometry.pose[:2]) > 1e-3,
-          f"pose {free.odometry.pose.round(3)}")
+          np.linalg.norm(free.fake_odom.pose[:2]) > 1e-3,
+          f"pose {free.fake_odom.pose.round(3)}")
     check("with it, the measured pose stays where the fix says the robot is",
-          np.linalg.norm(stuck.odometry.pose[:2]) < 0.02,
-          f"pose {stuck.odometry.pose.round(4)}")
+          np.linalg.norm(stuck.fake_odom.pose[:2]) < 0.02,
+          f"pose {stuck.fake_odom.pose.round(4)}")
 
     # The point of all of it: a base that is not moving keeps producing error,
     # so the controller keeps asking. Under dead-reckoning alone the error
@@ -737,16 +737,16 @@ def test_slam_base_pose_feedback():
     wbc.config.enable_slam_base_pose = True
     wbc.slam_pose = FakeSlam(np.array([9.0, 9.0, 0.0]),
                              age=wbc.config.slam_pose_max_age_s + 1.0)
-    wbc.odometry.reset(np.array([0.1, 0.2, 0.3]))
+    wbc.fake_odom.reset(np.array([0.1, 0.2, 0.3]))
     wbc._correct_base_from_slam()
     check("a stale fix is ignored and the base coasts on dead-reckoning",
-          np.allclose(wbc.odometry.pose, [0.1, 0.2, 0.3]),
-          str(wbc.odometry.pose.round(4)))
+          np.allclose(wbc.fake_odom.pose, [0.1, 0.2, 0.3]),
+          str(wbc.fake_odom.pose.round(4)))
 
     wbc.slam_pose = None
     wbc._correct_base_from_slam()
     check("no publisher at all is survivable",
-          np.allclose(wbc.odometry.pose, [0.1, 0.2, 0.3]))
+          np.allclose(wbc.fake_odom.pose, [0.1, 0.2, 0.3]))
 
 
 def _slam_msg(yaw: float, x: float, z: float, conf: float = 100.0) -> list:
@@ -895,7 +895,7 @@ def test_slam_frame_handedness():
     def converge(correction_rate, ticks=240):
         dt, offset = 1.0 / 30.0, -math.pi / 2.0
         frame = SlamBaseFrame(yaw_sign=WholeBodyHardwareConfig().slam_yaw_sign)
-        pd, odo = BasePoseController(ff_gain=0.0), BaseOdometry()
+        pd, odo = BasePoseController(ff_gain=0.0), FakeBaseOdometry()
         opposed = []
         target, true = np.array([0.0, -0.05, math.radians(30)]), np.zeros(3)
         # Ground truth: the SLAM plane is the mirror of the IK plane, which is

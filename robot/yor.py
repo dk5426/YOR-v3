@@ -124,7 +124,12 @@ class YOR():
             base_max_accel=base_max_accel,
             origin=(0.0, 0.0),
             grid_res=0.05,
-            # Navigation closes on the 20 Hz SLAM pose, so it is paced by it.
+            # Navigation closes on the SLAM pose, so it is paced by it. The
+            # publisher measures 30 Hz (2026-08-27), so 20 here is slower
+            # than it needs to be -- raising it is a nav-tuning change, not a
+            # polling one, because the PIDs' dt and vel_alpha were tuned at
+            # this rate, so it is left alone. The `pose_sig` gate in
+            # robot/base.py is what keeps repeats harmless either way.
             control_hz=20,
             # Whole-body control now publishes base commands at 30 Hz
             # (WholeBodyHardwareConfig.control_hz). The relay is deliberately

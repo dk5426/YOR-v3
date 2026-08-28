@@ -1018,7 +1018,7 @@ class Base:
             # sampling error that integrating a 30 Hz-sampled velocity does,
             # and it is what robot/nav/odometry/swerve_odom.py integrates. With
             # it in the trajectory log, wheel odometry can be reconstructed
-            # offline and compared against BaseOdometry's commanded-velocity
+            # offline and compared against FakeBaseOdometry's commanded-velocity
             # dead reckoning without another tape run. Same cached status frame
             # 2 as GetVelocity, so it costs no extra bus traffic.
             "drive_pos_rot": np.array(

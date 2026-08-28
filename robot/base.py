@@ -643,6 +643,14 @@ class BaseController:
                          **({} if drive_vel_scale is None
                             else {"drive_vel_scale": float(drive_vel_scale)}))
         self.slam_sub = None
+        # One line per outage, not one per retry: the loop below re-tries the
+        # subscriber every second forever, and a nav mode with no SLAM pose
+        # otherwise looks identical to a nav mode that is simply idle.
+        self._slam_unavailable_warned = False
+        # Separate flag for a publisher that dies *after* the subscriber was
+        # built: `slam_sub` stays non-None, so the retry path above never runs
+        # again and would never re-arm the notice.
+        self._slam_read_warned = False
 
         self.pos_tol = pos_tol
         self.theta_tol = theta_tol
@@ -739,6 +747,7 @@ class BaseController:
             return
 
         self.slam_sub = out["sub"]
+        self._slam_unavailable_warned = False
         print("SLAM pose subscriber initialized")
         return
 
@@ -795,6 +804,17 @@ class BaseController:
                     last_sub_try = now
                     self.slam_sub_init()
 
+                if self.slam_sub is None and not self._slam_unavailable_warned:
+                    # Unlike whole-body control, there is no fake odometry to
+                    # fall back to here: MOVE_TO / PATH_FOLLOWING /
+                    # POSE_TARGET all measure straight off the SLAM pose, so
+                    # without it this loop can only hold the wheels at zero.
+                    print(f"[base] SLAM pose not available ({THOR_IP}:"
+                          f"{SLAM_PUB_PORT}) — {self.mode} is holding the "
+                          f"base still; there is no fake-odometry fallback on "
+                          f"this path. Is odin_pub_node running on Thor?")
+                    self._slam_unavailable_warned = True
+
                 self.yor.pose = None
                 self.base.set_target_base_velocity(np.zeros(3, dtype=float), smooth=True)
                 self.rate.sleep()
@@ -812,7 +832,15 @@ class BaseController:
                 y = float(translation[2])
                 # Identity of THIS pose sample, for the PID gate below.
                 pose_sig = (x, y, theta)
-            except Exception:
+                if self._slam_read_warned:
+                    print("[base] SLAM pose back — nav modes are live again")
+                    self._slam_read_warned = False
+            except Exception as exc:
+                if not self._slam_read_warned:
+                    print(f"[base] SLAM pose read failed ({exc!r}) — "
+                          f"{self.mode} is holding the base still until the "
+                          f"pose comes back")
+                    self._slam_read_warned = True
                 self.yor.pose = None
                 self.base.set_target_base_velocity(np.zeros(3, dtype=float), smooth=True)
                 self.rate.sleep()

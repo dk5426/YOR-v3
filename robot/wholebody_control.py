@@ -32,8 +32,9 @@ joint commands rather than one coarse command per solve tick.
 
 Three things are worth knowing before running this on the robot:
 
-* **Base odometry is dead-reckoned from the commanded velocity, and
-  corrected by SLAM.** Integrating the commanded velocity is exact with
+* **Base odometry is fake -- dead-reckoned from the commanded velocity --
+  and corrected by SLAM.** `FakeBaseOdometry` is named for what it is:
+  integrating the commanded velocity is exact with
   respect to what the solver asked for and says nothing whatever about the
   floor: slip, a push, or a module that never reached its angle all move the
   robot without moving odometry. Used alone as the base PD's measurement --
@@ -44,11 +45,12 @@ Three things are worth knowing before running this on the robot:
   `enable_slam_base_pose` (**on** by default) closes that loop on the Odin
   VIO+lidar fix (`slam/pose`, from robot/odin_pub_node.py). Dead-reckoning
   still carries the estimate between fixes -- it is smooth and available at
-  loop rate, which a 20 Hz absolute pose is not -- but every tick it is pulled
+  loop rate, which a 30 Hz absolute pose is not -- but every tick it is pulled
   toward the fix under a rate limit, so what the PD measures is where the
   robot actually is and a loop-closure jump is absorbed over ~1 s rather than
-  arriving as a step. A dropout costs only the correction: the pose ages out
-  and the base coasts on dead-reckoning.
+  arriving as a step. A dropout costs only the correction: the pose ages out,
+  the base coasts on the fake odometry alone, and after
+  `slam_pose_warn_after_s` the loop prints that it is doing so.
 
   One value is not solved for and can be wrong: `slam_yaw_sign`, the
   handedness of the SLAM planar frame against the IK one. If
@@ -226,7 +228,7 @@ class SwerveTwistShaper:
     plane, and a point moving along a line sweeps its polar angle
     monotonically, so ``travel_i(s)`` is monotone and a short bisection finds
     the largest feasible ``s``. Whatever is left over is not lost: the caller
-    integrates what was issued into `BaseOdometry`, so the residual reappears
+    integrates what was issued into `FakeBaseOdometry`, so the residual reappears
     as pose error next tick and the PD asks for it again. The transition takes
     the several ticks it physically takes, instead of being demanded in one
     and delivered in none.
@@ -490,7 +492,7 @@ class WholeBodyHardwareConfig:
     # Applied to the linear velocity as a *vector*, not per axis. Per-axis
     # limits skew the commanded direction toward whichever axis saturates
     # first; the same reasoning is already written down for the SLAM
-    # correction in BaseOdometry.apply_correction.
+    # correction in FakeBaseOdometry.apply_correction.
     base_max_lin_vel: float = 0.35   # m/s, magnitude of (forward, lateral)
     base_max_ang_vel: float = 1.60   # rad/s
     # Velocities below this are sent as zero, so solver noise doesn't leave the
@@ -788,9 +790,9 @@ class WholeBodyHardwareConfig:
     # ── SLAM base pose (PD feedback) ─────────────────────────────────────────
     # What closes the base pose loop on the floor instead of on the command.
     #
-    # `_dispatch_base` measures with `self.odometry.pose`, and that pose is
+    # `_dispatch_base` measures with `self.fake_odom.pose`, and that pose is
     # dead-reckoned by integrating the velocity the base was *commanded*
-    # (BaseOdometry.update). Left alone that makes the PD an echo chamber: the
+    # (FakeBaseOdometry.update). Left alone that makes the PD an echo chamber: the
     # error decays because odometry moved, whether or not the robot did. Wheel
     # slip, a push, a module that never reached its angle and a stalled drive
     # are all invisible to it, by construction.
@@ -816,7 +818,18 @@ class WholeBodyHardwareConfig:
     slam_pose_port: int = 6000
     # Poll rate of the background listener. The control loop never blocks on
     # the network — it reads whatever this thread last cached.
-    slam_pose_hz: float = 20.0
+    #
+    # 30 Hz because that is what odin_pub_node actually publishes: measured
+    # 2026-08-27 off the live topic, 180 distinct poses in 6.0 s, confidence
+    # a flat 100. At the old 20 Hz this thread was the bottleneck rather than
+    # Thor, and a third of the fixes were dropped without ever being read.
+    # Matching the solver's own control_hz means a tick can still read a
+    # repeat of the previous pose, which costs nothing here: the correction
+    # is a rate-limited pull toward an absolute target, not a derivative, so
+    # a repeated sample simply asks for the same remaining offset again.
+    # (The nav PIDs in robot/base.py do differentiate the pose, which is why
+    # they gate on `pose_sig` instead of running open at loop rate.)
+    slam_pose_hz: float = 30.0
     # Ignore a cached pose older than this and coast on dead-reckoning.
     slam_pose_max_age_s: float = 0.5
     # Handedness of the SLAM planar frame relative to the IK one. This is the
@@ -855,6 +868,19 @@ class WholeBodyHardwareConfig:
     # and SLAM have diverged far more than drift explains (wrong yaw_sign,
     # wheel slip, or the robot was picked up).
     slam_offset_warn_m: float = 0.50
+    # How long the listener may produce nothing before the loop says so.
+    #
+    # Silence was the old behaviour and it cost a day: on 2026-08-27 the Odin
+    # publisher was down from ~14:46, and all 36 whole-body starts after it
+    # announced `enable_slam_base_pose` at startup, received not one fix, and
+    # drove the chassis on FakeBaseOdometry alone without a single line of
+    # output saying so. commlink's Subscriber does not raise when nothing is
+    # publishing -- it just polls a dead topic -- so the listener's own
+    # except branch never fires either. This is the only thing that notices.
+    #
+    # Sized well above the 30 Hz publish period and the 0.5 s staleness
+    # window, so an ordinary hiccup stays quiet and a real absence does not.
+    slam_pose_warn_after_s: float = 3.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -940,20 +966,27 @@ class LiftVelocityPD:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Base odometry
+# Fake base odometry
 # ─────────────────────────────────────────────────────────────────────────────
 
-class BaseOdometry:
+class FakeBaseOdometry:
     """The chassis pose (x, y, theta) the base PD measures, IK world frame.
 
-    `update` integrates the velocity that was actually *commanded* to the
-    base: exact with respect to the solver's intent, free of unit guesswork,
-    and completely open-loop with respect to the floor. `apply_correction`
-    is the other half -- it pulls that estimate toward an absolute fix, and
-    `_correct_base_from_slam` drives it from the Odin pose once per tick.
+    Called *fake* because `update` integrates the velocity that was
+    **commanded** to the base, never anything measured off the floor: exact
+    with respect to the solver's intent, free of unit guesswork, and blind to
+    slip, a push, or a module that never reached its angle. On this estimate
+    alone the base PD is an echo chamber -- the error decays because this
+    pose moved, whether or not the robot did.
+
+    `apply_correction` is what makes it more than fake: it pulls the estimate
+    toward an absolute fix, and `_correct_base_from_slam` drives it from the
+    Odin pose once per tick. When that fix is missing the class name is the
+    literal truth about what the base is driving on, which is why
+    `_correct_base_from_slam` says so out loud rather than degrading quietly.
 
     The two halves are not interchangeable. Dead-reckoning supplies rate:
-    smooth, at loop rate, never missing. The fix supplies truth, at 20 Hz and
+    smooth, at loop rate, never missing. The fix supplies truth, at 30 Hz and
     with steps in it. Running on either alone gives up something the base PD
     needs, which is why this holds one pose that both write to.
     """
@@ -1799,7 +1832,7 @@ class WholeBodyController:
         self._home_right: Optional[mink.SE3] = None
         self._home_lift: float = 0.0
 
-        self.odometry = BaseOdometry()
+        self.fake_odom = FakeBaseOdometry()
         # SLAM drift correction — inert unless enable_slam_base_pose is set.
         self.slam_frame = SlamBaseFrame(
             yaw_sign=self.config.slam_yaw_sign,
@@ -1809,6 +1842,13 @@ class WholeBodyController:
         self._slam_offset_m = 0.0
         self._slam_pose_age = float("inf")
         self._slam_offset_warned = False
+        # Fallback announcement state. `_slam_since` is when the current
+        # stretch without a usable fix began -- listener start, or the last
+        # good pose -- and `_slam_fallback_warned` keeps the announcement to
+        # one line per outage instead of one per tick.
+        self._slam_since = time.monotonic()
+        self._slam_fallback_warned = False
+        self._slam_ever_seen = False
         if self.config.enable_slam_base_pose:
             self.slam_pose = SlamPoseListener(
                 self.config.slam_pose_host,
@@ -1966,7 +2006,7 @@ class WholeBodyController:
         self._home_left, self._home_right = T_l.copy(), T_r.copy()
         self._home_lift = float(self.ik.configuration.q[self.ik._lift_qpos_adr])
 
-        self.odometry.reset()
+        self.fake_odom.reset()
         # The odometry origin just moved, so any earlier SLAM alignment is void.
         self.slam_frame.reset()
         # Open-loop mode still needs one encoder snapshot so its initial model
@@ -2002,10 +2042,16 @@ class WholeBodyController:
                 f"solver asks for — see base_feedback_alpha"
             )
         if self.config.enable_slam_base_pose:
+            # Phrased as an intention, not an accomplishment: at this point
+            # not one fix has arrived yet, and until one does the base is on
+            # FakeBaseOdometry. `_announce_slam_fallback` is what reports the
+            # outcome; this line used to read as confirmation and was printed
+            # by 36 runs that never received a pose.
             print(
-                f"[wholebody] base: pose loop closes on the Odin SLAM fix "
+                f"[wholebody] base: pose loop will close on the Odin SLAM fix "
                 f"({self.config.slam_pose_host}:{self.config.slam_pose_port}, "
-                f"yaw_sign={self.config.slam_yaw_sign:+.0f}) — watch "
+                f"yaw_sign={self.config.slam_yaw_sign:+.0f}) once the first "
+                f"fix arrives — until then, fake base odometry; watch "
                 f"slam_base_correction_m in get_state()"
             )
             if alpha > 0.0:
@@ -2266,7 +2312,7 @@ class WholeBodyController:
             "left_ee_wxyz_xyz": T_l.wxyz_xyz.tolist(),
             "right_ee_wxyz_xyz": T_r.wxyz_xyz.tolist(),
             "lift": self.get_lift_position(),
-            "base_xytheta": self.odometry.pose.tolist(),
+            "base_xytheta": self.fake_odom.pose.tolist(),
             "base_velocity": base_vel.tolist(),
             "base_command": base_cmd.tolist(),
             # What the base is being driven *to* and how far off it is
@@ -2405,7 +2451,7 @@ class WholeBodyController:
 
         Translation is clamped on the magnitude of the xy error rather than
         per axis, so the direction the solver asked for survives it -- the
-        same reasoning as `_limit_linear` and `BaseOdometry.apply_correction`.
+        same reasoning as `_limit_linear` and `FakeBaseOdometry.apply_correction`.
 
         No-op when both gates are 0, and while the base is not being driven:
         `fix_base` already stops the belief moving, and a disabled or
@@ -2425,7 +2471,7 @@ class WholeBodyController:
             return
 
         belief = np.asarray(result.base_position, dtype=float).reshape(-1)[:3]
-        ref = self.odometry.pose
+        ref = self.fake_odom.pose
         leashed = belief.copy()
         changed = False
 
@@ -2559,10 +2605,10 @@ class WholeBodyController:
             # override a pose error the size of however far the operator went
             # -- and the base would drive back at full speed to answer it.
             # Seeding every inactive tick keeps that error at zero instead.
-            base = np.asarray(self.odometry.pose, dtype=float)
+            base = np.asarray(self.fake_odom.pose, dtype=float)
         else:
             belief = self.ik.configuration.q[self.ik.base_qpos_adrs]
-            err = np.asarray(self.odometry.pose, dtype=float) - belief
+            err = np.asarray(self.fake_odom.pose, dtype=float) - belief
             err[2] = _wrap_pi(err[2])
             base = belief + alpha * err
         self.ik.set_measured_state(
@@ -2579,12 +2625,13 @@ class WholeBodyController:
         Deliberately a *correction* rather than a replacement, even though it
         is now fast enough to be feedback. Dead-reckoning is what carries the
         estimate between fixes: it is smooth, available at loop rate, and
-        exact with respect to what the solver commanded, none of which a 20 Hz
+        exact with respect to what the solver commanded, none of which a 30 Hz
         absolute fix is. SLAM supplies the one thing it cannot -- a statement
         about the floor -- and the rate limit is what stops a loop-closure
         step from reaching the PD as a step. A dropout costs nothing but the
         correction: `latest()` ages out, this returns early, and the base
-        coasts on dead-reckoning exactly as it did before.
+        drives on `FakeBaseOdometry` alone -- which is announced rather than
+        silent, see `_announce_slam_fallback`.
 
         Nothing here is conditional on the base being enabled or overridden.
         The estimate has to stay true while a human drives the chassis by
@@ -2597,19 +2644,30 @@ class WholeBodyController:
         pose, age = self.slam_pose.latest()
         self._slam_pose_age = age
         if pose is None or age > self.config.slam_pose_max_age_s:
+            self._announce_slam_fallback(age)
             return
+
+        # A usable fix: reset the outage clock, and say so if the last thing
+        # printed was the fallback notice.
+        self._slam_since = time.monotonic()
+        self._slam_ever_seen = True
+        if self._slam_fallback_warned:
+            print(f"[wholebody] SLAM pose back ({self.config.slam_pose_host}:"
+                  f"{self.config.slam_pose_port}) — base measurement is "
+                  f"corrected again")
+            self._slam_fallback_warned = False
 
         if not self.slam_frame.aligned:
             # First usable fix: pin the SLAM frame onto wherever the odometry
             # currently thinks it is, so the correction starts at exactly zero
             # and only removes drift accumulated from here on.
-            self.slam_frame.align(pose, self.odometry.pose)
+            self.slam_frame.align(pose, self.fake_odom.pose)
             print("[wholebody] SLAM base correction aligned "
                   f"(yaw_sign={self.config.slam_yaw_sign:+.0f})")
             return
 
         target = self.slam_frame.to_ik(pose)
-        lin, _ang = self.odometry.apply_correction(
+        lin, _ang = self.fake_odom.apply_correction(
             target,
             self.dt,
             self.config.slam_correction_max_lin_rate,
@@ -2623,6 +2681,35 @@ class WholeBodyController:
             self._slam_offset_warned = True
         elif lin < 0.5 * self.config.slam_offset_warn_m:
             self._slam_offset_warned = False
+
+    def _announce_slam_fallback(self, age: float) -> None:
+        """Say, once per outage, that the base is running on fake odometry.
+
+        The message is the whole point of the method: `FakeBaseOdometry` is
+        exactly what its name says whenever this fires, and an operator who
+        is tuning the base needs to know that what they are watching is the
+        chassis following commands rather than following the floor.
+
+        One line per outage, not one per tick, and it waits
+        `slam_pose_warn_after_s` first so a hiccup between two 30 Hz fixes
+        never trips it. `age` is infinite when no fix has ever arrived, which
+        is the case that used to be invisible: the publisher being down does
+        not raise anywhere, so nothing else in this file would ever notice.
+        """
+        if self._slam_fallback_warned:
+            return
+        if (time.monotonic() - self._slam_since) < self.config.slam_pose_warn_after_s:
+            return
+
+        where = f"{self.config.slam_pose_host}:{self.config.slam_pose_port}"
+        if self._slam_ever_seen:
+            detail = f"no fix for {age:.1f} s"
+        else:
+            detail = "no fix since startup — is odin_pub_node running on Thor?"
+        print(f"[wholebody] SLAM pose not available ({where}, {detail}) — "
+              f"driving the base on FAKE base odometry (integrated commanded "
+              f"velocity), which is blind to slip and to being pushed")
+        self._slam_fallback_warned = True
 
     def _measured_lift(self) -> Optional[float]:
         try:
@@ -2963,7 +3050,7 @@ class WholeBodyController:
         """Drive the chassis toward the base *pose* the solver asked for.
 
         `result.base_position` is the IK's own belief about where the base
-        should be; `self.odometry.pose` is where it is -- dead-reckoned at
+        should be; `self.fake_odom.pose` is where it is -- dead-reckoned at
         loop rate and, with `enable_slam_base_pose`, corrected toward the Odin
         fix every tick by `_correct_base_from_slam`, so the difference the PD
         closes is a real one and not just the part of the command the wheels
@@ -3004,7 +3091,7 @@ class WholeBodyController:
             return
 
         forward, lateral, yaw_rate = self.base_pose.compute(
-            target, self.odometry.pose, dt=self.dt)
+            target, self.fake_odom.pose, dt=self.dt)
 
         request = np.array([forward, lateral, yaw_rate], dtype=float)
 
@@ -3054,7 +3141,7 @@ class WholeBodyController:
         # Odometry integrates what was *commanded* after clamping, so the
         # model's base pose cannot run ahead of what the wheels were asked for.
         v_applied = self._body_to_world(forward, lateral, yaw_rate)
-        self.odometry.update(v_applied, self.dt)
+        self.fake_odom.update(v_applied, self.dt)
         with self._lock:
             self._last_base_velocity = v_applied
             self._last_base_command = command.copy()
@@ -3082,7 +3169,7 @@ class WholeBodyController:
         (base_pose_heading_offset, −π/2) reproduces it for the pose error.
         Held to it by tests/test_wholebody_control.py::test_axis_map_and_odometry.
         """
-        theta = float(self.odometry.pose[2])
+        theta = float(self.fake_odom.pose[2])
         c, s = math.cos(theta), math.sin(theta)
         vx_body = c * v_world[0] + s * v_world[1]
         vy_body = -s * v_world[0] + c * v_world[1]
@@ -3091,7 +3178,7 @@ class WholeBodyController:
     def _body_to_world(self, forward: float, lateral: float, yaw_rate: float) -> np.ndarray:
         """Inverse of `_world_to_body`, for odometry integration."""
         vx_body, vy_body = lateral, -forward
-        theta = float(self.odometry.pose[2])
+        theta = float(self.fake_odom.pose[2])
         c, s = math.cos(theta), math.sin(theta)
         return np.array([c * vx_body - s * vy_body, s * vx_body + c * vy_body, yaw_rate])
 
@@ -3107,7 +3194,7 @@ class WholeBodyController:
            rescales the pair, so the direction the solver asked for is the
            direction the wheels get -- clamping per axis would not merely
            scale the command but turn it, and `_dispatch_base` integrates
-           the result into `BaseOdometry`, so a distortion that always
+           the result into `FakeBaseOdometry`, so a distortion that always
            points at an axis accumulates as pose bias rather than averaging
            out.
         2. One-pole low-pass, per component so the direction is filtered
