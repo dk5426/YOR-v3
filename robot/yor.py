@@ -1202,10 +1202,11 @@ def main():
              "to make yaw less of a hair trigger; what matters is the ratio "
              "to the linear weight, not the absolute value.")
     parser.add_argument(
-        "--base-motion-weight-min", type=float, default=None, metavar="W",
+        "--base-motion-weight-min", type=float, default=5.0, metavar="W",
         help="what --base-motion-weight falls to when the arms run out of posture "
-             "(default 10, which keeps the linear DOFs above --base-motion-weight-yaw "
-             "so yaw stays the cheap route into the base). The cost is gated on arm "
+             "(default 5; the config value is 10). Either way it keeps the linear "
+             "DOFs above --base-motion-weight-yaw so yaw stays the cheap route into "
+             "the base. The cost is gated on arm "
              "manipulability, so the chassis moves to keep the arms working rather "
              "than only after they have contorted. Set equal to --base-motion-weight "
              "to disable the gate.")
@@ -1262,14 +1263,14 @@ def main():
              "raising: it scales yaw amplitude but leaves the sign-flip "
              "rate identical at every weight, so it cannot damp an "
              "oscillation, and the 0.15 s dispatch filter already cuts "
-             "noise-driven yaw to 1.4% of ticks. Weight 10 buys that last "
+             "noise-driven yaw to 1.4%% of ticks. Weight 10 buys that last "
              "1.4 points for a third of the chassis's reach yaw. Exposed "
              "because before 2026-08-27 the anchor could only be switched "
              "on by raising the primary price, so --base-motion-weight-yaw "
              "2.0 silently did two unrelated things; runs at that setting "
              "had an anchor of 2.0 and need this passed to reproduce.")
     parser.add_argument(
-        "--base-recenter-yaw", type=float, nargs=2, default=None,
+        "--base-recenter-yaw", type=float, nargs=2, default=[2.0, 0.8],
         metavar=("GAIN", "MAXVEL"),
         help="null-space base YAW recentering: the rotational twin of "
              "--base-recenter. Continuously turns the chassis so it carries "
@@ -1280,11 +1281,12 @@ def main():
              "by the shoulder load rather than the hands' bearing so it "
              "cannot cancel the yaw the primary solve spends on reach -- "
              "see WholeBodyIKConfig.base_recenter_yaw_gain. "
-             "Default 1.0 0.30; 0 0 disables.")
+             "Default 2.0 0.8; the config value is 1.0 0.30. 0 0 disables.")
     parser.add_argument(
-        "--base-recenter-yaw-deadzone", type=float, default=None, metavar="RAD",
+        "--base-recenter-yaw-deadzone", type=float, default=0.10, metavar="RAD",
         help="shoulder-yaw drift ignored by --base-recenter-yaw, radians "
-             "(default 0.25). Working off to one side is a comfortable "
+             "(default 0.10; the config value is 0.25). Working off to one "
+             "side is a comfortable "
              "posture, not a fault: without this the chassis tracked the "
              "operator's arms like a turret (2026-08-27, 3.45 rad of net "
              "wander in one 106 s run). Ordinary working load measured p95 "
@@ -1409,7 +1411,7 @@ def main():
              "flips per 1000 ticks against 'soft' on hardware. See "
              "artifacts/wholebody_logs/posture_fix_commands.md.")
     parser.add_argument(
-        "--dls-damping", type=float, default=0.05,
+        "--dls-damping", type=float, default=0.02,
         help="only with --redundancy-resolution dls_projector: Tikhonov/DLS "
              "damping λ for the pseudoinverse J⁺=Jᵀ(JJᵀ+λ²I)⁻¹ (default: "
              "%(default)s). Larger = more robust near singularities, at the "
@@ -1426,7 +1428,7 @@ def main():
              "26.9deg, 1.0 -> 8.2deg, 5.0 -> 1.9deg, EE tracking unchanged. "
              "0 disables (default: %(default)s)")
     parser.add_argument(
-        "--elbow-swivel-gain", type=float, default=1.0,
+        "--elbow-swivel-gain", type=float, default=0.05,
         help="only with --redundancy-resolution dls_projector: proportional "
              "gain pulling each elbow back to its target swivel angle "
              "(default: %(default)s)")
@@ -1437,15 +1439,15 @@ def main():
              "latch each arm's angle from its pose at startup, which keeps "
              "the elbow branch the arm homes into rather than choosing one.")
     parser.add_argument(
-        "--nullspace-continuity-weight", type=float, default=0.0,
+        "--nullspace-continuity-weight", type=float, default=0.5,
         help="only with --redundancy-resolution dls_projector: weight on "
-             "||qdot - qdot_prev||. Defaults to 0 because it measured "
-             "counterproductive -- it resists *change*, which also means it "
+             "||qdot - qdot_prev||. The default is the value the hardware "
+             "runs; kinematic replay measured raising it counterproductive -- "
+             "it resists *change*, which also means it "
              "perpetuates existing null-space motion instead of letting "
              "posture bleed it off (raising it worsened null-space jerk, "
-             "null-space speed and elbow drift at every swivel weight). Kept "
-             "tunable in case hardware command-smoothness behaves differently "
-             "from a kinematic replay (default: %(default)s)")
+             "null-space speed and elbow drift at every swivel weight) -- so "
+             "0 remains the replay-preferred setting (default: %(default)s)")
     parser.add_argument(
         "--enable-manipulability", action="store_true",
         help="only with --redundancy-resolution dls_projector: add a gated "
@@ -1488,9 +1490,9 @@ def main():
              "arms instead (default: keep config value, currently 0.2; "
              "0 = off)")
     parser.add_argument(
-        "--base-leash-rad", type=float, default=None, metavar="RAD",
-        help="the same leash on yaw (default: keep config value, currently "
-             "0 = off; try 0.24)")
+        "--base-leash-rad", type=float, default=0.24, metavar="RAD",
+        help="the same leash on yaw (default 0.24; the config value is "
+             "0 = off)")
     parser.add_argument(
         "--base-pose-kp-xy", type=float, default=None, metavar="KP",
         help="proportional gain of the base pose PD, in (m/s)/m. At the "
@@ -1513,14 +1515,15 @@ def main():
              "a short --base-leash-m coexist with a responsive base "
              "(default: keep config value, currently 1.0; 0 = off)")
     parser.add_argument(
-        "--nullspace-home-gain", type=float, default=None, metavar="GAIN",
+        "--nullspace-home-gain", type=float, default=1.0, metavar="GAIN",
         help="[S1] null-space pull of the arm joints toward the home "
              "posture, in (rad/s per rad of error); the missing recovery "
-             "force for contorted poses. Default 0.3; 0 = off")
+             "force for contorted poses. Default 1.0; the config value is "
+             "0.3. 0 = off")
     parser.add_argument(
-        "--nullspace-home-weight", type=float, default=None, metavar="W",
+        "--nullspace-home-weight", type=float, default=40.0, metavar="W",
         help="[S1] weight of the home attractor in the secondary stack "
-             "(default: config 1.0)")
+             "(default 40; the config value is 1.0)")
     parser.add_argument(
         "--nullspace-home-max-vel", type=float, default=None, metavar="V",
         help="[S1] per-joint cap on the home-attractor desire in rad/s "
@@ -1559,10 +1562,11 @@ def main():
              "during high/low reaches. On by default; "
              "--no-swivel-parallel-ref restores the z/x convention.")
     parser.add_argument(
-        "--swivel-relatch-err", type=float, default=None, metavar="RAD",
+        "--swivel-relatch-err", type=float, default=0.25, metavar="RAD",
         help="[S5b] if the swivel error stays above this for "
              "--swivel-relatch-time, accept the branch the arm is actually "
-             "in instead of fighting it (default 1.57; 0 = off)")
+             "in instead of fighting it (default 0.25; the config value is "
+             "1.57. 0 = off)")
     parser.add_argument(
         "--swivel-relatch-time", type=float, default=None, metavar="S",
         help="[S5b] dwell before a re-latch (default: config 1.0 s)")
