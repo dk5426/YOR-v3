@@ -163,31 +163,43 @@ on **port 8081**.
 
 ### Start the client (terminal 2 — plain `python`, no viewer)
 ```bash
-conda run -n dev python robot/teleop/wholebody_teleop.py --input keyboard
+conda run -n dev python robot/teleop/wholebody_teleop.py --target sim --input keyboard
 ```
+
+The client defaults to `--target hw --input oculus`, so driving the sim from a
+keyboard takes both flags.
 
 `--input` selects the backend:
 
 | Backend | Needs | Notes |
 |---------|-------|-------|
-| `keyboard` (default) | nothing | nudge-based, works everywhere |
+| `keyboard` | nothing | nudge-based, works everywhere |
 | `gamepad` | `pip install pygame` + controller | hold **L1**/**R1** to steer left/right arm with the sticks, D-pad = lift |
-| `oculus` | Quest streaming to `--oculus-host` | clutch teleop: X/A engage, full 6-DoF pose following |
+| `oculus` (default) | Quest streaming to `--oculus-host` (default `10.21.63.17`) | clutch teleop: X/A engage, full 6-DoF pose following |
 
 ### Quest pose filtering (`--input oculus`)
 
-Controller poses are smoothed on arrival with a 1€ filter, so tracker jitter
-does not reach the IK and a tracking dropout holds the target instead of
-throwing the arm at it. Dropped samples are reported on the console.
+**Off by default** — we stream raw controller poses and let the solver do the
+smoothing. `--pose-filter` turns the 1€ filter back on, so tracker jitter does
+not reach the IK and a tracking dropout holds the target instead of throwing
+the arm at it. Dropped samples are reported on the console either way.
 
 | Flag | Default | Effect |
 |------|---------|--------|
+| `--pose-filter` / `--no-pose-filter` | off | 1€-filter the poses on arrival |
 | `--filter-min-cutoff` | `3.0` Hz | smoothing while the hand is still — lower is calmer but laggier |
 | `--filter-beta` | `8.0` | how fast the filter opens up with hand speed — raise it if fast reaches feel sluggish |
-| `--no-pose-filter` | off | stream raw poses (for comparing / debugging the headset) |
 
-The 72 Hz input gives the 3 Hz resting cutoff 24 samples per cycle. The adaptive
-cutoff rises with hand speed so a moving controller remains responsive.
+With the filter on, the 72 Hz input gives the 3 Hz resting cutoff 24 samples per
+cycle, and the adaptive cutoff rises with hand speed so a moving controller
+remains responsive.
+
+### Clutch reseed (`--input oculus`)
+
+**On by default.** Engaging the clutch anchors it to the robot's actual EE pose
+(one `get_state` RPC) rather than the client's local target, which clears any
+wind-up banked while streaming into a constraint. `--no-clutch-reseed` restores
+anchoring to the local target.
 
 On hardware, the command path is:
 
@@ -297,8 +309,10 @@ commlink RPC on **port 5557**.
 
 ### Drive it (from the operator machine)
 ```bash
-python robot/teleop/wholebody_teleop.py --target hw --host <robot-ip> --input oculus
+python robot/teleop/wholebody_teleop.py --host <robot-ip>
 ```
+`--target hw` and `--input oculus` are the defaults, as are the headset IP,
+raw poses and clutch reseed — this is usually the whole command.
 Everything else — keys, clutch behaviour, toggles — is identical to the sim.
 
 ### Bring-up checklist

@@ -87,14 +87,14 @@ controller act on is derived from it.
 ```bash
 # simulation (macOS needs mjpython for the viewer)
 conda run -n dev mjpython robot/yor_mujoco.py
-conda run -n dev python robot/teleop/wholebody_teleop.py --input keyboard
+conda run -n dev python robot/teleop/wholebody_teleop.py --target sim --input keyboard
 
 # interactive solver demo, no RPC
 conda run -n dev mjpython tools/wholebody_ik_demo.py
 
 # on the robot
 python robot/yor.py
-python robot/teleop/wholebody_teleop.py --target hw --host <robot-ip> --input oculus
+python robot/teleop/wholebody_teleop.py --host <robot-ip>   # --target hw --input oculus are the defaults
 ```
 
 Read [docs/RUNNING.md](docs/RUNNING.md) before the first hardware run — the

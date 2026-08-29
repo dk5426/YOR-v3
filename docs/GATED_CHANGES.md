@@ -1,7 +1,16 @@
 # Gated teleop/solver changes (2026-08-25 wave)
 
-Every change ships OFF by default -- a run with no new flags is bit-identical
-to the `pre-gates` checkpoint (verified: 40-solve trajectory, max |Δq| = 0.0).
+Every change shipped OFF by default -- a run with no new flags was
+bit-identical to the `pre-gates` checkpoint (verified: 40-solve trajectory,
+max |Δq| = 0.0).
+
+**Stale as of 2026-08-28.** The gates that survived floor testing are now the
+defaults, so the "Off / try" column below records what each gate did in the
+2026-08-25 wave, not what a bare run does today. Currently on by default:
+T1 (`--clutch-reseed`), S1 (`--nullspace-home-gain 1.0`, weight 40), S3, S4a,
+S5a, S5b (`--swivel-relatch-err 0.25`), S7. Read `--help` on `robot/yor.py`
+and `robot/teleop/wholebody_teleop.py` for the live values; each of those
+help strings names the config default it departs from.
 
 **Restore everything:** `git reset --hard pre-gates` (also branch `backup-pre-gates`).
 

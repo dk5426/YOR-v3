@@ -10,24 +10,25 @@ expose the same API:
   --target hw    robot/yor.py          port 5557   (the real robot)
 
 Input backends (pick with --input):
-  keyboard  Terminal keys, zero extra deps (default; runs anywhere).
+  keyboard  Terminal keys, zero extra deps (runs anywhere).
   gamepad   Xbox / PS4 controller via pygame.
   oculus    Meta Quest controllers via ZMQ (reuses oculus_msgs protocol).
-            Controller poses are 1€-filtered on arrival — tune with
-            --filter-min-cutoff / --filter-beta, or disable with
-            --no-pose-filter.
+            The default. Pose filtering is off by default (--pose-filter
+            turns the 1€ filter back on; tune it with --filter-min-cutoff
+            / --filter-beta).
 
 Run
 ---
+  # Hardware — the default: on the robot,
+  python robot/yor.py
+  # then, from the operator machine (--oculus-host defaults to the headset
+  # we run, so this is usually the whole command):
+  python robot/teleop/wholebody_teleop.py --host <robot-ip>
+
   # Simulation — start the server (macOS needs mjpython for the viewer):
   conda run -n dev mjpython robot/yor_mujoco.py
   # then, in another terminal (plain python is fine):
-  conda run -n dev python robot/teleop/wholebody_teleop.py --input keyboard
-
-  # Hardware — on the robot:
-  python robot/yor.py
-  # then, from the operator machine:
-  python robot/teleop/wholebody_teleop.py --target hw --host <robot-ip> --input oculus
+  conda run -n dev python robot/teleop/wholebody_teleop.py --target sim --input keyboard
 
 Keyboard controls
 -----------------
@@ -745,23 +746,30 @@ class WholeBodyTeleop:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     parser.add_argument("--input", choices=["keyboard", "gamepad", "oculus"],
-                        default="keyboard", help="input backend")
-    parser.add_argument("--target", choices=["sim", "hw"], default="sim",
-                        help="which whole-body server to drive (sets the default port)")
+                        default="oculus", help="input backend (default: %(default)s)")
+    parser.add_argument("--target", choices=["sim", "hw"], default="hw",
+                        help="which whole-body server to drive (sets the default "
+                             "port; default: %(default)s)")
     parser.add_argument("--host", default="localhost", help="RPC server host")
     parser.add_argument("--port", type=int, default=None,
                         help="RPC server port (default: 8081 for sim, 5557 for hw)")
     parser.add_argument("--rate", type=int, default=LOOP_RATE, help="loop rate (Hz)")
-    parser.add_argument("--oculus-host", default="10.21.116.241",
-                        help="Quest headset IP (oculus input only)")
-    parser.add_argument("--no-pose-filter", action="store_true",
-                        help="stream raw Quest poses (skip 1€ filtering)")
-    parser.add_argument("--clutch-reseed", action="store_true",
+    parser.add_argument("--oculus-host", default="10.21.63.17",
+                        help="Quest headset IP (oculus input only; default: "
+                             "%(default)s)")
+    parser.add_argument("--pose-filter", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="1€-filter the Quest poses on arrival. Off by "
+                             "default: we stream raw poses and let the solver "
+                             "do the smoothing. --pose-filter restores it.")
+    parser.add_argument("--clutch-reseed", action=argparse.BooleanOptionalAction,
+                        default=True,
                         help="[T1] on engage, anchor the clutch to the robot's "
                              "actual EE pose (one get_state RPC) instead of the "
                              "client's local target -- clears any wind-up banked "
                              "while streaming into a constraint (oculus input "
-                             "only; default: off = current behaviour)")
+                             "only). On by default; --no-clutch-reseed anchors "
+                             "to the local target as before.")
     parser.add_argument("--filter-min-cutoff", type=float, default=3.0,
                         help="1€ cutoff (Hz) at rest — lower = smoother, laggier")
     parser.add_argument("--filter-beta", type=float, default=8.0,
@@ -786,7 +794,7 @@ def main() -> None:
         source = GamepadSource()
     else:
         source = OculusSource(host=args.oculus_host,
-                              pose_filter=not args.no_pose_filter,
+                              pose_filter=args.pose_filter,
                               filter_min_cutoff=args.filter_min_cutoff,
                               filter_beta=args.filter_beta,
                               yaw_correction_deg=args.oculus_yaw_correction,
