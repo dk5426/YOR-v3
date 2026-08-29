@@ -22,3 +22,7 @@ maps/*
 # reference, not part of this repo.
 neer_odin_v2-main/
 .claude/
+
+# Logs over GitHub's 100 MiB per-file cap - kept on the robot only
+artifacts/wholebody_logs/trajectories/traj_20260825_114654.csv
+artifacts/wholebody_logs/swerve/swerve_20260825_195800.csv

@@ -1,0 +1,9 @@
+[console-log] mirroring output to /home/pi-v3/YOR-v3-try/artifacts/wholebody_logs/yor_20260827_193504.log
+[yor] overrides: none (config defaults)
+[yor] posture-fix: stiffen_joint7=True (scale=3x), refresh_target=True, redundancy_resolution=dls_projector (dls_damping=0.05)
+[yor] null-space: swivel_weight=1 (gain=1, target=latched-from-pose), continuity_weight=0, manipulability=False
+[YOR] base: drive command scale 1.068 (from base_pid_hybrid.json)
+[PicoLift] Opening serial /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG02XPI5-if00-port0 @ 115200...
+[PicoLift] Serial open OK
+[ArmNode] Initializing can_left with nerolib...
+[ArmNode] Failed to initialize arm on can_left: Failed to enable arm
