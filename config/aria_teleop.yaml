@@ -1,0 +1,112 @@
+# aria_teleop.yaml — settings for the Project Aria hand-teleop backend.
+#
+# Read by `robot/teleop/wholebody_teleop.py --input aria` and by
+# `robot/teleop/aria/sim_viz.py`. Point either at a different file with
+# --aria-config / --config; every key below is optional and falls back to the
+# value shown.
+#
+# The Aria *publisher* is not configured here — it lives in the aria2robot repo
+# and owns the glasses, the hand tracking and the finger retargeting. This file
+# only describes the subscriber side.
+
+publisher:
+  # Where `python -m aria2robot.stream_pub` is running. Port 5555 is its
+  # commlink default; the topics consumed are `meta` and `wuji`.
+  host: localhost
+  port: 5555
+
+  # Release the clutch if nothing arrives for this long, in seconds.
+  # commlink's buffer=False subscriber hands back the last payload forever, so
+  # without this a publisher that dies mid-motion leaves the arm holding a
+  # target the operator can no longer release by gesture. 0 disables the gate.
+  stale_s: 0.5
+
+mapping:
+  # Which hand drives which arm: left, right or both. The idle arm is never
+  # commanded — nothing is sent for it at all.
+  hand: both
+
+  # Robot end-effector travel per metre of wrist travel. 1.0 is 1:1. Below 1
+  # buys precision at the cost of reach; above 1 the reverse.
+  position_scale: 1.0
+
+  # Rotate the end-effector with your wrist. false pins it to the model's home
+  # orientation and teleoperates translation alone, which is the way to check
+  # the position mapping in isolation.
+  follow_orientation: true
+
+  # Which frame hand *translation* is read in. Rotation is wrist-framed either
+  # way — this is only the split Quest already makes between the two.
+  #
+  #   world  Up is up. A metre up in odom is a metre up for the end-effector at
+  #          every engage pose. Only the *heading* comes from engage: the map
+  #          is the yaw of the full wrist map about the robot's vertical, which
+  #          is what absorbs the arbitrary yaw of Aria's odometry frame and is
+  #          why there is still no room calibration to set.
+  #   wrist  The older action space: translation rides the engage orientation
+  #          too, so raising your hand raises the end-effector only if you
+  #          engaged with your hand roughly in the robot's hand pose.
+  #
+  # world assumes odom's +Z is the operator's true vertical, which holds because
+  # Aria's VIO odometry frame is gravity-aligned. That axis is ODOM_UP in
+  # clutch.py and is deliberately not a setting — see the tables note there.
+  translation_frame: world
+
+  # The MJCF the flange->wrist offset and the pinned home orientation are read
+  # from at startup. Must be the same robot the server is running, since that
+  # offset is applied through a rotation — a value that disagrees becomes an arc
+  # the hand swings through, not a constant bias. Relative paths resolve against
+  # the repo root.
+  scene: description/scene_wholebody.xml
+
+clutch:
+  # On engage, anchor to the robot's *actual* end-effector pose (one get_state
+  # RPC) rather than the client's local target. Clears any wind-up banked while
+  # streaming into a constraint, so engaging never starts from a pose the robot
+  # never reached. Ignored by sim_viz, which reads its own live FK.
+  reseed: true
+
+  # Pin the lift to its current height on the first tick.
+  #
+  # Both the hardware and sim nodes start with no lift target, which the solver
+  # reads as "the lift is yours" — so a client that simply never mentions the
+  # lift does not leave it where it is, it hands the solver the column. This
+  # sends one set_lift_target to claim it back.
+  #
+  # It is a preference, not a lock: the lift target is a soft posture term
+  # (lift_posture_cost, 1e-4 on the sim node), so the solver will still trade
+  # the column away to help the arms reach. Holding it hard would need a
+  # fix_lift RPC, which neither node exposes today. false leaves the lift free,
+  # which is what sim_viz runs.
+  hold_lift: true
+
+home:
+  # Thumbs up on *both* hands, both disengaged, homes both arms — the node's
+  # own safe sequence (base lock, lift to 450 mm, then the arms). There is no
+  # single-arm gesture: that sequence locks the base and drives the lift
+  # whichever arms it homes, so one thumb would move the whole robot to home
+  # one arm. Needs mapping.hand: both; a one-handed session cannot ask.
+  #
+  # The disengaged gate is what makes this safe without a confirmation step:
+  # nothing is following either hand at that moment, and clutch reseed means
+  # re-engaging afterwards anchors on wherever home left the arms. It also
+  # keeps the shaka symmetric — disengage stays the stop gesture on *both*
+  # hands, which is what a startled operator reaches for.
+  #
+  # Thumbs up cannot be confused with the shaka: that one wants the pinky
+  # extended, this one wants it curled.
+  gesture: true
+
+  # How long both thumbs must be held, in seconds. This is the whole safety
+  # margin against a passing thumb homing a real robot, so shorten it with
+  # care. The dwell runs from the *second* thumb up, so a staggered pair still
+  # holds both hands committed for the full time.
+  dwell_s: 1.0
+
+# sim_viz.py only — ignored by the RPC path.
+sim:
+  ik_rate_hz: 100          # whole-body solve rate
+  base_posture_cost: 1.0e-4  # raise toward 5e-2 to make the chassis a last resort
+  solver: pyqpmad          # QP backend; qpsolvers names work too (daqp, ...)
+  viser_port: 8080         # browser UI
+  share: false             # request a public share URL

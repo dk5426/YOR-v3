@@ -20,6 +20,14 @@ scipy==1.16.3        # pose maths in base.py
 # Optional: only the gamepad teleop backend and joystick.py need this.
 # pygame
 
+# Optional: only the Aria hand-teleop backend needs these, and only its
+# in-process sim viewer (robot/teleop/aria/sim_viz.py) at that. The RPC path
+# (--input aria) adds NO new dependency -- it needs mujoco, mink and commlink,
+# all of which are already required above. The Aria publisher itself is NOT
+# here: it stays in the aria2robot repo, which owns the projectaria SDKs.
+# viser==1.0.28       browser 3-D viewer
+# mjviser==0.0.14     renders the MuJoCo scene into viser
+
 # ── SLAM / navigation ───────────────────────────────────────────────────────
 # Needed by robot/odin_pub_node.py and robot/slam_node_.py only; the solver,
 # simulation and teleop stack above run without any of it.

@@ -62,6 +62,7 @@ class YORMujoco:
         self.model = self.ik.model
         self.data = self.ik.data
         self._init_swerve_animation()
+        self._init_target_markers()
 
         # ── Launch Viewer ─────────────────────────────────────────────────────
         self.viewer = mujoco.viewer.launch_passive(
@@ -79,6 +80,10 @@ class YORMujoco:
         T_l, T_r = self.ik.forward_kinematics()
         self.left_ee_target: mink.SE3 = T_l.copy()
         self.right_ee_target: mink.SE3 = T_r.copy()
+        # Start the markers on the hands, not on the XML's default pose
+        self._draw_ik_targets(T_l, T_r)
+        mujoco.mj_forward(self.model, self.data)
+
         # Home poses (for home_left_arm / home_right_arm RPC)
         self._home_left: mink.SE3 = T_l.copy()
         self._home_right: mink.SE3 = T_r.copy()
@@ -311,6 +316,7 @@ class YORMujoco:
                 )
                 self.ik.update_configuration(self.data.qpos)
                 self._animate_swerve(np.zeros(3))
+                self._draw_ik_targets(T_l, T_r)
                 mujoco.mj_forward(self.model, self.data)
                 with self.target_lock:
                     self._last_base_velocity = np.zeros(3)
@@ -348,6 +354,7 @@ class YORMujoco:
                     )
                 self.ik.update_configuration(self.data.qpos)
                 self._animate_swerve(np.zeros(3))
+                self._draw_ik_targets(T_l, T_r)
                 mujoco.mj_forward(self.model, self.data)
                 with self.target_lock:
                     self._last_base_velocity = np.zeros(3)
@@ -371,6 +378,7 @@ class YORMujoco:
             # Apply in Kinematic Mode
             self.ik.apply_to_sim_kinematic(self.data, result)
             self._animate_swerve(result.base_velocity)
+            self._draw_ik_targets(T_l, T_r)
             mujoco.mj_forward(self.model, self.data)
 
             with self.target_lock:
@@ -384,6 +392,40 @@ class YORMujoco:
             abandoned_home = self._homing_request
         if abandoned_home is not None:
             self._finish_arm_home(abandoned_home, False)
+
+    # ── IK target visualization ─────────────────────────────────────────────
+
+    def _init_target_markers(self) -> None:
+        """Cache the mocap ids of the scene's draggable IK-target bodies.
+
+        The scene ships a green (left) and magenta (right) sphere-plus-triad,
+        but nothing here ever wrote to them, so they sat at their XML defaults
+        and read as a target the solver was ignoring.  A scene without them
+        still runs -- the markers are just not drawn.
+        """
+        self._target_mocap_ids: dict[str, int] = {}
+        for side in ("left", "right"):
+            try:
+                self._target_mocap_ids[side] = int(
+                    self.model.body(f"{side}_ik_target").mocapid[0]
+                )
+            except KeyError:
+                print(f"[sim] scene has no {side}_ik_target; target not drawn")
+
+    def _draw_ik_targets(self, T_l: mink.SE3, T_r: mink.SE3) -> None:
+        """Park the marker triads on the poses the solver is chasing this tick.
+
+        These are the raw arm-flange targets, so the offset you see between a
+        marker and the hand it carries is the tracking error plus nothing else.
+        Written every tick, which also means dragging a marker in the viewer no
+        longer does anything -- the teleop client owns the target here.
+        """
+        for side, T in (("left", T_l), ("right", T_r)):
+            mid = self._target_mocap_ids.get(side)
+            if mid is None:
+                continue
+            self.data.mocap_pos[mid] = T.translation()
+            self.data.mocap_quat[mid] = T.rotation().wxyz
 
     # ── Swerve visualization ────────────────────────────────────────────────
 

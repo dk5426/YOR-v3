@@ -26,3 +26,9 @@ neer_odin_v2-main/
 # Logs over GitHub's 100 MiB per-file cap - kept on the robot only
 artifacts/wholebody_logs/trajectories/traj_20260825_114654.csv
 artifacts/wholebody_logs/swerve/swerve_20260825_195800.csv
+
+CLAUDE.md
+.vscode/
+
+# Sim console logs
+artifacts/wholebody_logs/yor_mujoco_*.log

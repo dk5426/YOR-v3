@@ -16,6 +16,12 @@ Input backends (pick with --input):
             The default. Pose filtering is off by default (--pose-filter
             turns the 1€ filter back on; tune it with --filter-min-cutoff
             / --filter-beta).
+  aria      Project Aria hand tracking, via the aria2robot publisher's
+            `wuji` topic. Arms only -- no gripper. The shaka gesture is
+            the per-arm clutch. Settings live in config/aria_teleop.yaml
+            (--aria-config), not on the command line. Full 20-DOF fingers
+            are rendered by robot/teleop/aria/sim_viz.py, which runs its
+            own in-process sim and needs no RPC server.
 
 Run
 ---
@@ -48,18 +54,17 @@ import select
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-
-import numpy as np
 
 import mink
+import numpy as np
 
 _REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO))
 
 from commlink import RPCClient
+
 from robot.teleop.filters import PoseFilter
 
 # Quest tracking arrives at approximately 72 Hz (may change -- unconfirmed) and
@@ -109,16 +114,16 @@ class TeleopState:
 @dataclass
 class TeleopCommand:
     """What an input source wants this tick. None = leave unchanged."""
-    left_target: Optional[mink.SE3] = None
-    right_target: Optional[mink.SE3] = None
-    lift_target: Optional[float] = None
+    left_target: mink.SE3 | None = None
+    right_target: mink.SE3 | None = None
+    lift_target: float | None = None
     # Gripper: 1.0 open, 0.0 closed. Set only on a change, never every tick --
     # the server applies a gripper value by sending the arm a joint target of
     # its *measured* pose, which competes with the interpolated targets the
     # whole-body dispatch loop is streaming. One command per open/close is a
     # blip the next dispatch tick corrects; one per tick would fight it.
-    left_gripper: Optional[float] = None
-    right_gripper: Optional[float] = None
+    left_gripper: float | None = None
+    right_gripper: float | None = None
     home_left: bool = False
     home_right: bool = False
     home_arms: bool = False
@@ -399,7 +404,7 @@ class OculusSource(InputSource):
         # Last gripper value actually sent per side, so update() can send on
         # change only. Cleared on disengage: whatever the operator holds when
         # they re-engage is then re-sent, rather than assumed still in effect.
-        self._gripper_sent: dict[str, Optional[float]] = {"left": None, "right": None}
+        self._gripper_sent: dict[str, float | None] = {"left": None, "right": None}
 
     def start(self) -> None:
         import zmq  # deferred so keyboard mode needs no zmq
@@ -624,7 +629,7 @@ class WholeBodyTeleop:
               f"fix_base={self.state.fix_base}, "
               f"collisions={self.state.collision_avoidance}")
 
-    def _server_state(self) -> Optional[dict]:
+    def _server_state(self) -> dict | None:
         """One get_state() RPC, or None on any failure (never raises)."""
         try:
             srv = self.yor.get_state()
@@ -745,7 +750,7 @@ class WholeBodyTeleop:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    parser.add_argument("--input", choices=["keyboard", "gamepad", "oculus"],
+    parser.add_argument("--input", choices=["keyboard", "gamepad", "oculus", "aria"],
                         default="oculus", help="input backend (default: %(default)s)")
     parser.add_argument("--target", choices=["sim", "hw"], default="hw",
                         help="which whole-body server to drive (sets the default "
@@ -782,6 +787,11 @@ def main() -> None:
                              "(com.GRAIL.YORTeleop, Left|Right) instead of "
                              "v0.2's (com.GRAIL.Yor_Teleop, Head|Left|Right) "
                              "-- default is v0.2")
+    parser.add_argument("--aria-config", default=None,
+                        help="Aria teleop settings (aria input only). Default: "
+                             "config/aria_teleop.yaml -- host, hand, scale, "
+                             "clutch and lift behaviour all live there, "
+                             "commented.")
     parser.add_argument("--step", type=float, default=0.02,
                         help="keyboard nudge step in metres")
     args = parser.parse_args()
@@ -792,6 +802,12 @@ def main() -> None:
         source = KeyboardSource(step=args.step)
     elif args.input == "gamepad":
         source = GamepadSource()
+    elif args.input == "aria":
+        from robot.teleop.aria.config import AriaConfig
+        from robot.teleop.aria.source import AriaSource
+        cfg = AriaConfig.load(args.aria_config)
+        print(cfg.describe())
+        source = AriaSource.from_config(cfg)
     else:
         source = OculusSource(host=args.oculus_host,
                               pose_filter=args.pose_filter,
