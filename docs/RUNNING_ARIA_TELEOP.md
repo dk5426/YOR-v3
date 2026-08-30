@@ -52,16 +52,28 @@ python -m aria2robot.stream_pub --wifi
 mjpython robot/yor_mujoco.py      # sim,   :8081
 python robot/yor.py               # robot, :5557 (on the robot)
 
-# 3. the client — on the operator machine
+# 3. the client — same machine as step 1, so publisher.host defaults to localhost
 python robot/teleop/wholebody_teleop.py --input aria --target sim      # sim
 python robot/teleop/wholebody_teleop.py --input aria --host <robot-ip> # robot
+
+# 3'. the client somewhere else — on the robot, say, with the publisher remote
+python robot/teleop/wholebody_teleop.py --input aria \
+    --host localhost --pub-host <publisher-ip>
 ```
 
 `--target hw` is the default, so the robot form is the shorter one. Nothing on
 the robot changes between Aria and Quest — the backend is entirely client-side.
 
-**`publisher.host` is not `--host`.** The first is where step 1 runs, and lives
-in the YAML; the second is the robot. They are usually different machines.
+**`--pub-host` is not `--host`.** The first is where step 1 runs; the second is
+the robot's RPC server. They are usually different machines. `--pub-host`
+overrides `publisher.host` for one run and nothing else, so the config file
+stays the description of a *session* rather than of a network.
+
+Which machine should run the client? Prefer the **robot**. The RPC client is a
+blocking `zmq.REQ` (`commlink/rpc_client.py:25`), so every tick is a round trip
+and WiFi stalls the 30 Hz loop directly; the hand stream is one-way PUB/SUB that
+already drains to the newest sample and has a staleness gate, so it is the link
+that should cross the network. On a good LAN either placement works.
 
 Arms only: this backend never commands the base, and touches the lift exactly
 once (§5).
@@ -70,14 +82,22 @@ once (§5).
 
 ## 2. Configuration
 
-One flag, `--aria-config` (`--config` in `sim_viz.py`). Everything else is
+Two flags: `--aria-config` (`--config` in `sim_viz.py`) picks the file, and
+`--pub-host` overrides `publisher.host` for one run. Everything else is
 [config/aria_teleop.yaml](../../../config/aria_teleop.yaml), which is commented
 in full and shared by both entry points. **Edit the YAML, not the command
-line.**
+line** — `--pub-host` is the exception because it is the one setting that
+follows the machine you happen to be on rather than the session you are
+running. The startup line echoes what it resolved, so a typo is visible
+immediately:
+
+```
+[aria] config aria_teleop.yaml: 10.21.63.99:5555 hand=both scale=1.0 …
+```
 
 | Key | Default | Effect |
-|-----|---------|--------|
-| `publisher.host` / `.port` | `localhost` / `5555` | where the publisher is |
+| ----- | --------- | -------- |
+| `publisher.host` / `.port` | `localhost` / `5555` | where the publisher is; `--pub-host` overrides the host per run |
 | `publisher.stale_s` | `0.5` | release if the publisher goes quiet this long; `0` disables |
 | `mapping.hand` | `both` | the idle arm is never commanded |
 | `mapping.position_scale` | `1.0` | robot EE travel per metre of wrist travel |
@@ -110,7 +130,7 @@ that anchor, and **rotation and translation are read in different frames** — t
 same split Quest makes:
 
 | | Frame | What that buys |
-|---|---|---|
+| --- | --- | --- |
 | **Rotation** | your wrist, at engage | turning your hand about one of its own axes turns the robot's hand about the matching one, whatever either was doing at engage |
 | **Translation** | the world, heading from engage | **up is up** — raising your hand raises the EE at every engage pose |
 
@@ -179,7 +199,7 @@ in this backend come from collapsing them.
 ### Who detects which gesture
 
 | Gesture | Detected in | On the wire | Effect |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **shaka** | the **publisher** (aria2robot `utils/gesture.py`, latched by `PauseToggle`, `stream_pub --shaka-dwell-s`, default 0.5 s) | a per-side `paused` bool | publisher stops retargeting fingers; this client releases that arm's clutch |
 | **thumbs up** | **here** (`gesture.py`), read off the published `kp_mp` landmarks | *nothing* — no field, no publisher change | `home_arms` |
 
@@ -201,7 +221,7 @@ Pausing skips **one call**, `retarget()`. Everything else in the payload keeps
 being computed and published:
 
 | Field | While paused |
-|---|---|
+| --- | --- |
 | `kp_mp`, `kp_mp_scaled` | **live** — recomputed every tick |
 | `T_device_hand` | **live** — derived from the landmarks (`mano_wrist_frame`), not from the retargeted joints |
 | `qpos` (20 finger angles) | **frozen, not dropped** — the last retargeted value, republished unchanged |
@@ -325,9 +345,9 @@ both rendering fixes — the marker one measured as 0.0000 mm on the hand versus
 ## 8. Troubleshooting
 
 | Symptom | Cause / Fix |
-|---|---|
+| --- | --- |
 | `publisher sends T_device_wrist but no T_device_hand` | The publisher is old. `T_device_wrist` is Aria's own frame — different origin, different convention. That side stays disengaged until `stream_pub` is updated. |
-| Nothing arrives; no `[aria] subscribing …` follow-through | `publisher.host` points at the wrong machine, or step 1 is not running. It is *not* `--host`. |
+| Nothing arrives; no `[aria] subscribing …` follow-through | `publisher.host` points at the wrong machine, or step 1 is not running. It is *not* `--host` — pass `--pub-host` and check the config line it echoes at startup. |
 | Arm releases on its own mid-motion | `publisher.stale_s` fired — the publisher went quiet. commlink hands back the last payload forever, so without this gate a dead publisher leaves the arm holding a target you cannot release by gesture. |
 | Arm keeps moving after you shaka off | Working as designed, and the thing to internalise: disengaging stops *new* targets, and the last one is a standing goal the controller keeps solving toward. See §4. |
 | Fingers sit at the model default until you first engage | The publisher republishes the last `qpos` while paused and has none before the first unpause. §4. |

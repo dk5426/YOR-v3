@@ -19,7 +19,9 @@ Input backends (pick with --input):
   aria      Project Aria hand tracking, via the aria2robot publisher's
             `wuji` topic. Arms only -- no gripper. The shaka gesture is
             the per-arm clutch. Settings live in config/aria_teleop.yaml
-            (--aria-config), not on the command line. Full 20-DOF fingers
+            (--aria-config), not on the command line -- except --pub-host,
+            which overrides publisher.host because that is the one thing
+            that moves per run. Full 20-DOF fingers
             are rendered by robot/teleop/aria/sim_viz.py, which runs its
             own in-process sim and needs no RPC server.
 
@@ -792,6 +794,12 @@ def main() -> None:
                              "config/aria_teleop.yaml -- host, hand, scale, "
                              "clutch and lift behaviour all live there, "
                              "commented.")
+    parser.add_argument("--pub-host", default=None,
+                        help="override the Aria config's publisher.host (aria "
+                             "input only) -- the machine running stream_pub, "
+                             "which is not --host, the robot. The one setting "
+                             "that changes per run when the client and the "
+                             "publisher are on different machines.")
     parser.add_argument("--step", type=float, default=0.02,
                         help="keyboard nudge step in metres")
     args = parser.parse_args()
@@ -806,6 +814,8 @@ def main() -> None:
         from robot.teleop.aria.config import AriaConfig
         from robot.teleop.aria.source import AriaSource
         cfg = AriaConfig.load(args.aria_config)
+        if args.pub_host:
+            cfg.publisher["host"] = args.pub_host
         print(cfg.describe())
         source = AriaSource.from_config(cfg)
     else:
