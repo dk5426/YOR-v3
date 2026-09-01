@@ -15,14 +15,20 @@ _REPO = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = _REPO / "config" / "aria_teleop.yaml"
 
 DEFAULTS: dict[str, dict[str, Any]] = {
-    "publisher": {"host": "localhost", "port": 5555, "stale_s": 0.5},
+    "publisher": {"host": "localhost", "port": 5555, "stale_s": 0.5,
+                  "clock_port": 5556, "stats": True},
     "mapping": {"hand": "both", "position_scale": 1.0,
                 "follow_orientation": True, "translation_frame": "world",
                 "scene": "description/scene_wholebody.xml"},
     "clutch": {"reseed": True, "hold_lift": True},
-    "home": {"gesture": True, "dwell_s": 1.0},
+    "home": {"gesture": True},
     "sim": {"ik_rate_hz": 100, "base_posture_cost": 1e-4, "solver": "pyqpmad",
             "viser_port": 8080, "share": False},
+    # robot/hand/hands.py -- the finger path, which both nodes own in-process
+    # and which reads this same publisher on a thread of its own.
+    "hand": {"backend": "none", "serial": {"left": "", "right": ""},
+             "rpc_port": 5558, "rate_hz": 100, "ramp_s": 1.5,
+             "lowpass_hz": 5.0},
 }
 
 
@@ -38,7 +44,13 @@ class AriaConfig:
         self.path = path
         for section, defaults in DEFAULTS.items():
             merged = dict(defaults)
-            merged.update(data.get(section) or {})
+            given = data.get(section) or {}
+            merged.update(given)
+            # `hand.serial` is the one nested mapping; a file that names only
+            # one side would otherwise drop the other key entirely
+            for key, value in defaults.items():
+                if isinstance(value, dict) and isinstance(given.get(key), dict):
+                    merged[key] = {**value, **given[key]}
             setattr(self, section, merged)
         scene = Path(self.mapping["scene"])
         self.mapping["scene"] = scene if scene.is_absolute() else _REPO / scene

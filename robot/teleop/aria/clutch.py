@@ -34,7 +34,7 @@ it is — but a publisher that ever changes that makes "up" mean something else,
 which is why the axis is named here and overridable from the config.
 
 The operator's frame is the WUJI hand root — the frame the operator's hand URDF
-is drawn at, published as `T_device_hand` — not Aria's own `transform_device_wrist`.
+is drawn at, published as `T_odom_hand` — not Aria's own `transform_device_wrist`.
 That choice is what makes the mapping exact rather than measured: the robot wears
 the same WUJI hand, so both ends of the mapping are the same physical frame on the
 same hand model, and the operator's wrist landmark lands on the robot's hand base
@@ -150,7 +150,7 @@ class Clutch:
             an arc rather than pivoting in place. Zero means the two coincide.
 
     `wrist_offset` is the only lever arm here, and it is rigid — read off the
-    model. The operator side needs none: `T_device_hand`'s origin already *is*
+    model. The operator side needs none: `T_odom_hand`'s origin already *is*
     the wrist landmark the hand is drawn from.
     """
 
@@ -221,7 +221,7 @@ class Clutch:
         """Anchor to the current hand pose and end-effector pose.
 
         `T_odom_wrist` is the operator's WUJI hand-root pose in odom — the
-        published `T_device_hand` composed with `T_odom_device`, not Aria's own
+        published `T_odom_hand`, which the publisher composes, not Aria's own
         wrist frame.
         """
         T = np.asarray(T_odom_wrist, dtype=np.float64)
@@ -262,31 +262,6 @@ class Clutch:
         self._ee_engage = None
         self._wrist_engage = None
         self._A_t = None
-
-    def map_points(
-        self, points_odom: np.ndarray, T_odom_wrist: np.ndarray
-    ) -> np.ndarray | None:
-        """Map odom-frame points into robot world through the engaged mapping.
-
-        Placed *through the mapped hand frame*: the landmarks are read in the
-        operator's current wrist axes and hung off `operator_frame`. That is
-        `wrist_target`'s own path, so a wrong convention shows up on screen —
-        the overlay comes out mirrored or rotated 90° — rather than being
-        inferred from a misbehaving arm. It also keeps the drawn hand the size
-        of a hand: `position_scale` moves the wrist, it does not shrink the
-        fingers.
-
-        Needs the wrist pose because translation and rotation no longer share
-        one matrix — under `translation_frame="world"` the hand's position and
-        its orientation come from different maps.
-        """
-        frame = self.operator_frame(T_odom_wrist)
-        if frame is None:
-            return None
-        T = np.asarray(T_odom_wrist, dtype=np.float64)
-        pts = np.asarray(points_odom, dtype=np.float64)
-        local = (pts - T[:3, 3]) @ T[:3, :3] @ self._C.T
-        return frame.translation() + local @ frame.rotation().as_matrix().T
 
     def travel(self, T_odom_wrist: np.ndarray) -> np.ndarray | None:
         """Where the hand went since engage, in robot world axes, scaled.

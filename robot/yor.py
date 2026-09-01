@@ -15,17 +15,17 @@
 # (manual_override_timeout_s), so the two controllers never fight over the
 # same actuator.
 
-import sys
 import argparse
+import atexit
 import functools
 import json
+import sys
 import threading
 import time
-import numpy as np
-import mink
-import atexit
 from pathlib import Path
-from typing import Optional
+
+import mink
+import numpy as np
 
 # Add project root to sys.path
 _HERE = Path(__file__).parent
@@ -33,18 +33,25 @@ _ROOT = _HERE.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from commlink import RPCServer
+
+from nerolib import FirmwareVersion
 from robot.arm.arm import ArmNode
-from robot.base import BaseController
-from robot.base_motor import DRIVE_VEL_SCALE as _DRIVE_VEL_SCALE, MODULE_ORDER
-from robot.wholebody_control import WholeBodyController, WholeBodyHardwareConfig
-from robot.swerve_log import DEFAULT_HZ as SWERVE_LOG_HZ, SwerveRecorder
 from robot.arm.wholebody_ik import WholeBodyIKConfig
+from robot.base import BaseController
+from robot.base_motor import DRIVE_VEL_SCALE as _DRIVE_VEL_SCALE
+from robot.base_motor import MODULE_ORDER
+from robot.hand.hands import Hands, add_hand_args, hands_from_args
+from robot.swerve_log import DEFAULT_HZ as SWERVE_LOG_HZ
+from robot.swerve_log import SwerveRecorder
+from robot.wholebody_control import WholeBodyController, WholeBodyHardwareConfig
 from tools.base_pid_preflight import (
-    COMMISSIONED_MANIFEST, DEFAULT_MANIFEST, STOCK_MANIFEST, drive_command_scale,
+    COMMISSIONED_MANIFEST,
+    DEFAULT_MANIFEST,
+    STOCK_MANIFEST,
+    drive_command_scale,
     sync_from_manifest,
 )
-from commlink import RPCServer
-from nerolib import FirmwareVersion
 
 THOR_IP = '192.168.1.11'
 
@@ -75,22 +82,23 @@ def require_wholebody(func):
     return wrapper
 
 
-class YOR():
+class YOR:
     def __init__(
         self,
         base_max_vel=np.array((1.0, 1.0, 1.57)),
         base_max_accel=np.array((1.0, 1.0, 1.57)),
         no_arms: bool = False,
         wholebody: bool = True,
-        wholebody_config: Optional[WholeBodyHardwareConfig] = None,
-        ik_config: Optional[WholeBodyIKConfig] = None,
+        wholebody_config: WholeBodyHardwareConfig | None = None,
+        ik_config: WholeBodyIKConfig | None = None,
         flash_base_pid: bool = True,
-        base_pid_manifest: Optional[Path] = None,
+        base_pid_manifest: Path | None = None,
         restore_base_pid: bool = True,
-        base_pid_stock_manifest: Optional[Path] = None,
+        base_pid_stock_manifest: Path | None = None,
         swerve_log: bool = True,
         swerve_log_hz: float = SWERVE_LOG_HZ,
         gripper: str = "none",
+        hands: Hands | None = None,
     ):
         self._initialized = False
         self._flash_base_pid = bool(flash_base_pid)
@@ -99,7 +107,7 @@ class YOR():
         self._base_pid_provenance = "unknown"
         self._swerve_log = bool(swerve_log)
         self._swerve_log_hz = float(swerve_log_hz)
-        self._swerve_recorder: Optional[SwerveRecorder] = None
+        self._swerve_recorder: SwerveRecorder | None = None
         self._base_pid_stock_manifest = (
             Path(base_pid_stock_manifest) if base_pid_stock_manifest
             else STOCK_MANIFEST
@@ -145,7 +153,12 @@ class YOR():
         self.no_arms = no_arms
         self.left_arm = None
         self.right_arm = None
-        self.wholebody: Optional[WholeBodyController] = None
+        # The WUJI fingers, in this process but off this RPC socket: they
+        # arrive on the aria2robot publisher, on a thread of their own, so a
+        # finger target never queues behind a 30 Hz arm target. See
+        # robot/hand/hands.py.
+        self.hands: Hands | None = hands
+        self.wholebody: WholeBodyController | None = None
         self._wholebody_requested = wholebody and not no_arms
         self._wholebody_config = wholebody_config
         self._ik_config = ik_config
@@ -275,6 +288,32 @@ class YOR():
             if not self.wholebody.config.enable_lift_motion:
                 self.wholebody.ik.toggle_fix_lift(True)
             self.wholebody.start()
+
+        # Last, after the arms have homed: the first pose an engaged operator
+        # sends is a whole grasp, and nothing should be closing a hand while
+        # an arm is still travelling to home.
+        #
+        # Never fatal. Everything above this raises for a living, and rightly
+        # so -- a lift that did not home has no absolute zero and an arm that
+        # did not home cannot be driven. The hands are an accessory, and by
+        # this point the expensive part is done: a missing wujihandpy, an
+        # unprovisioned ~/.wuji, a wrong serial or a busy USB device must not
+        # throw away a completed 30-60 s homing cycle and leave the operator
+        # with nothing. Drop them and run the arms.
+        if self.hands is not None:
+            try:
+                self.hands.start()
+            except Exception as exc:
+                print(f"[YOR] hands failed to start ({exc!r})")
+                print("[YOR] continuing WITHOUT fingers; the arms are unaffected")
+                # A partial open leaves one hand energised and unowned.
+                # Hands.stop() marks itself started before the driver opens, so
+                # this reaches the driver's close() and disables whatever came up.
+                try:
+                    self.hands.stop()
+                except Exception as stop_exc:
+                    print(f"[YOR] hands cleanup also failed ({stop_exc!r})")
+                self.hands = None
 
     def _sync_base_pid_gains(self) -> None:
         """Bring the swerve controllers to the selected PID manifest.
@@ -724,7 +763,7 @@ class YOR():
         return {"available": False}
 
     @require_initialization
-    def lift_position_known(self) -> Optional[bool]:
+    def lift_position_known(self) -> bool | None:
         """Whether the lift controller has an established zero.
 
         False means every height it reports is meaningless — run lift_home().
@@ -843,6 +882,12 @@ class YOR():
         previous_fix_lift = False
         previous_collisions = True
         try:
+            # Home means "return to a known pose", and the hand is part of
+            # that. First, before the lift moves, so anything being held falls
+            # from where it is rather than from 450 mm up. Safe as a gesture
+            # because the home gesture needs both hands *released*.
+            if self.hands is not None:
+                self.hands.open_hands(sides)
             if active_wholebody is not None:
                 previous_fix_base = bool(active_wholebody.ik.fix_base)
                 previous_fix_lift = bool(active_wholebody.ik.fix_lift)
@@ -957,6 +1002,19 @@ class YOR():
             return {}
         state = self.wholebody.get_state()
         state["lift"] = self.get_lift_position()
+        # Reported here, though not commanded here, so one get_state() is a
+        # snapshot of the whole robot -- arms and fingers -- at one instant.
+        hand = self.hands.targets() if self.hands is not None else {}
+        for side in ("left", "right"):
+            q = hand.get(side)
+            state[f"{side}_hand_qpos"] = None if q is None else q.tolist()
+        # The rest of what `Hands` knows -- engagement, where the pose came
+        # from, and the cumulative count of writes that reached the driver.
+        # A total, not a rate: the client differentiates it across redraws.
+        state["hands"] = (
+            None if self.hands is None
+            else {k: v for k, v in self.hands.get_hand_state().items()
+                  if k != "qpos"})
         return state
 
     @require_initialization
@@ -1075,7 +1133,12 @@ class YOR():
 
     @require_initialization
     def emergency_stop(self):
-        """Freeze everything: wheels stopped, lift stopped, arms held in place."""
+        """Freeze wheels, lift and arms in place. The hands hold their grasp.
+
+        Deliberately: a stop that sprang an open hand would drop whatever is
+        being carried. `graceful_shutdown` is what ramps them open, when the
+        arms are already coming down.
+        """
         if self.wholebody is not None:
             self.wholebody.emergency_stop()
         self.base_controller.mode = "BASE_VEL"
@@ -1575,6 +1638,7 @@ def main():
         help="[S7] skip the per-solve sigma_min/manipulability/swivel/"
              "collision-row diagnostics (on by default; two 6x7 SVDs per "
              "solve)")
+    add_hand_args(parser)
     args = parser.parse_args()
 
     if not args.no_console_log:
@@ -1745,6 +1809,7 @@ def main():
         swerve_log_hz=args.swerve_log_hz,
         base_pid_stock_manifest=args.base_pid_stock_manifest,
         gripper=args.gripper,
+        hands=hands_from_args(args),
     )
     server = None
     shutdown_started = False
@@ -1776,6 +1841,10 @@ def main():
 
         if yor.wholebody is not None:
             attempt("whole-body stop", yor.wholebody.stop)
+
+        # Before the arms drop: ramp the fingers open and disable them.
+        if yor.hands is not None:
+            attempt("hands stop", yor.hands.stop)
 
         # Stop hardware workers before RPC teardown/interpreter shutdown so
         # PicoLift cannot keep reconnecting after Ctrl-C.

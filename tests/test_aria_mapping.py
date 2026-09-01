@@ -31,16 +31,10 @@ from robot.teleop.aria.clutch import (
     Clutch,
     convention_matrix,
 )
-from robot.teleop.aria.gesture import (
-    HoldTrigger,
-    HomeGesture,
-    bend_ratios,
-    is_thumbs_up,
-)
 from robot.teleop.aria.stream import (
     AriaHandStream,
+    HomeSeqWatcher,
     canonical_joint_names,
-    landmarks_in_world,
 )
 
 SIDES = ("left", "right")
@@ -65,28 +59,6 @@ def _pose(rotation: np.ndarray, position: Sequence[float]) -> np.ndarray:
     T[:3, :3] = rotation
     T[:3, 3] = position
     return T
-
-
-def _hand(rotation: np.ndarray, origin: Sequence[float]) -> np.ndarray:
-    """(21, 3) landmarks whose [0] IS the frame origin, posed by `rotation`.
-
-    That identity is the wire contract: `T_device_hand`'s origin is the wrist
-    landmark `kp_mp[0]`, which is what makes the overlay's wrist dot and the
-    commanded wrist the same point at every pose rather than only at engage.
-    The remaining landmarks are filled in along the fingers so the array is the
-    right shape and a wrong index shows up as a wrong answer, not a crash.
-    """
-    middle, palm_out = np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])
-    thumb = np.cross(middle, palm_out)
-    kp = np.zeros((21, 3))
-    kp[9] = 0.09 * middle
-    kp[5] = 0.09 * middle + 0.02 * thumb
-    kp[13] = 0.085 * middle - 0.02 * thumb
-    kp[17] = 0.08 * middle - 0.04 * thumb
-    kp[1:5] = np.linspace(0.02, 0.07, 4)[:, None] * thumb
-    for mcp, tip in ((5, 8), (9, 12), (13, 16), (17, 20)):
-        kp[mcp + 1: tip + 1] = kp[mcp] + np.linspace(0.02, 0.07, 3)[:, None] * middle
-    return kp @ rotation.T + np.asarray(origin, dtype=np.float64)
 
 
 _MODEL = None
@@ -486,13 +458,12 @@ def test_wrist_offset():
     check("offset leaves a pure push alone", close(moved[0], moved[1], 1e-12))
 
 
-def test_wrist_landmark_lands_on_the_ik_target():
-    print("\nWrist landmark vs the commanded wrist")
-    # The reported symptom, now structural: the wrist landmark sits on the
-    # commanded wrist at every pose, not just at engage. `T_device_hand`'s
-    # origin IS kp[0], so the overlay's wrist dot and the ik target coincide by
-    # construction — an origin taken from anywhere else would drift the moment
-    # the hand turns.
+def test_operator_frame_lands_on_the_ik_target():
+    print("\nOperator frame vs the commanded wrist")
+    # The overlay triad is the axis-correctness diagnostic now that the hand
+    # skeleton is gone, so it has to sit exactly on the commanded wrist — at
+    # every pose, not just at engage. A wrong row in either axis table shows up
+    # here as a rotation, and on screen as a mirrored triad.
     offset = np.array([0.0, 0.0375, 0.0])
     for side in SIDES:
         ee0 = mink.SE3.from_rotation_and_translation(
@@ -500,20 +471,24 @@ def test_wrist_landmark_lands_on_the_ik_target():
         R0, o0 = mink.SO3.from_z_radians(0.8).as_matrix(), [0.2, -0.3, 0.9]
         wrist_home = ee0.translation() + ee0.rotation().as_matrix() @ offset
         at_engage = tracks = True
-        # Both frames: under "world" the overlay's position and its orientation
-        # come from different maps, so this is exactly where they could diverge
+        # Both frames: under "world" position and orientation come from
+        # different maps, so this is exactly where they could diverge
         for frame in Clutch.TRANSLATION_FRAMES:
             c = Clutch(side, wrist_offset=offset, translation_frame=frame)
             c.engage(_pose(R0, o0), ee0)
-            at_engage &= close(c.map_points(_hand(R0, o0), _pose(R0, o0))[0],
+            at_engage &= close(c.operator_frame(_pose(R0, o0)).translation(),
                                wrist_home)
             for rpy, origin in (((0.5, 0.0, 0.8), [0.2, -0.3, 0.9]),
                                 ((-1.1, 0.7, 0.2), [0.3, 0.1, 1.0])):
                 R = mink.SO3.from_rpy_radians(*rpy).as_matrix()
-                tracks &= close(c.map_points(_hand(R, origin), _pose(R, origin))[0],
-                                c.wrist_target(_pose(R, origin)).translation())
-        check(f"{side} landmark is the robot's wrist at engage", at_engage)
-        check(f"{side} landmark tracks the commanded wrist at every pose", tracks)
+                got, want = c.operator_frame(_pose(R, origin)), c.wrist_target(
+                    _pose(R, origin))
+                tracks &= close(got.translation(), want.translation())
+                tracks &= close(got.rotation().as_matrix(),
+                                want.rotation().as_matrix())
+        check(f"{side} operator frame is the robot's wrist at engage", at_engage)
+        check(f"{side} operator frame tracks the commanded wrist everywhere",
+              tracks)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -524,30 +499,64 @@ def test_wire_decode():
     print("\nWire decode")
     T_od = _pose(mink.SO3.from_rpy_radians(0.3, -0.2, 1.1).as_matrix(),
                  [1.0, 2.0, 0.5])
-    T_dh = _pose(mink.SO3.from_z_radians(0.4).as_matrix(), [0.1, 0.2, 0.3])
-    kp = _hand(np.eye(3), [0.1, 0.2, 0.3])
+    T_oh = _pose(mink.SO3.from_z_radians(0.4).as_matrix(), [0.1, 0.2, 0.3])
+
     stream = AriaHandStream("localhost", sides=("left",))
     stream._ingest({
-        "T_odom_device": T_od,
-        "left": {"T_device_hand": T_dh, "kp_mp": kp,
-                 "qpos": np.zeros(20), "paused": False},
+        "wire": 2, "seq": 3, "home_seq": 0,
+        "left": {"T_odom_hand": T_oh.astype(np.float32),
+                 "qpos": np.zeros(20, np.float32), "paused": False},
     })
     s = stream.snapshot()["left"]
-    check("T_odom_wrist == T_odom_device @ T_device_hand",
-          close(s.T_odom_wrist, T_od @ T_dh))
-    check("landmarks are lifted into odom",
-          close(s.kp_odom, landmarks_in_world(kp, T_od), 1e-6))
+    check("T_odom_hand passes through as the wrist pose",
+          close(s.T_odom_wrist, T_oh, 1e-6))
+    # The wire is float32 because T_odom_device was; everything downstream of
+    # here does SE(3) algebra and wants float64.
+    check("the pose is upcast to float64",
+          s.T_odom_wrist.dtype == np.float64 and s.qpos.dtype == np.float64)
     check("paused passes through", s.paused is False)
+    check("home_seq is read off the envelope", stream.home_seq() == 0)
+
+    # A pre-wire-2 publisher still works, composed locally, for one release:
+    # the two repos deploy to different machines and "the arms do not move" is
+    # a worse thing to hand an operator than a warning.
+    T_dh = _pose(mink.SO3.from_z_radians(0.4).as_matrix(), [0.1, 0.2, 0.3])
+    stream = AriaHandStream("localhost", sides=("left",))
+    stream._ingest({"T_odom_device": T_od,
+                    "left": {"T_device_hand": T_dh, "paused": False}})
+    check("a pre-wire-2 publisher is composed locally",
+          close(stream.snapshot()["left"].T_odom_wrist, T_od @ T_dh))
+    check("and says so exactly once", stream._warned == {"wire1"})
+    check("with no home counter to act on", stream.home_seq() is None)
 
     # Never fall back to Aria's own wrist frame: its origin is a joint centre a
     # couple of cm off the landmark and its axes are a different convention.
     stream = AriaHandStream("localhost", sides=("left",))
-    stream._ingest({
-        "T_odom_device": T_od,
-        "left": {"T_device_wrist": T_dh, "kp_mp": kp, "paused": False},
-    })
-    check("a T_device_hand-less publisher leaves the side unfollowable",
+    stream._ingest({"T_odom_device": T_od,
+                    "left": {"T_device_wrist": T_dh, "paused": False}})
+    check("a hand-frame-less publisher leaves the side unfollowable",
           stream.snapshot()["left"].T_odom_wrist is None)
+
+
+def test_home_seq():
+    print("\nHome counter")
+    # A counter rather than an edge because PUB/SUB drops packets and this
+    # subscriber conflates them: an edge can be missed, a total cannot.
+    w = HomeSeqWatcher()
+    check("no counter yet never fires", not w.update(None))
+    check("joining a publisher mid-session adopts without firing",
+          not w.update(5))
+    check("an unchanged counter does not fire", not w.update(5))
+    check("an increase fires", w.update(6))
+    check("and only once", not w.update(6))
+    # buffer=False means the client routinely skips values. A jump of three is
+    # one gesture whose packets we did not see, not three requests -- homing
+    # twice in a row is a hardware hazard.
+    check("a jump of several fires exactly once", w.update(20))
+    check("still only once", not w.update(20))
+    # Same guard status.py puts on the cumulative `sends` total.
+    check("a restarted publisher resyncs without firing", not w.update(0))
+    check("and fires again from the new baseline", w.update(1))
 
 
 def test_staleness_gate():
@@ -555,10 +564,9 @@ def test_staleness_gate():
     # commlink's buffer=False subscriber hands back the last payload forever, so
     # a publisher that dies mid-motion would otherwise leave the clutch engaged
     # on a target the operator can no longer release by gesture.
-    T_od, T_dh = np.eye(4), np.eye(4)
+    T_oh = np.eye(4)
     stream = AriaHandStream("localhost", sides=("left",), stale_s=0.2)
-    stream._ingest({"T_odom_device": T_od,
-                    "left": {"T_device_hand": T_dh, "paused": False}})
+    stream._ingest({"left": {"T_odom_hand": T_oh, "paused": False}})
     check("fresh sample is not forced paused",
           stream.snapshot()["left"].paused is False)
     stream._t_recv -= 0.5
@@ -566,8 +574,7 @@ def test_staleness_gate():
           stream.snapshot()["left"].paused is True)
 
     stream = AriaHandStream("localhost", sides=("left",), stale_s=None)
-    stream._ingest({"T_odom_device": T_od,
-                    "left": {"T_device_hand": T_dh, "paused": False}})
+    stream._ingest({"left": {"T_odom_hand": T_oh, "paused": False}})
     stream._t_recv -= 10.0
     check("stale_s=None disables the gate",
           stream.snapshot()["left"].paused is False)
@@ -580,9 +587,11 @@ def test_staleness_gate():
 class _FakeStream:
     """Stands in for AriaHandStream so update() can be driven without commlink."""
 
-    def __init__(self, sample, right=None):
+    def __init__(self, sample, right=None, home_seq=None, meta=None):
         self.sample = sample
         self.right = right
+        self._home_seq = home_seq
+        self._meta = meta
 
     def start(self):
         pass
@@ -590,10 +599,20 @@ class _FakeStream:
     def stop(self):
         pass
 
+    def home_seq(self):
+        return self._home_seq
+
+    def meta(self):
+        return self._meta
+
+    def bump(self):
+        """The publisher completed a home gesture."""
+        self._home_seq = 1 if self._home_seq is None else self._home_seq + 1
+
     def snapshot(self):
         from robot.teleop.aria.stream import SideSample
         return {"left": self.sample,
-                "right": self.right or SideSample(None, None, None, True)}
+                "right": self.right or SideSample(None, None, True)}
 
 
 def test_aria_source():
@@ -619,8 +638,7 @@ def test_aria_source():
                                                    np.array([-0.3, -0.25, 0.4]))
     state = TeleopState(left_target=ee, right_target=other, lift_target=0.2)
     wrist = _pose(mink.SO3.from_z_radians(0.7).as_matrix(), [0.2, -0.3, 0.9])
-    sample = SideSample(wrist, _hand(np.eye(3), [0.2, -0.3, 0.9]),
-                        np.zeros(20), False)
+    sample = SideSample(wrist, np.zeros(20), False)
 
     src = AriaSource("localhost", hand="left")
     src._stream = _FakeStream(sample)
@@ -672,69 +690,62 @@ def test_aria_source():
     check("--no-clutch-reseed anchors on the local target",
           close(cmd.left_target.translation(), ee.translation()))
 
-    # Home: both thumbs up on *paused* hands, held. An engaged hand cannot
-    # ask, which is what makes this safe without a confirmation step.
-    up = _gesture_hand(extended=("thumb",))
-    flat_hand = _gesture_hand(extended=("thumb", "index", "middle",
-                                        "ring", "pinky"))
-    paused_up = SideSample(wrist, up, np.zeros(20), True)
-    paused_flat = SideSample(wrist, flat_hand, np.zeros(20), True)
+    # Home: the publisher detected both thumbs up on two released hands and
+    # bumped its counter. The dwell and the released gate ran up there; what
+    # is tested here is that the counter is acted on exactly once, and never
+    # while this side is still following a hand.
+    paused = SideSample(wrist, np.zeros(20), True)
+    engaged = SideSample(wrist, np.zeros(20), False)
 
-    def ticking(step: float = 1 / 30):
-        """A monotonic clock the test advances itself, so no dwell sleeps."""
-        t = [0.0]
+    def run(src, ticks=10):
+        return [c for c in (src.update(state, 1 / 30) for _ in range(ticks))
+                if c.home_arms or c.home_left or c.home_right]
 
-        def now() -> float:
-            t[0] += step
-            return t[0]
-        return now
-    src = AriaSource("localhost", hand="both", home_dwell_s=0.3)
-    src._stream = _FakeStream(paused_up, paused_up)
-    src._clock = ticking()
+    src = AriaSource("localhost", hand="both")
+    stream = _FakeStream(paused, paused, home_seq=0)
+    src._stream = stream
     src.start()
-    fired = [c for c in (src.update(state, 1 / 30) for _ in range(40))
-             if c.home_arms or c.home_left or c.home_right]
-    check("both thumbs up while paused runs the node's home_arms sequence",
+    check("an unchanged counter does not home", not run(src))
+    stream.bump()
+    fired = run(src)
+    check("a counter bump runs the node's home_arms sequence",
           len(fired) == 1 and fired[0].home_arms
           and not fired[0].home_left and not fired[0].home_right,
           f"{len(fired)} home commands")
+    check("and does not repeat while the counter holds", not run(src))
 
-    # One thumb is not a request: home_arms locks the base and drives the
-    # lift whichever arms it homes, so it takes both hands to ask for it
-    src = AriaSource("localhost", hand="both", home_dwell_s=0.3)
-    src._stream = _FakeStream(paused_up, paused_flat)
-    src._clock = ticking()
+    # Joining a publisher that has already homed must not home on connect.
+    src = AriaSource("localhost", hand="both")
+    src._stream = _FakeStream(paused, paused, home_seq=7)
     src.start()
-    check("one thumb never homes",
-          not any(c.home_arms or c.home_left or c.home_right
-                  for c in (src.update(state, 1 / 30) for _ in range(40))))
+    check("a counter that is merely nonzero at connect does not home",
+          not run(src))
 
-    engaged_up = SideSample(wrist, up, np.zeros(20), False)
-    src = AriaSource("localhost", hand="both", home_dwell_s=0.3)
-    src._stream = _FakeStream(engaged_up, paused_up)
-    src._clock = ticking()
+    # Belt and braces: the publisher required both sides paused, but "nothing
+    # is following either hand" is the whole safety argument and is worth
+    # asserting locally rather than trusting a remote definition of paused.
+    src = AriaSource("localhost", hand="both")
+    stream = _FakeStream(engaged, paused, home_seq=0)
+    src._stream = stream
     src.start()
-    check("a thumb on an ENGAGED hand never homes",
-          not any(c.home_arms or c.home_left or c.home_right
-                  for c in (src.update(state, 1 / 30) for _ in range(40))))
+    src.update(state, 1 / 30)          # engage the left clutch
+    stream.bump()
+    check("a bump while a hand is still engaged never homes", not run(src))
 
-    # A one-handed session cannot make the gesture at all
-    src = AriaSource("localhost", hand="left", home_dwell_s=0.3)
-    src._stream = _FakeStream(paused_up)
-    src._clock = ticking()
+    # A one-handed session cannot make the gesture at all, whatever arrives
+    src = AriaSource("localhost", hand="left")
+    src._stream = _FakeStream(paused, home_seq=0)
     src.start()
-    check("a single-hand session has no home gesture",
-          not src._home.available
-          and not any(c.home_arms or c.home_left
-                      for c in (src.update(state, 1 / 30) for _ in range(40))))
+    check("a single-hand session has no home gesture", src._home is None)
+    src._stream._home_seq = 9
+    check("and ignores a counter that moves", not run(src))
 
-    src = AriaSource("localhost", hand="both", home_gesture=False,
-                     home_dwell_s=0.3)
-    src._stream = _FakeStream(paused_up, paused_up)
+    src = AriaSource("localhost", hand="both", home_gesture=False)
+    stream = _FakeStream(paused, paused, home_seq=0)
+    src._stream = stream
     src.start()
-    check("home.gesture false disables it entirely",
-          not any(c.home_arms or c.home_left or c.home_right
-                  for c in (src.update(state, 1 / 30) for _ in range(40))))
+    stream.bump()
+    check("home.gesture false disables it entirely", not run(src))
 
     # Releasing when the publisher pauses, and no target while released
     src = AriaSource("localhost", hand="left")
@@ -797,8 +808,7 @@ def test_overlay_offset_ordering():
     text = (_REPO / "robot/teleop/aria/sim_viz.py").read_text()
     i_update = text.index("scene.update_from_mjdata(")
     i_sync = text.index("sync_overlay_offset()", i_update)
-    i_draw = min(text.index("draw_target_hand(side", i_update),
-                 text.index("draw_operator_frame(side", i_update))
+    i_draw = text.index("draw_operator_frame(side", i_update)
     check("update_from_mjdata → sync_overlay_offset → draw_*",
           i_update < i_sync < i_draw)
 
@@ -847,137 +857,6 @@ def test_config():
     check("an explicit path that is not there fails loudly", missing_raises)
 
 
-def _gesture_hand(extended: Sequence[str]) -> np.ndarray:
-    """(21, 3) landmarks with the named digits straight and the rest curled.
-
-    A curled finger is built by folding the last two landmarks back toward the
-    knuckle, which is what puts the bend cosine near +1; a straight one runs
-    out along the finger and sits near -1. Only the three landmarks each chain
-    reads have to be right, but the whole array is filled so a wrong index
-    reads as a wrong answer rather than a zero vector.
-    """
-    middle, palm_out = np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])
-    thumb_dir = np.cross(middle, palm_out)
-    kp = np.zeros((21, 3))
-    kp[9] = 0.09 * middle
-    kp[5] = 0.09 * middle + 0.02 * thumb_dir
-    kp[13] = 0.085 * middle - 0.02 * thumb_dir
-    kp[17] = 0.08 * middle - 0.04 * thumb_dir
-    if "thumb" in extended:
-        kp[1:5] = np.linspace(0.02, 0.07, 4)[:, None] * thumb_dir
-    else:
-        kp[1:4] = np.linspace(0.02, 0.05, 3)[:, None] * thumb_dir
-        kp[4] = kp[3] - 0.025 * thumb_dir + 0.004 * palm_out
-    for name, (mcp, tip) in zip(("index", "middle", "ring", "pinky"),
-                                ((5, 8), (9, 12), (13, 16), (17, 20))):
-        if name in extended:
-            kp[mcp + 1: tip + 1] = (kp[mcp]
-                                    + np.linspace(0.02, 0.07, 3)[:, None] * middle)
-        else:
-            kp[mcp + 1] = kp[mcp] + 0.03 * middle
-            kp[mcp + 2] = kp[mcp + 1] - 0.01 * middle - 0.02 * palm_out
-            kp[tip] = kp[mcp + 1] - 0.028 * middle - 0.01 * palm_out
-    return kp
-
-
-def test_home_gesture() -> None:
-    """Thumbs up is detected, distinct from the shaka, and gated on release."""
-    print("\nhome gesture")
-    up = _gesture_hand(extended=("thumb",))
-    shaka = _gesture_hand(extended=("thumb", "pinky"))
-    flat = _gesture_hand(extended=("thumb", "index", "middle", "ring", "pinky"))
-    fist = _gesture_hand(extended=())
-
-    check("thumbs up detected", is_thumbs_up(up),
-          " ".join(f"{k}={v:+.2f}" for k, v in bend_ratios(up).items()))
-    # The shaka is the disengage gesture; the two reading true together would
-    # make the publisher's toggle ambiguous
-    check("shaka is NOT thumbs up", not is_thumbs_up(shaka),
-          f"pinky={bend_ratios(shaka)['pinky']:+.2f}")
-    check("open hand is NOT thumbs up", not is_thumbs_up(flat))
-    check("fist is NOT thumbs up", not is_thumbs_up(fist),
-          f"thumb={bend_ratios(fist)['thumb']:+.2f}")
-    check("missing landmarks are not a gesture", not is_thumbs_up(None))
-    check("wrong shape is not a gesture", not is_thumbs_up(np.zeros((5, 3))))
-
-    # Bend cosines are dot products of differences, so a rigid transform of the
-    # whole hand must not change the verdict -- that is what lets the detector
-    # run on odom-frame landmarks with no calibration
-    R = Rotation.from_euler("xyz", [0.7, -1.1, 2.3]).as_matrix()
-    moved = up @ R.T + np.array([1.5, -2.0, 0.75])
-    check("detector is frame invariant", is_thumbs_up(moved),
-          f"thumb={bend_ratios(moved)['thumb']:+.2f}")
-
-    trig = HoldTrigger(dwell_s=1.0, release_s=0.2)
-    check("no fire before the dwell", not any(trig.update(True, t)
-                                              for t in (0.0, 0.5, 0.9)))
-    check("fires once the dwell completes", trig.update(True, 1.05))
-    check("does not repeat while held", not any(trig.update(True, t)
-                                                for t in (1.2, 2.0, 5.0)))
-    trig.update(False, 5.3)
-    check("re-arms only after release", trig.update(True, 6.4) is False
-          and trig.update(True, 7.5))
-
-    # A dropped tracking frame must not restart a genuine hold
-    trig2 = HoldTrigger(dwell_s=1.0, release_s=0.2)
-    trig2.update(True, 0.0)
-    trig2.update(False, 0.5)          # one bad frame
-    trig2.update(True, 0.55)
-    check("a dropped frame does not restart the hold", trig2.update(True, 1.05))
-
-    both_up = {"left": up, "right": up}
-    released = {"left": True, "right": True}
-
-    # The gate: a hand that is still driving an arm cannot ask for home
-    g = HomeGesture(SIDES, dwell_s=1.0)
-    engaged = {"left": False, "right": False}
-    check("engaged hands never home",
-          not any(g.update(both_up, engaged, t)
-                  for t in np.arange(0.0, 4.0, 0.1)))
-
-    g = HomeGesture(SIDES, dwell_s=1.0)
-    hits = [round(float(t), 2) for t in np.arange(0.0, 3.0, 0.05)
-            if g.update(both_up, released, t)]
-    check("both thumbs home both arms, once per hold",
-          len(hits) == 1 and 1.0 <= hits[0] <= 1.1, f"{hits}")
-
-    # Homing is all-or-nothing: home_arms locks the base and drives the lift
-    # to 450 mm whichever arms it homes, so one thumb must never ask for it
-    g = HomeGesture(SIDES, dwell_s=1.0)
-    one_up = {"left": up, "right": flat}
-    check("one thumb never homes",
-          not any(g.update(one_up, released, t)
-                  for t in np.arange(0.0, 4.0, 0.05)))
-
-    # Half a request stays half a request: dropping one thumb mid-dwell must
-    # not leave the other hand homing on its own
-    g = HomeGesture(SIDES, dwell_s=1.0)
-    check("dropping one thumb mid-hold cancels it",
-          not any(g.update(both_up if t < 0.5 else one_up, released, t)
-                  for t in np.arange(0.0, 4.0, 0.05)))
-
-    # The dwell runs from the *second* thumb, so a staggered pair still holds
-    # both hands committed for the full time
-    g = HomeGesture(SIDES, dwell_s=1.0)
-    hits = [round(float(t), 2) for t in np.arange(0.0, 3.0, 0.05)
-            if g.update(one_up if t < 0.5 else both_up, released, t)]
-    check("a staggered two-hand thumbs up dwells from the second thumb",
-          len(hits) == 1 and 1.5 <= hits[0] <= 1.6, f"{hits}")
-
-    # One hand released, one still driving an arm, is not a request either
-    g = HomeGesture(SIDES, dwell_s=1.0)
-    half_released = {"left": True, "right": False}
-    check("one hand still engaged never homes",
-          not any(g.update(both_up, half_released, t)
-                  for t in np.arange(0.0, 4.0, 0.05)))
-
-    g = HomeGesture(("left",), dwell_s=1.0)
-    check("a single-hand session cannot ask for home",
-          not g.available
-          and not any(g.update({"left": up}, {"left": True}, t)
-                      for t in np.arange(0.0, 4.0, 0.05)))
-
-
 def main() -> int:
     for test in (
         test_config,
@@ -990,11 +869,11 @@ def main() -> int:
         test_clutch_rotation,
         test_clutch_pinned_orientation,
         test_wrist_offset,
-        test_wrist_landmark_lands_on_the_ik_target,
+        test_operator_frame_lands_on_the_ik_target,
         test_wire_decode,
+        test_home_seq,
         test_staleness_gate,
         test_aria_source,
-        test_home_gesture,
         test_marker_rides_the_wrist,
         test_overlay_offset_ordering,
     ):

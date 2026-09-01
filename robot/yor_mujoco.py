@@ -1,22 +1,24 @@
-import threading
 import atexit
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Optional
-import numpy as np
 
+import mink
 import mujoco
 import mujoco.viewer
+import numpy as np
 from loop_rate_limiters import RateLimiter
-import mink
 
 # Inject the repo root into sys.path so 'robot' and 'commlink' import cleanly
 _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO))
 
-from robot.arm.wholebody_ik import WholeBodyIK, WholeBodyIKConfig, DEFAULT_SCENE
 from commlink import RPCServer
+
+from robot.arm.wholebody_ik import DEFAULT_SCENE, WholeBodyIK, WholeBodyIKConfig
+from robot.hand.hands import Hands, add_hand_args, hands_from_args
+from robot.hand.wuji_driver import canonical_joint_names
 
 
 class YORMujoco:
@@ -26,6 +28,13 @@ class YORMujoco:
     Runs WholeBodyIK (18 DOF: base + lift + 2×arms) in kinematic mode and
     serves the same RPC surface as the hardware node, so
     robot/teleop/wholebody_teleop.py drives either by changing only the port.
+
+    The WUJI fingers are owned by this process too, through `Hands`, but they
+    are deliberately *not* on that RPC surface: a REP socket serves one caller
+    at a time, so a finger target sent here would queue behind the 30 Hz arm
+    targets. `Hands` subscribes to the same aria2robot publisher the arm
+    client reads, on a thread of its own -- see robot/hand/hands.py. No
+    publisher is not an error: the hands hold whatever pose they already have.
     """
 
     _SWERVE_MODULES = (
@@ -41,7 +50,8 @@ class YORMujoco:
     _ARM_HOME_DURATION_S = 3.0
     _ARM_HOME_TIMEOUT_S = 20.0
 
-    def __init__(self, mjcf_path: Optional[str] = None, solver_dt: float = 1.0 / 108.0):
+    def __init__(self, mjcf_path: str | None = None, solver_dt: float = 1.0 / 108.0,
+                 hands: Hands | None = None):
         self.mjcf_path = str(mjcf_path or DEFAULT_SCENE)
         self.solver_dt = solver_dt
 
@@ -63,6 +73,7 @@ class YORMujoco:
         self.data = self.ik.data
         self._init_swerve_animation()
         self._init_target_markers()
+        self._init_hand_joints()
 
         # ── Launch Viewer ─────────────────────────────────────────────────────
         self.viewer = mujoco.viewer.launch_passive(
@@ -90,14 +101,32 @@ class YORMujoco:
         self._home_lift: float = float(self.data.qpos[self.ik._lift_qpos_adr])
         self._home_left_q = self.data.qpos[self.ik._left_arm_qpos_adrs].copy()
         self._home_right_q = self.data.qpos[self.ik._right_arm_qpos_adrs].copy()
-        self.lift_target: Optional[float] = None
+        self.lift_target: float | None = None
         self.base_fixed: bool = False
         self._last_base_velocity = np.zeros(3)
         self._homing_lock = threading.Lock()
-        self._homing_request: Optional[dict] = None
+        self._homing_request: dict | None = None
+        # Last solve's residuals, for get_state(). Only the solving branch of
+        # the control loop writes these, so during a homing animation they
+        # hold the last real solve rather than reading as a perfect one.
+        self._last_solve: dict = {
+            "left_pos_err": None, "left_ori_err": None,
+            "right_pos_err": None, "right_ori_err": None,
+            "solved": None, "solve_iters": None,
+        }
+
+        # Fingers hold the keyframe pose until `Hands` has something to say,
+        # and hold whatever it last said after that -- there is no staleness
+        # gate. A grasp frozen by a dead link is still the pose the operator
+        # asked for; springing it open would be a motion nobody commanded.
+        self._hand_cmd: dict[str, np.ndarray] = {
+            side: self.data.qpos[adrs].copy()
+            for side, adrs in self._hand_qpos_adrs.items()
+        }
+        self.hands: Hands | None = hands if self._hand_qpos_adrs else None
 
         # ── Control Loop ──────────────────────────────────────────────────────
-        self.control_loop_thread: Optional[threading.Thread] = None
+        self.control_loop_thread: threading.Thread | None = None
         self.control_loop_running = False
 
     # ── RPC API / External Commands ───────────────────────────────────────────
@@ -115,13 +144,13 @@ class YORMujoco:
         with self.target_lock:
             self.lift_target = lift_target
 
-    def toggle_fix_base(self, fixed: Optional[bool] = None) -> bool:
+    def toggle_fix_base(self, fixed: bool | None = None) -> bool:
         """Lock the mobile base in place, only arms and lift will move."""
         with self.target_lock:
             self.base_fixed = self.ik.toggle_fix_base(fixed)
             return self.base_fixed
 
-    def relatch_elbow_swivel(self, side: Optional[str] = None) -> bool:
+    def relatch_elbow_swivel(self, side: str | None = None) -> bool:
         """Accept the elbow branch the arm(s) are currently in (API parity
         with the hardware node -- clears the latched swivel target so the
         next solve re-latches from the live pose)."""
@@ -157,7 +186,7 @@ class YORMujoco:
             self.left_ee_target = L_ee_target
             self.right_ee_target = R_ee_target
 
-    def toggle_collision_avoidance(self, enable: Optional[bool] = None) -> bool:
+    def toggle_collision_avoidance(self, enable: bool | None = None) -> bool:
         """Enable/disable the solver's self-collision avoidance constraint."""
         with self.target_lock:
             return self.ik.toggle_collision_avoidance(enable)
@@ -175,6 +204,7 @@ class YORMujoco:
         """Snapshot of the sim state for teleop clients (plain types only)."""
         with self.target_lock:
             base_vel = self._last_base_velocity.copy()
+            solve = dict(self._last_solve)
         T_l, T_r = self.ik.forward_kinematics()
         q = self.data.qpos
         return {
@@ -192,7 +222,34 @@ class YORMujoco:
             "swerve_wheel_angles": self._swerve_wheel_angles.tolist(),
             "left_joint_positions": q[self.ik._left_arm_qpos_adrs].tolist(),
             "right_joint_positions": q[self.ik._right_arm_qpos_adrs].tolist(),
+            # The fingers do not come in through this RPC surface, but they
+            # are reported on it, so one get_state() is a snapshot of the whole
+            # robot at one instant.
+            "left_hand_qpos": self._hand_qpos(q, "left"),
+            "right_hand_qpos": self._hand_qpos(q, "right"),
+            # The rest of what `Hands` knows: which sides are engaged, where
+            # the pose came from, and the cumulative count of writes that
+            # reached the driver. A total rather than a rate, because a total
+            # cannot be wrong about the interval it was measured over -- the
+            # client differentiates it across redraws. None when --no-hands.
+            "hands": self._hand_status(),
+            # How well the last solve actually met the targets. The client
+            # can measure its own target against the EE above, but only the
+            # solver knows its residual and how many iterations it spent --
+            # additive keys, so a client that does not read them is unaffected.
+            **solve,
         }
+
+    def _hand_qpos(self, q: np.ndarray, side: str) -> list | None:
+        adrs = self._hand_qpos_adrs.get(side)
+        return None if adrs is None else q[adrs].tolist()
+
+    def _hand_status(self) -> dict | None:
+        """`Hands`' own bookkeeping, minus the qpos already reported above."""
+        if self.hands is None:
+            return None
+        state = self.hands.get_hand_state()
+        return {k: v for k, v in state.items() if k != "qpos"}
 
     def _home_arm_joints(self, sides: tuple[str, ...]) -> bool:
         """Animate the same ordered Quest homing sequence used on hardware."""
@@ -208,6 +265,12 @@ class YORMujoco:
             "success": False,
         }
         try:
+            # Home means "return to a known pose", and the hand is part of
+            # that. First, before the lift moves, so anything being held falls
+            # from where it is rather than from 450 mm up. Safe as a gesture
+            # because the home gesture needs both hands *released*.
+            if self.hands is not None:
+                self.hands.open_hands(sides)
             with self.target_lock:
                 request["previous_fix_base"] = bool(self.ik.fix_base)
                 self.base_fixed = self.ik.toggle_fix_base(True)
@@ -280,6 +343,8 @@ class YORMujoco:
     def start_control(self):
         if self.control_loop_thread is not None:
             return
+        if self.hands is not None:
+            self.hands.start()
         self.control_loop_running = True
         self.control_loop_thread = threading.Thread(target=self.control_loop, daemon=True)
         self.control_loop_thread.start()
@@ -290,6 +355,8 @@ class YORMujoco:
         self.control_loop_running = False
         self.control_loop_thread.join()
         self.control_loop_thread = None
+        if self.hands is not None:
+            self.hands.stop()
         self.viewer.close()
 
     def control_loop(self):
@@ -297,6 +364,7 @@ class YORMujoco:
         rate_limiter = RateLimiter(freq, warn=False)
         
         while self.control_loop_running and self.viewer.is_running():
+            self._pull_hand_commands()
             with self.target_lock:
                 T_l = self.left_ee_target.copy()
                 T_r = self.right_ee_target.copy()
@@ -317,6 +385,7 @@ class YORMujoco:
                 self.ik.update_configuration(self.data.qpos)
                 self._animate_swerve(np.zeros(3))
                 self._draw_ik_targets(T_l, T_r)
+                self._apply_hand_qpos()
                 mujoco.mj_forward(self.model, self.data)
                 with self.target_lock:
                     self._last_base_velocity = np.zeros(3)
@@ -355,6 +424,7 @@ class YORMujoco:
                 self.ik.update_configuration(self.data.qpos)
                 self._animate_swerve(np.zeros(3))
                 self._draw_ik_targets(T_l, T_r)
+                self._apply_hand_qpos()
                 mujoco.mj_forward(self.model, self.data)
                 with self.target_lock:
                     self._last_base_velocity = np.zeros(3)
@@ -379,10 +449,19 @@ class YORMujoco:
             self.ik.apply_to_sim_kinematic(self.data, result)
             self._animate_swerve(result.base_velocity)
             self._draw_ik_targets(T_l, T_r)
+            self._apply_hand_qpos()
             mujoco.mj_forward(self.model, self.data)
 
             with self.target_lock:
                 self._last_base_velocity = result.base_velocity
+                self._last_solve = {
+                    "left_pos_err": float(result.left_pos_err),
+                    "left_ori_err": float(result.left_ori_err),
+                    "right_pos_err": float(result.right_pos_err),
+                    "right_ori_err": float(result.right_ori_err),
+                    "solved": bool(result.solved),
+                    "solve_iters": int(result.iters),
+                }
 
             self.viewer.sync()
             rate_limiter.sleep()
@@ -392,6 +471,62 @@ class YORMujoco:
             abandoned_home = self._homing_request
         if abandoned_home is not None:
             self._finish_arm_home(abandoned_home, False)
+
+    # ── WUJI fingers ────────────────────────────────────────────────────────
+
+    def _init_hand_joints(self) -> None:
+        """Cache each hand's 20 qpos addresses and joint ranges.
+
+        A scene without hands still runs -- the fingers are simply not driven.
+        The order is `canonical_joint_names`, which is also the order
+        aria2robot publishes in, so a published (20,) vector writes as one
+        slice with no reordering.
+        """
+        self._hand_qpos_adrs: dict[str, np.ndarray] = {}
+        self._hand_qpos_lo: dict[str, np.ndarray] = {}
+        self._hand_qpos_hi: dict[str, np.ndarray] = {}
+        for side in ("left", "right"):
+            try:
+                joints = [self.model.joint(n) for n in canonical_joint_names(side)]
+            except KeyError:
+                print(f"[sim] scene has no {side} hand joints; fingers not driven")
+                continue
+            self._hand_qpos_adrs[side] = np.array(
+                [int(j.qposadr[0]) for j in joints], dtype=int)
+            self._hand_qpos_lo[side] = np.array([float(j.range[0]) for j in joints])
+            self._hand_qpos_hi[side] = np.array([float(j.range[1]) for j in joints])
+
+    def _pull_hand_commands(self) -> None:
+        """Adopt the newest finger targets, if hands are switched on."""
+        if self.hands is None:
+            return
+        for side, qpos in self.hands.targets().items():
+            if qpos is None or side not in self._hand_qpos_adrs:
+                continue
+            if qpos.size != self._hand_qpos_adrs[side].size:
+                continue
+            # Clip here, where foreign data enters, not on the way into MjData:
+            # the seed is the model's own keyframe and must be written back
+            # verbatim. Several hand joints have a range that excludes zero, so
+            # clipping the seed would nudge a hand nobody has commanded.
+            with self.target_lock:
+                self._hand_cmd[side] = np.clip(
+                    qpos, self._hand_qpos_lo[side], self._hand_qpos_hi[side])
+
+    def _apply_hand_qpos(self) -> None:
+        """Write the held finger pose into the model.
+
+        Must run *after* `apply_to_sim_kinematic`, which does `qpos[:] =
+        result.q` and so overwrites the fingers along with everything else, and
+        before `mj_forward`. The next tick's `update_configuration(data.qpos)`
+        then carries the fingers back into the solver's own configuration, so
+        the ground-avoidance constraint measures off the real finger meshes
+        rather than a permanently open hand.
+        """
+        with self.target_lock:
+            cmd = {s: q.copy() for s, q in self._hand_cmd.items()}
+        for side, adrs in self._hand_qpos_adrs.items():
+            self.data.qpos[adrs] = cmd[side]
 
     # ── IK target visualization ─────────────────────────────────────────────
 
@@ -529,10 +664,18 @@ class YORMujoco:
 
 
 if __name__ == "__main__":
+    import argparse
+
     from robot.utils.console_log import start_console_log
+
+    p = argparse.ArgumentParser(description="YORv3 simulation node")
+    add_hand_args(p, backend_flag=False)
+    args = p.parse_args()
+
     start_console_log("yor_mujoco", _REPO / "artifacts" / "wholebody_logs")
 
-    yor_mujoco = YORMujoco()
+    # backend "none" always in sim: the fingers are rendered, not driven
+    yor_mujoco = YORMujoco(hands=hands_from_args(args, force_backend="none"))
     yor_mujoco.start_control()
 
     rpc_server = RPCServer(yor_mujoco, 8081, threaded=False)

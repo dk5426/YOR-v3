@@ -7,8 +7,9 @@ through mjviser. No RPC hop, no `mjpython`, no yor_mujoco.py.
 Each wrist pose commands one arm's end-effector; base, lift and both 7-DOF arms
 are solved together, so the chassis rolls and the lift extends on their own once
 you reach past the arms. The retargeted finger angles go straight into the hand
-joints of the same model, which is why this — not the RPC path — is where you
-see all 20 of them.
+joints of the same model — no wire, no `Hands`, so this stays the shortest way
+to see all 20 of them. The node path reaches them too, through
+robot/hand/hands.py, which is the one that also drives real hands.
 
     # publisher, from the aria2robot repo
     python -m aria2robot.stream_pub --wifi
@@ -31,6 +32,11 @@ Two things on screen are worth knowing how to read:
   the mapped operator triad (long thin needles) sits coincident and parallel
   with that sphere's own thick capsules. Mirrored or 90-degrees-off means an
   axis table in clutch.py is wrong; a gap with matching axes is IK tracking.
+
+The operator's hand used to be drawn here as a 21-point skeleton as well. The
+landmarks it needed no longer cross the wire -- the publisher retargets and
+detects gestures itself now -- so the triad is the axis-correctness diagnostic,
+and it answers the same question with two fewer scene nodes.
 """
 
 from __future__ import annotations
@@ -45,6 +51,9 @@ import numpy as np
 import viser
 from loop_rate_limiters import RateLimiter
 from mjviser import ViserMujocoScene
+from rich.console import Group
+from rich.live import Live
+from rich.table import Table
 
 _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO))
@@ -52,8 +61,9 @@ sys.path.insert(0, str(_REPO))
 from robot.arm.wholebody_ik import WholeBodyIK, WholeBodyIKConfig
 from robot.teleop.aria.clutch import Clutch
 from robot.teleop.aria.config import AriaConfig
-from robot.teleop.aria.gesture import HomeGesture
-from robot.teleop.aria.stream import AriaHandStream, canonical_joint_names
+from robot.teleop.aria.stream import AriaHandStream, HomeSeqWatcher, canonical_joint_names
+from robot.teleop.status import console, fmt_xyz
+from robot.teleop.status import log as _log
 
 DEFAULT_SCENE = _REPO / "description" / "scene_wholebody.xml"
 
@@ -61,29 +71,56 @@ SIDE_INDEX = {"left": 0, "right": 1}
 # Pushing every solve to the browser is wasted work; 1-in-3 of 100 Hz is plenty
 RENDER_EVERY = 3
 
-SKELETON_COLOR = (80, 220, 120)
-KEYPOINT_COLOR = (240, 200, 60)
-MEDIAPIPE_SKELETON_EDGES = (
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17),
-)
+
+def log(msg: str, style: str = "cyan") -> None:
+    """One `[aria]` line, through the client's shared console.
+
+    Not `print`: once the status table is live, a bare write tears through it
+    instead of scrolling above it.
+    """
+    _log(msg, style=style, prefix="aria")
 
 
-def add_hand_skeleton(server, name: str, pts: np.ndarray, color) -> None:
-    """Draw the MediaPipe bone segments as one line-segment node."""
-    seg = np.array([[pts[a], pts[b]] for a, b in MEDIAPIPE_SKELETON_EDGES],
-                   dtype=np.float32)
-    server.scene.add_line_segments(name, points=seg, colors=color, line_width=3.0)
+def _tracking_table(rows: list[dict], banner: str) -> Table:
+    """Where each hand is commanded, and whether the clutch is following it.
+
+    The mapping error `d` used to sit here, as the distance between the
+    commanded wrist and the operator's own wrist landmark. Measuring it needed
+    the landmarks, which no longer arrive; the operator triad in the 3D view
+    now carries that check, and `pos_err` in the next table still carries how
+    far the arm lags the command.
+    """
+    table = Table(title=banner, expand=False, show_lines=False)
+    table.add_column("Hand", style="cyan", no_wrap=True)
+    table.add_column("State", no_wrap=True)
+    table.add_column("ik_target", style="green", justify="right", no_wrap=True)
+    for r in rows:
+        table.add_row(
+            r["side"],
+            ("[green]ENGAGED[/green]" if r["engaged"] else "[yellow]paused[/yellow]"),
+            r["ik_target"],
+        )
+    return table
 
 
-def add_hand_keypoints(server, name: str, pts: np.ndarray, color) -> None:
-    """Draw the 21 landmarks as a point cloud."""
-    server.scene.add_point_cloud(name, points=pts.astype(np.float32),
-                                 colors=color, point_size=0.006)
+def _mapping_table(rows: list[dict], result) -> Table:
+    """Clutch travel and IK tracking error.
+
+    The footer carries the DOFs the hands never command.
+    """
+    bx, by, bt = result.base_position
+    table = Table(expand=False, show_lines=False,
+                  caption=(f"lift {result.lift_q:.3f} m   "
+                           f"base ({bx:+.2f}, {by:+.2f}, {bt:+.2f})   "
+                           f"solved={result.solved} iters={result.iters}"))
+    table.add_column("Hand", style="cyan", no_wrap=True)
+    table.add_column("travel", justify="right", no_wrap=True)
+    table.add_column("pos mm", style="magenta", justify="right", no_wrap=True)
+    table.add_column("ori mrad", style="magenta", justify="right", no_wrap=True)
+    for r in rows:
+        table.add_row(r["side"], r["travel"],
+                      f"{r['pos_err']:.1f}", f"{r['ori_err']:.1f}")
+    return table
 
 
 def main() -> int:
@@ -101,13 +138,13 @@ def main() -> int:
         cfg.publisher["host"] = args.pub_host
     if args.hand:
         cfg.mapping["hand"] = args.hand
-    print(cfg.describe())
+    console.print(cfg.describe(), markup=False, highlight=False)
 
     hand = cfg.mapping["hand"]
     sides = ("left", "right") if hand == "both" else (hand,)
     ik_rate = int(cfg.sim["ik_rate_hz"])
 
-    print(f"[aria] scene: {cfg.mapping['scene']}")
+    log(f"scene: {cfg.mapping['scene']}")
     ik = WholeBodyIK(
         str(cfg.mapping["scene"]),
         WholeBodyIKConfig(dt=1.0 / ik_rate, solver=cfg.sim["solver"],
@@ -116,8 +153,8 @@ def main() -> int:
     )
     ik.init_from_keyframe("home")
     model, mj_data = ik.model, ik.data
-    print(f"[aria] IK: {ik_rate} Hz, {ik.n_collision_pairs} collision pairs, "
-          f"sides={'+'.join(sides)}")
+    log(f"IK: {ik_rate} Hz, {ik.n_collision_pairs} collision pairs, "
+        f"sides={'+'.join(sides)}")
 
     # The MJCF names hand joints exactly as wuji-description does, so the
     # published (20,) vector maps straight across with no reordering
@@ -194,8 +231,8 @@ def main() -> int:
             # Private mjviser attribute. Degrading to zero silently would put
             # every overlay back where the bug had it, so say so once.
             warned_no_offset[0] = True
-            print("[aria] mjviser has no _scene_offset -- overlays will be "
-                  "drawn at raw world coordinates and will not line up")
+            log("mjviser has no _scene_offset -- overlays will be drawn at "
+                "raw world coordinates and will not line up", style="yellow")
         pos = np.zeros(3) if off is None else np.asarray(off, dtype=np.float64)
         overlay.position = pos
         # Same reason: the world triad is a claim about where the origin is
@@ -205,7 +242,6 @@ def main() -> int:
         gui_engaged = {side: server.gui.add_text(side, initial_value="paused",
                                                  disabled=True)
                        for side in sides}
-        gui_show_target_hand = server.gui.add_checkbox("Target Hand", True)
         gui_show_operator_frame = server.gui.add_checkbox("Operator Hand Frame", True)
         gui_fix_base = server.gui.add_checkbox("Fix Base", ik.fix_base)
         gui_avoid_collisions = server.gui.add_checkbox("Collision Avoidance",
@@ -258,31 +294,6 @@ def main() -> int:
                 c.set_alignment(translation_frame=gui_frame.value)
             gui_state["realign"] = True
 
-    # Operator hand overlay: the same landmarks the fingers were retargeted from,
-    # pushed through the clutch's own mapping. It locks onto the ik_target triad
-    # when the Aria->YOR convention is right, so a flipped axis shows up as a
-    # mirrored or 90°-rotated hand instead of being inferred from a misbehaving arm.
-    drawn_hands: set[str] = set()
-
-    def draw_target_hand(side: str, kp_odom: np.ndarray | None,
-                         T_odom_wrist: np.ndarray | None) -> None:
-        """Draw (or clear) the operator's mapped hand for one side."""
-        pts = None
-        if (gui_show_target_hand.value and kp_odom is not None
-                and T_odom_wrist is not None):
-            pts = clutches[side].map_points(kp_odom, T_odom_wrist)
-        if pts is None:
-            if side in drawn_hands:
-                server.scene.remove_by_name(f"/overlay/target_hand_{side}_skeleton")
-                server.scene.remove_by_name(f"/overlay/target_hand_{side}_keypoints")
-                drawn_hands.discard(side)
-            return
-        add_hand_skeleton(server, f"/overlay/target_hand_{side}_skeleton", pts,
-                          color=SKELETON_COLOR)
-        add_hand_keypoints(server, f"/overlay/target_hand_{side}_keypoints", pts,
-                           color=KEYPOINT_COLOR)
-        drawn_hands.add(side)
-
     # The operator's hand frame, mapped by the same clutch that drives the arm.
     # It should sit on the `{side}_ik_target` triad, which rides the robot's wrist:
     # same origin, same axes. Any standing gap is IK tracking, not the mapping.
@@ -316,163 +327,137 @@ def main() -> int:
     targets = dict(zip(("left", "right"), ik.forward_kinematics()))
     hand_cmd = {s: mj_data.qpos[hand_adrs[s]].copy() for s in sides}
     was_engaged = {s: False for s in sides}
-    home_gesture = (HomeGesture(tuple(sides), cfg.home["dwell_s"])
-                    if cfg.home["gesture"] else None)
-    if home_gesture is not None and not home_gesture.available:
-        print(f"[aria] home gesture off: it needs both hands (hand={'+'.join(sides)})")
+    home_watch = (HomeSeqWatcher()
+                  if cfg.home["gesture"] and len(sides) == 2 else None)
+    if home_watch is None:
+        log(f"home gesture off: it needs both hands (hand={'+'.join(sides)})",
+            style="yellow")
     travel: dict[str, np.ndarray | None] = {s: None for s in sides}
-    gap: dict[str, np.ndarray | None] = {s: None for s in sides}
     tick = 0
     last_dbg = 0.0
 
-    def fmt_xyz(v: np.ndarray | None) -> str:
-        return ("     --      --      --" if v is None
-                else "".join(f"{x:+8.4f}" for x in v))
-
-    print(f"[aria] viser on http://localhost:{cfg.sim['viser_port']}")
+    log(f"viser on http://localhost:{cfg.sim['viser_port']}")
+    banner = f"YORv3 sim - Aria hands ({'+'.join(sides)})"
     try:
-        while True:
-            if gui_state["reset"]:
-                gui_state["reset"] = False
-                ik.init_from_keyframe("home")
-                targets = dict(zip(("left", "right"), ik.forward_kinematics()))
+        with Live(_tracking_table([], banner), console=console,
+                  refresh_per_second=2) as live:
+            while True:
+                if gui_state["reset"]:
+                    gui_state["reset"] = False
+                    ik.init_from_keyframe("home")
+                    targets = dict(zip(("left", "right"), ik.forward_kinematics()))
+                    for side in sides:
+                        clutches[side].release()
+                        was_engaged[side] = False
+
+                snap = stream.snapshot()
+                realign = gui_state["realign"]
+                gui_state["realign"] = False
+
+                # The publisher detected both thumbs up on two released
+                # hands. There is no RPC here, so it lands on the same keyframe
+                # reset the GUI button drives -- this node owns the model
+                if (home_watch is not None
+                        and home_watch.update(stream.home_seq())
+                        and not any(clutches[s].engaged for s in sides)):
+                    log("both thumbs up -> home arms", style="yellow")
+                    gui_state["reset"] = True
+
                 for side in sides:
-                    clutches[side].release()
-                    was_engaged[side] = False
+                    clutch, s = clutches[side], snap[side]
+                    # Engaged means: the publisher isn't paused and we have a wrist
+                    # to follow. Anchoring is deferred until both hold, so engaging
+                    # with the hand out of view doesn't latch a stale pose.
+                    want = not s.paused and s.T_odom_wrist is not None
+                    if want and (not clutch.engaged or realign):
+                        clutch.engage(s.T_odom_wrist,
+                                      ik.forward_kinematics()[SIDE_INDEX[side]])
+                    elif not want and clutch.engaged:
+                        clutch.release()
+                    if clutch.engaged != was_engaged[side]:
+                        was_engaged[side] = clutch.engaged
+                        log(f"{side} arm: "
+                            f"{'ENGAGED' if clutch.engaged else 'released'}",
+                            style="green" if clutch.engaged else "yellow")
+                    travel[side] = None
+                    if s.T_odom_wrist is not None:
+                        target = clutch.target(s.T_odom_wrist)
+                        if target is not None:
+                            targets[side] = target
+                            travel[side] = clutch.travel(s.T_odom_wrist)
+                    # Shaka stops everything: the arm target freezes because the
+                    # clutch is released, and the fingers freeze here rather than
+                    # relying on the publisher to stop updating qpos while paused
+                    if not s.paused and s.qpos is not None:
+                        hand_cmd[side] = np.clip(s.qpos[:20], hand_lo[side],
+                                                 hand_hi[side])
 
-            snap = stream.snapshot()
-            realign = gui_state["realign"]
-            gui_state["realign"] = False
-
-            # Both thumbs up, both hands disengaged, asks for home. There is
-            # no RPC here, so it lands on the same keyframe reset the GUI
-            # button drives -- this node owns the model
-            if home_gesture is not None and home_gesture.update(
-                kp={s: snap[s].kp_odom for s in sides},
-                released={s: not clutches[s].engaged for s in sides},
-                now=time.monotonic(),
-            ):
-                print("[aria] both thumbs up -> home arms")
-                gui_state["reset"] = True
-
-            for side in sides:
-                clutch, s = clutches[side], snap[side]
-                # Engaged means: the publisher isn't paused and we have a wrist
-                # to follow. Anchoring is deferred until both hold, so engaging
-                # with the hand out of view doesn't latch a stale pose.
-                want = not s.paused and s.T_odom_wrist is not None
-                if want and (not clutch.engaged or realign):
-                    clutch.engage(s.T_odom_wrist,
-                                  ik.forward_kinematics()[SIDE_INDEX[side]])
-                elif not want and clutch.engaged:
-                    clutch.release()
-                if clutch.engaged != was_engaged[side]:
-                    was_engaged[side] = clutch.engaged
-                    print(f"[aria] {side} arm: "
-                          f"{'ENGAGED' if clutch.engaged else 'released'}")
-                travel[side] = None
-                gap[side] = None
-                if s.T_odom_wrist is not None:
-                    target = clutch.target(s.T_odom_wrist)
-                    if target is not None:
-                        targets[side] = target
-                        travel[side] = clutch.travel(s.T_odom_wrist)
-                    # kp_odom[0] is the wrist landmark and T_device_hand's
-                    # origin, so this is structurally zero — it stays as a cheap
-                    # check on a mismatched landmark index or a stale kp
-                    # snapshot, read in robot wrist axes so it names the axis to
-                    # correct
-                    frame = clutch.operator_frame(s.T_odom_wrist)
-                    pts = (clutch.map_points(s.kp_odom, s.T_odom_wrist)
-                           if s.kp_odom is not None else None)
-                    if frame is not None and pts is not None:
-                        gap[side] = frame.rotation().as_matrix().T @ (
-                            pts[0] - frame.translation())
-                # Shaka stops everything: the arm target freezes because the
-                # clutch is released, and the fingers freeze here rather than
-                # relying on the publisher to stop updating qpos while paused
-                if not s.paused and s.qpos is not None:
-                    hand_cmd[side] = np.clip(s.qpos[:20], hand_lo[side],
-                                             hand_hi[side])
-
-            # Feed the commanded finger angles back into the IK configuration: the
-            # ground-avoidance limit measures distances off the finger meshes, so a
-            # stale home-pose hand would let the fingertips clip through the floor
-            q = ik.configuration.q.copy()
-            for side in sides:
-                q[hand_adrs[side]] = hand_cmd[side]
-            ik.update_configuration(q)
-
-            result = ik.solve(targets["left"], targets["right"], lift_target=None)
-
-            ik.apply_to_sim_kinematic(mj_data, result)
-            for side in sides:
-                mj_data.qpos[hand_adrs[side]] = hand_cmd[side]
-                # Marker rides the wrist, not the flange, so it sits on the hand
-                R = targets[side].rotation()
-                mj_data.mocap_pos[mocap_id[side]] = (
-                    targets[side].translation() + R.as_matrix() @ wrist_offset[side]
-                )
-                mj_data.mocap_quat[mocap_id[side]] = R.wxyz
-            mujoco.mj_forward(model, mj_data)
-
-            # 1 Hz readout of the two points that are supposed to be the same
-            # place: the `{side}_ik_target` triad (the mocap marker, riding the
-            # commanded wrist) and the mapped hand-tracking wrist landmark the
-            # overlay is drawn from. Both in robot world, metres. `d` is the
-            # mapping error only — how far the arm then lags its target is
-            # `pos_err`. `--` while released: no mapping to evaluate.
-            now = time.monotonic()
-            if now - last_dbg >= 1.0:
-                last_dbg = now
+                # Feed the commanded finger angles back into the IK configuration: the
+                # ground-avoidance limit measures distances off the finger meshes, so a
+                # stale home-pose hand would let the fingertips clip through the floor
+                q = ik.configuration.q.copy()
                 for side in sides:
-                    ik_t = np.asarray(mj_data.mocap_pos[mocap_id[side]], float)
-                    frame = (clutches[side].operator_frame(snap[side].T_odom_wrist)
-                             if snap[side].T_odom_wrist is not None else None)
-                    pts = (clutches[side].map_points(snap[side].kp_odom,
-                                                     snap[side].T_odom_wrist)
-                           if frame is not None and snap[side].kp_odom is not None
-                           else None)
-                    hand = None if pts is None else pts[0]
-                    d = ("--" if hand is None
-                         else f"{np.linalg.norm(hand - ik_t) * 1e3:6.1f}")
-                    g = gap[side]
-                    err = (result.left_pos_err if side == "left"
-                           else result.right_pos_err)
-                    ori = (result.left_ori_err if side == "left"
-                           else result.right_ori_err)
-                    print(f"{side:5s} "
-                          f"{'ENGAGED' if clutches[side].engaged else 'paused ':8s}"
-                          f" ik_target[{fmt_xyz(ik_t)} ]"
-                          f"  hand_wrist[{fmt_xyz(hand)} ]  d {d} mm"
-                          f"  travel[{fmt_xyz(travel[side])} ]"
-                          f"  gap[{fmt_xyz(g)} ]"
-                          f"  pos_err {err * 1e3:5.1f} mm"
-                          f"  ori_err {ori * 1e3:5.1f} mrad")
-                bx, by, bt = result.base_position
-                print(f"      lift {result.lift_q:.3f} m   "
-                      f"base ({bx:+.2f}, {by:+.2f}, {bt:+.2f})   "
-                      f"solved={result.solved} iters={result.iters}")
+                    q[hand_adrs[side]] = hand_cmd[side]
+                ik.update_configuration(q)
 
-            tick += 1
-            if tick % RENDER_EVERY == 0:
-                # Offset first: mjviser recomputes it from this mj_data, and the
-                # overlays drawn below have to ride the value it just used
-                scene.update_from_mjdata(mj_data)
-                sync_overlay_offset()
+                result = ik.solve(targets["left"], targets["right"], lift_target=None)
+
+                ik.apply_to_sim_kinematic(mj_data, result)
                 for side in sides:
-                    gui_engaged[side].value = (
-                        "ENGAGED" if clutches[side].engaged else "paused")
-                    draw_target_hand(side, snap[side].kp_odom,
-                                     snap[side].T_odom_wrist)
-                    draw_operator_frame(side, snap[side].T_odom_wrist)
-            rate.sleep()
+                    mj_data.qpos[hand_adrs[side]] = hand_cmd[side]
+                    # Marker rides the wrist, not the flange, so it sits on the hand
+                    R = targets[side].rotation()
+                    mj_data.mocap_pos[mocap_id[side]] = (
+                        targets[side].translation() + R.as_matrix() @ wrist_offset[side]
+                    )
+                    mj_data.mocap_quat[mocap_id[side]] = R.wxyz
+                mujoco.mj_forward(model, mj_data)
+
+                # 1 Hz readout of the two points that are supposed to be the same
+                # place: the `{side}_ik_target` triad (the mocap marker, riding the
+                # commanded wrist) and the mapped hand-tracking wrist landmark the
+                # overlay is drawn from. Both in robot world, metres. `d` is the
+                # mapping error only — how far the arm then lags its target is
+                # `pos_err`. `--` while released: no mapping to evaluate.
+                #
+                # Still 1 Hz, not the render rate: these are numbers to read, and a
+                # table that changes 30 times a second cannot be read.
+                now = time.monotonic()
+                if now - last_dbg >= 1.0:
+                    last_dbg = now
+                    rows = []
+                    for side in sides:
+                        ik_t = np.asarray(mj_data.mocap_pos[mocap_id[side]], float)
+                        rows.append({
+                            "side": side,
+                            "engaged": clutches[side].engaged,
+                            "ik_target": fmt_xyz(ik_t),
+                            "travel": fmt_xyz(travel[side]),
+                            "pos_err": (result.left_pos_err if side == "left"
+                                        else result.right_pos_err) * 1e3,
+                            "ori_err": (result.left_ori_err if side == "left"
+                                        else result.right_ori_err) * 1e3,
+                        })
+                    live.update(Group(_tracking_table(rows, banner),
+                                      _mapping_table(rows, result)))
+
+                tick += 1
+                if tick % RENDER_EVERY == 0:
+                    # Offset first: mjviser recomputes it from this mj_data, and the
+                    # overlays drawn below have to ride the value it just used
+                    scene.update_from_mjdata(mj_data)
+                    sync_overlay_offset()
+                    for side in sides:
+                        gui_engaged[side].value = (
+                            "ENGAGED" if clutches[side].engaged else "paused")
+                        draw_operator_frame(side, snap[side].T_odom_wrist)
+                rate.sleep()
     except KeyboardInterrupt:
         pass
     finally:
         stream.stop()
         server.stop()
-        print("\n[aria] stopped.")
+        log("stopped.", style="yellow")
     return 0
 
 

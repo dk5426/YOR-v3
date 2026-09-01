@@ -68,6 +68,7 @@ sys.path.insert(0, str(_REPO))
 from commlink import RPCClient
 
 from robot.teleop.filters import PoseFilter
+from robot.teleop.status import SideStatus, SourceStatus, StatusDisplay, console, log
 
 # Quest tracking arrives at approximately 72 Hz (may change -- unconfirmed) and
 # is 1-euro filtered on OculusSource's own receive thread at that native rate,
@@ -153,6 +154,18 @@ class InputSource:
     def update(self, state: TeleopState, dt: float) -> TeleopCommand:
         raise NotImplementedError
 
+    def status(self) -> SourceStatus | None:
+        """Device state for the client's status table.
+
+        None -- the default -- means this backend has nothing to add, and the
+        table's device columns read as dashes. A clutched backend returns
+        per-side engagement; one with a network transport also returns a row
+        per subscribed topic. All of it lives only here, because no device
+        state is on either node's RPC surface, and a table is the wrong
+        reason to put it there.
+        """
+        return None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Keyboard (raw terminal — stdlib only)
@@ -183,7 +196,7 @@ class KeyboardSource(InputSource):
         self._fd = sys.stdin.fileno()
         self._old_attrs = termios.tcgetattr(self._fd)
         tty.setcbreak(self._fd)
-        print(f"[keyboard] {self._HELP}")
+        log(self._HELP, prefix="keyboard")
 
     def stop(self) -> None:
         if self._old_attrs is not None:
@@ -229,10 +242,10 @@ class KeyboardSource(InputSource):
             elif k == "c": cmd.toggle_collisions = True
             elif k == "[":
                 self.step = max(0.005, self.step / 2)
-                print(f"\n[keyboard] step = {self.step*100:.1f} cm")
+                log(f"step = {self.step*100:.1f} cm", prefix="keyboard")
             elif k == "]":
                 self.step = min(0.16, self.step * 2)
-                print(f"\n[keyboard] step = {self.step*100:.1f} cm")
+                log(f"step = {self.step*100:.1f} cm", prefix="keyboard")
             elif k in ("x", "\x1b"):  # x or ESC
                 cmd.quit = True
 
@@ -273,7 +286,7 @@ class GamepadSource(InputSource):
             raise RuntimeError("no gamepad detected")
         self.js = pygame.joystick.Joystick(0)
         self.js.init()
-        print(f"[gamepad] using: {self.js.get_name()}")
+        log(f"using: {self.js.get_name()}", prefix="gamepad")
 
     def stop(self) -> None:
         self._pygame.quit()
@@ -416,7 +429,7 @@ class OculusSource(InputSource):
         self._zmq = zmq
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
-        print(f"[oculus] subscribing to tcp://{self.host}:{self.port} ...")
+        log(f"subscribing to tcp://{self.host}:{self.port} ...", prefix="oculus")
 
     def stop(self) -> None:
         self._stop.set()
@@ -490,8 +503,9 @@ class OculusSource(InputSource):
         dropped = sum(f.rejected for f in self._filters.values())
         now = time.time()
         if dropped > self._reported_drops and now - self._last_glitch_report > 2.0:
-            print(f"\n[oculus] dropped {dropped - self._reported_drops} pose "
-                  f"samples as tracking glitches ({dropped} total)")
+            log(f"dropped {dropped - self._reported_drops} pose samples as "
+                f"tracking glitches ({dropped} total)",
+                style="yellow", prefix="oculus")
             self._reported_drops, self._last_glitch_report = dropped, now
         return poses
 
@@ -561,12 +575,14 @@ class OculusSource(InputSource):
                             setattr(state, tgt_attr,
                                     mink.SE3(np.array(srv[key])))
                         else:
-                            print(f"[oculus] {side} clutch reseed failed -- "
-                                  "using local target")
+                            log(f"{side} clutch reseed failed -- using "
+                                "local target", style="yellow", prefix="oculus")
                     self._clutch[side] = (ctrl_T, getattr(state, tgt_attr))
                 else:
                     self._gripper_sent[side] = None
-                print(f"[oculus] {side} {'engaged' if self._engaged[side] else 'disengaged'}")
+                engaged = self._engaged[side]
+                log(f"{side} {'engaged' if engaged else 'disengaged'}",
+                    style="green" if engaged else "yellow", prefix="oculus")
             home_pressed[side] = self._debounced(f"{side}_home", home_btn)
             if home_pressed[side]:
                 self._engaged[side] = False
@@ -597,6 +613,14 @@ class OculusSource(InputSource):
         return cmd
 
 
+    def status(self) -> SourceStatus:
+        # No stream rows: the Quest transport is a raw SUB socket with no
+        # publisher-stamped wall clock to measure a latency against.
+        return SourceStatus(
+            sides={side: SideStatus("ENGAGED" if engaged else "released")
+                   for side, engaged in self._engaged.items()})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Client
 # ─────────────────────────────────────────────────────────────────────────────
@@ -605,10 +629,13 @@ class WholeBodyTeleop:
     """Streams targets from an InputSource to the whole-body IK sim server."""
 
     def __init__(self, source: InputSource, host: str = "localhost",
-                 port: int = 8081, rate_hz: int = LOOP_RATE):
+                 port: int = 8081, rate_hz: int = LOOP_RATE,
+                 banner: str = "YORv3 teleop", status_table: bool = True):
         self.source = source
         self.rate_hz = rate_hz
-        print(f"[teleop] connecting to {host}:{port} ...")
+        self.banner = banner
+        self.status_table = bool(status_table)
+        log(f"connecting to {host}:{port} ...")
         self.yor = RPCClient(host, port)
         self.yor.init()
 
@@ -627,9 +654,9 @@ class WholeBodyTeleop:
             fix_base=bool(srv["fix_base"]),
             collision_avoidance=bool(srv["collision_avoidance"]),
         )
-        print(f"[teleop] synced: lift={self.state.lift_target:.3f} m, "
-              f"fix_base={self.state.fix_base}, "
-              f"collisions={self.state.collision_avoidance}")
+        log(f"synced: lift={self.state.lift_target:.3f} m, "
+            f"fix_base={self.state.fix_base}, "
+            f"collisions={self.state.collision_avoidance}")
 
     def _server_state(self) -> dict | None:
         """One get_state() RPC, or None on any failure (never raises)."""
@@ -637,7 +664,7 @@ class WholeBodyTeleop:
             srv = self.yor.get_state()
             return srv or None
         except Exception as exc:
-            print(f"\n[teleop] get_state failed: {exc}")
+            log(f"get_state failed: {exc}", style="red")
             return None
 
     def _dispatch(self, cmd: TeleopCommand) -> None:
@@ -662,19 +689,19 @@ class WholeBodyTeleop:
                 st.lift_target = float(srv["lift"])
                 st.fix_base = bool(srv["fix_base"])
                 st.collision_avoidance = bool(srv["collision_avoidance"])
-                print(f"\n[teleop] {home_label} home sequence complete")
+                log(f"{home_label} home sequence complete", style="green")
             else:
-                print(f"\n[teleop] {home_label} home sequence FAILED")
+                log(f"{home_label} home sequence FAILED", style="red")
         if cmd.home_lift:
             self.yor.lift_home()
             st.lift_target = float(self.yor.get_state()["lift"])
-            print("\n[teleop] lift → home")
+            log("lift → home")
         if cmd.toggle_fix_base:
             st.fix_base = self.yor.toggle_fix_base()
-            print(f"\n[teleop] fix_base = {st.fix_base}")
+            log(f"fix_base = {st.fix_base}")
         if cmd.toggle_collisions:
             st.collision_avoidance = self.yor.toggle_collision_avoidance()
-            print(f"\n[teleop] collision_avoidance = {st.collision_avoidance}")
+            log(f"collision_avoidance = {st.collision_avoidance}")
 
         # Targets: send atomically when both move, individually otherwise.
         # A gripper change rides along with the pose it belongs to; it only
@@ -723,31 +750,38 @@ class WholeBodyTeleop:
         self.source.state_refresh = self._server_state
         self.source.start()
         try:
-            while True:
-                cmd = self.source.update(self.state, dt)
-                if cmd.quit:
-                    break
-                self._dispatch(cmd)
+            # The display's own get_state() runs on this thread, inside the
+            # same tick as _dispatch, so the RPC client stays single-threaded.
+            with StatusDisplay(self.banner, enabled=self.status_table) as display:
+                while True:
+                    cmd = self.source.update(self.state, dt)
+                    if cmd.quit:
+                        break
+                    self._dispatch(cmd)
 
-                now = time.time()
-                if now - last_hud > 1.0:  # 1 Hz status line
-                    lp = self.state.left_target.translation()
-                    rp = self.state.right_target.translation()
-                    print(
-                        f"\r[teleop] L=({lp[0]:+.2f},{lp[1]:+.2f},{lp[2]:+.2f}) "
-                        f"R=({rp[0]:+.2f},{rp[1]:+.2f},{rp[2]:+.2f}) "
-                        f"lift={self.state.lift_target:.2f} "
-                        f"fix_base={self.state.fix_base} "
-                        f"col={self.state.collision_avoidance}   ",
-                        end="", flush=True,
-                    )
-                    last_hud = now
-                rate.sleep()
+                    if display.enabled:
+                        display.update(time.monotonic(), self.state,
+                                       self.source.status(), self._server_state)
+                    # Without the table, the old one-line HUD: it costs no RPC,
+                    # which is what a raw-terminal backend wants.
+                    elif time.time() - last_hud > 1.0:
+                        lp = self.state.left_target.translation()
+                        rp = self.state.right_target.translation()
+                        print(
+                            f"\r[teleop] L=({lp[0]:+.2f},{lp[1]:+.2f},{lp[2]:+.2f}) "
+                            f"R=({rp[0]:+.2f},{rp[1]:+.2f},{rp[2]:+.2f}) "
+                            f"lift={self.state.lift_target:.2f} "
+                            f"fix_base={self.state.fix_base} "
+                            f"col={self.state.collision_avoidance}   ",
+                            end="", flush=True,
+                        )
+                        last_hud = time.time()
+                    rate.sleep()
         except KeyboardInterrupt:
             pass
         finally:
             self.source.stop()
-            print("\n[teleop] stopped.")
+            log("stopped.", style="yellow")
 
 
 def main() -> None:
@@ -802,6 +836,13 @@ def main() -> None:
                              "publisher are on different machines.")
     parser.add_argument("--step", type=float, default=0.02,
                         help="keyboard nudge step in metres")
+    parser.add_argument("--status-table", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="1 Hz Rich status table: targets vs the EE the "
+                             "node reports, the solver's own residuals, and "
+                             "the fingers. Default: on, except for --input "
+                             "keyboard, whose raw terminal wants the plain "
+                             "one-line HUD instead.")
     args = parser.parse_args()
     port = args.port if args.port is not None else TARGET_PORTS[args.target]
 
@@ -816,7 +857,7 @@ def main() -> None:
         cfg = AriaConfig.load(args.aria_config)
         if args.pub_host:
             cfg.publisher["host"] = args.pub_host
-        print(cfg.describe())
+        console.print(cfg.describe(), markup=False, highlight=False)
         source = AriaSource.from_config(cfg)
     else:
         source = OculusSource(host=args.oculus_host,
@@ -827,8 +868,15 @@ def main() -> None:
                               legacy_oculus_app=args.legacy_oculus_app,
                               clutch_reseed=args.clutch_reseed)
 
-    print(f"[teleop] target = {args.target}")
-    WholeBodyTeleop(source, host=args.host, port=port, rate_hz=args.rate).run()
+    # The table and a cbreak terminal both want to own the screen, and the
+    # keyboard backend's own feedback is per-keypress rather than per-second.
+    status_table = (args.input != "keyboard" if args.status_table is None
+                    else args.status_table)
+
+    log(f"target = {args.target}")
+    WholeBodyTeleop(source, host=args.host, port=port, rate_hz=args.rate,
+                    banner=f"YORv3 teleop - {args.input} -> {args.target}",
+                    status_table=status_table).run()
 
 
 if __name__ == "__main__":

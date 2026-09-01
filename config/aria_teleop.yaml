@@ -15,6 +15,20 @@ publisher:
   host: localhost
   port: 5555
 
+  # The publisher's clock-sync REP port (`stream_pub --clock-port`). The
+  # client and the publisher each stamp with their own wall clock, so the
+  # `p50/p95 ms` columns of the status table are only meaningful once the
+  # offset between the two is known -- on separate machines it is routinely
+  # bigger than the latency being measured. A publisher without the socket
+  # costs those two columns and nothing else.
+  clock_port: 5556
+
+  # Measure the subscription: receive counts, rate, latency and bandwidth per
+  # topic, shown as the `Stream` table. Costs one pickle per payload to size
+  # it, on the receive thread. The node's own finger subscription never runs
+  # this -- it is the client's link that the operator is watching.
+  stats: true
+
   # Release the clutch if nothing arrives for this long, in seconds.
   # commlink's buffer=False subscriber hands back the last payload forever, so
   # without this a publisher that dies mid-motion leaves the arm holding a
@@ -95,13 +109,14 @@ home:
   #
   # Thumbs up cannot be confused with the shaka: that one wants the pinky
   # extended, this one wants it curled.
+  #
+  # The *detection* is the publisher's: it owns the landmarks, and shipping 21
+  # points per hand across a wireless link so the robot could measure a thumb
+  # was most of the payload. What arrives here is a counter of completed
+  # gestures. Both the dwell and the released-hands gate therefore live in
+  # aria2robot (`stream_pub --home-dwell-s`, default 1.0 s), and this key is
+  # the local veto: false ignores the counter however the publisher is set up.
   gesture: true
-
-  # How long both thumbs must be held, in seconds. This is the whole safety
-  # margin against a passing thumb homing a real robot, so shorten it with
-  # care. The dwell runs from the *second* thumb up, so a staggered pair still
-  # holds both hands committed for the full time.
-  dwell_s: 1.0
 
 # sim_viz.py only — ignored by the RPC path.
 sim:
@@ -110,3 +125,40 @@ sim:
   solver: pyqpmad          # QP backend; qpsolvers names work too (daqp, ...)
   viser_port: 8080         # browser UI
   share: false             # request a public share URL
+
+# robot/hand/hands.py — the WUJI finger path. Ignored by the arm client and by
+# sim_viz.
+#
+# The hands live *inside* yor.py and yor_mujoco.py, but not on either node's
+# RPC socket: a ZMQ REP socket serves one caller at a time, so a finger target
+# sent there would queue behind the 30 Hz arm targets. Instead they subscribe
+# to the same publisher the arm client reads, on a thread of their own.
+hand:
+  # none      command nothing. The simulator still moves its fingers, because
+  #           it reads the targets in-process. The right setting for sim.
+  # hardware  drive real hands through wujihandpy. yor.py only.
+  backend: none
+
+  # wujihandpy Hand(serial_number=...). Blank picks whichever hand the USB bus
+  # enumerated first, which is fine for one hand and a coin flip for two — so
+  # with mapping.hand: both, the driver refuses to start until both are set.
+  serial:
+    left: "386C36603533"
+    right: "347238733433"
+
+  # A socket of the hands' own, for clients other than the Aria stream
+  # (set_hand_target / set_bimanual_hand_target / get_hand_state / home_hands /
+  # open_hands). Separate from the node's port on purpose — same reason as
+  # above. 0 disables it.
+  rpc_port: 5558
+
+  rate_hz: 100
+
+  # How long the *first* command to each hand takes to arrive. The first pose
+  # after an operator engages is a whole grasp and stepping to it from rest is
+  # a real hazard, so each side ramps once and streams after that. Hardware
+  # only — nothing to ramp when the backend commands nothing.
+  ramp_s: 1.5
+
+  # Cutoff of wujihandpy's own controller-side low-pass, in Hz.
+  lowpass_hz: 5.0

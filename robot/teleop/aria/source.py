@@ -5,10 +5,13 @@ each wrist pose commands one arm's end-effector, and the whole-body solver on
 the other end of the RPC decides how much of the reach the base, lift and arm
 each take.
 
-Arms only. The publisher also sends 20 retargeted finger angles per hand, but
-the RPC surface carries a single open/close gripper value, so nothing is done
-with them here — robot/teleop/aria/sim_viz.py renders them in full against its
-own model.
+Arms only, on purpose. The publisher also sends 20 retargeted finger angles per
+hand, and nothing is done with them here: they are read off the same `wuji`
+topic by `Hands`, which lives inside yor.py / yor_mujoco.py and subscribes on a
+thread of its own. Two independent paths off one publisher, so finger targets
+never queue behind arm targets on either node's single RPC socket -- a ZMQ REP
+socket serves one caller at a time. See robot/hand/hands.py.
+robot/teleop/aria/sim_viz.py renders the fingers in-process, without either.
 
 The lift is pinned once, on the first tick, to the height the server reports and
 never touched again. That single command is deliberate: both nodes start with
@@ -30,14 +33,19 @@ Homing is the one thing besides the arm targets this sends: *both* thumbs up
 with *both* hands disengaged runs the node's `home_arms` sequence. There is no
 single-arm variant -- that sequence locks the base and drives the lift to
 450 mm whichever arms it was asked for, so one thumb would move the whole robot
-to home one arm. Read off the published landmarks here rather than in the
-publisher, so the wire is unchanged and the gesture lives with the code that
-knows what home means. See gesture.py.
+to home one arm.
+
+Detecting it is the publisher's job, because the landmarks it needs are the
+publisher's and there is no reason to ship 21 points per hand across a wireless
+link so the robot can measure a thumb. What arrives here is `home_seq`, a count
+of completed gestures; this module watches for it to go up. Both the dwell and
+the released-hands gate live upstream, so a client that never sees the counter
+move can never home -- and because it is a total rather than an edge, a dropped
+packet costs nothing.
 """
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import mink
@@ -45,8 +53,9 @@ import numpy as np
 
 from robot.teleop.aria.clutch import Clutch
 from robot.teleop.aria.config import AriaConfig
-from robot.teleop.aria.gesture import HomeGesture
-from robot.teleop.aria.stream import AriaHandStream
+from robot.teleop.aria.stats import ClockSync, StreamStats
+from robot.teleop.aria.stream import AriaHandStream, HomeSeqWatcher
+from robot.teleop.status import SideStatus, SourceStatus, StreamRow, log
 from robot.teleop.wholebody_teleop import InputSource, TeleopCommand, TeleopState
 
 _REPO = Path(__file__).resolve().parents[3]
@@ -72,17 +81,19 @@ class AriaSource(InputSource):
         hold_lift: pin the lift to its current height on the first tick, so the
             solver cannot claim it. Off leaves the lift a free DOF.
         scene_xml: MJCF the flange->wrist offset and home orientation come from.
-        home_gesture: enable the two-hand thumbs-up home. Needs hand="both";
-            a single-hand session has no way to make the gesture.
-        home_dwell_s: how long both thumbs must be held before it fires.
+        home_gesture: act on the publisher's two-hand thumbs-up home. Needs
+            hand="both"; a single-hand session has no way to make the gesture,
+            and this is the local veto on one that can. The dwell itself is a
+            publisher setting (`stream_pub --home-dwell-s`).
     """
 
     def __init__(self, host: str, port: int = 5555, hand: str = "both",
                  position_scale: float = 1.0, follow_orientation: bool = True,
                  clutch_reseed: bool = True, stale_s: float | None = 0.5,
                  hold_lift: bool = True, scene_xml: str | None = None,
-                 home_gesture: bool = True, home_dwell_s: float = 1.0,
-                 translation_frame: str = "world"):
+                 home_gesture: bool = True,
+                 translation_frame: str = "world", stats: bool = True,
+                 clock_port: int = 5556):
         self._sides = ("left", "right") if hand == "both" else (hand,)
         self._position_scale = float(position_scale)
         self._follow_orientation = bool(follow_orientation)
@@ -91,15 +102,24 @@ class AriaSource(InputSource):
         self._hold_lift = bool(hold_lift)
         self._lift_pinned = False
         self._scene_xml = Path(scene_xml) if scene_xml else DEFAULT_SCENE
+        # Measured on the client's own subscription -- not the node's, which
+        # reads the same publisher for the fingers on a link of its own.
+        self._stats = (StreamStats(AriaHandStream.TOPICS) if stats else None)
+        self._clock_sync = (ClockSync(host, int(clock_port), self._stats)
+                            if self._stats is not None and clock_port else None)
         self._stream = AriaHandStream(host, port, sides=self._sides,
-                                      stale_s=stale_s)
+                                      stale_s=stale_s, stats=self._stats)
         self._clutches: dict[str, Clutch] = {}
-        self._home = (HomeGesture(self._sides, home_dwell_s)
-                      if home_gesture else None)
-        # Wall clock, not accumulated dt: the loop is handed a nominal 1/rate,
-        # so a slow tick would stretch the dwell past what the config says.
-        # Swappable so the gesture tests can run a dwell without sleeping
-        self._clock = time.monotonic
+        # Last tick's per-side row for the client's status table. Written by
+        # update() rather than rebuilt on demand, so what the table shows is
+        # the sample that was acted on and not a fresher one taken since.
+        self._status: dict[str, SideStatus] = {}
+        # Two hands or nothing, same rule the publisher applies: homing is one
+        # indivisible sequence on the robot, so one thumb must not reach it.
+        self._home_wanted = bool(home_gesture)
+        self._home = (HomeSeqWatcher()
+                      if home_gesture and len(self._sides) == 2 else None)
+        self._warned_no_home = False
 
     @classmethod
     def from_config(cls, cfg: AriaConfig) -> AriaSource:
@@ -115,7 +135,8 @@ class AriaSource(InputSource):
             hold_lift=cfg.clutch["hold_lift"],
             scene_xml=cfg.mapping["scene"],
             home_gesture=cfg.home["gesture"],
-            home_dwell_s=cfg.home["dwell_s"],
+            stats=cfg.publisher["stats"],
+            clock_port=cfg.publisher["clock_port"],
         )
 
     def start(self) -> None:
@@ -134,16 +155,33 @@ class AriaSource(InputSource):
             )
             for side in self._sides
         }
-        print(f"[aria] sides={'+'.join(self._sides)} "
-              f"scale={self._position_scale:.2f} "
-              f"follow_orientation={self._follow_orientation} "
-              f"translation={self._translation_frame}")
-        if self._home is not None and not self._home.available:
-            print("[aria] home gesture off: it needs both hands "
-                  f"(hand={'+'.join(self._sides)})")
+        log(f"sides={'+'.join(self._sides)} "
+            f"scale={self._position_scale:.2f} "
+            f"follow_orientation={self._follow_orientation} "
+            f"translation={self._translation_frame}", prefix="aria")
+        if self._home_wanted and self._home is None:
+            log("home gesture off: it needs both hands "
+                f"(hand={'+'.join(self._sides)})", style="yellow", prefix="aria")
         self._stream.start()
+        # Best-effort and off-thread: the first handshake retries for several
+        # seconds against a publisher that has no clock socket, and the arms
+        # are waiting on start(). Latency reads '--' until it lands.
+        if self._clock_sync is not None:
+            self._clock_sync.start(on_sync=self._log_clock)
+
+    @staticmethod
+    def _log_clock(sample: tuple[float, float] | None) -> None:
+        """Report the first handshake, from the clock thread."""
+        if sample is None:
+            log("clock handshake failed -- stream latency will read '--'",
+                style="yellow", prefix="aria")
+        else:
+            log(f"clock offset {sample[0] * 1e3:+.2f} ms "
+                f"(rtt {sample[1] * 1e3:.2f} ms)", prefix="aria")
 
     def stop(self) -> None:
+        if self._clock_sync is not None:
+            self._clock_sync.stop()
         self._stream.stop()
 
     def update(self, state: TeleopState, dt: float) -> TeleopCommand:
@@ -153,7 +191,7 @@ class AriaSource(InputSource):
         if self._hold_lift and not self._lift_pinned:
             self._lift_pinned = True
             cmd.lift_target = float(state.lift_target)
-            print(f"\n[aria] lift pinned at {cmd.lift_target:.3f} m")
+            log(f"lift pinned at {cmd.lift_target:.3f} m", prefix="aria")
         snap = self._stream.snapshot()
         for side in self._sides:
             clutch, s = self._clutches[side], snap[side]
@@ -170,35 +208,75 @@ class AriaSource(InputSource):
             want = not s.paused and s.T_odom_wrist is not None
             if want and not clutch.engaged:
                 clutch.engage(s.T_odom_wrist, self._engage_pose(side, state))
-                print(f"\n[aria] {side} arm: ENGAGED")
+                log(f"{side} arm: ENGAGED", style="green", prefix="aria")
             elif not want and clutch.engaged:
                 clutch.release()
-                print(f"\n[aria] {side} arm: released")
+                log(f"{side} arm: released", style="yellow", prefix="aria")
             if s.T_odom_wrist is None:
+                # Distinct from "paused": the publisher is talking, the hand
+                # is just not in view, and no shaka will fix it.
+                self._status[side] = SideStatus("no track")
                 continue
             target = clutch.target(s.T_odom_wrist)
             if target is not None:
                 setattr(cmd, f"{side}_target", target)
+            self._status[side] = SideStatus(
+                "ENGAGED" if clutch.engaged else "paused")
         self._maybe_home(cmd, snap)
         return cmd
 
+    def status(self) -> SourceStatus:
+        """Engagement off the tick `update()` just ran, plus the link's stats.
+
+        Engagement is cached rather than re-snapshotted, so the table
+        describes the sample that was actually acted on. A side the session
+        does not run is absent, which the display renders as dashes.
+        """
+        streams: tuple[StreamRow, ...] = ()
+        if self._stats is not None:
+            snap = self._stats.snapshot()
+            streams = tuple(
+                StreamRow(t, *snap[t]) for t in self._stats.topics)
+        return SourceStatus(sides=dict(self._status), streams=streams)
+
     def _maybe_home(self, cmd: TeleopCommand, snap: dict) -> None:
-        """Both thumbs up, both hands disengaged -> the node's home_arms."""
+        """The publisher's home counter went up -> the node's home_arms."""
         if self._home is None:
             return
-        fired = self._home.update(
-            kp={side: snap[side].kp_odom for side in self._sides},
-            released={side: not self._clutches[side].engaged
-                      for side in self._sides},
-            now=self._clock(),
-        )
-        if not fired:
+        self._check_publisher_can_home()
+        if not self._home.update(self._stream.home_seq()):
+            return
+        # Belt and braces. The publisher already required both sides paused for
+        # a full dwell, and the loop above has released their clutches by now,
+        # so this is free -- but "nothing is following either hand" is the whole
+        # safety argument for homing without a confirmation, and it is worth
+        # asserting locally rather than trusting a remote definition of paused.
+        if any(self._clutches[s].engaged for s in self._sides):
+            log("ignoring home: a hand is still engaged", style="yellow",
+                prefix="aria")
             return
         # home_arms is the node's own sequence -- base lock, lift to 450 mm,
         # then both arms. home_left_arm / home_right_arm run that same
         # preamble for one arm, which is why no gesture asks for them
         cmd.home_arms = True
-        print("\n[aria] both thumbs up -> home arms")
+        log("both thumbs up -> home arms", style="yellow", prefix="aria")
+
+    def _check_publisher_can_home(self) -> None:
+        """Say so once if the publisher physically cannot send the gesture.
+
+        A `--hand left` publisher never increments the counter, so a two-handed
+        client would otherwise wait for a home that can never arrive.
+        """
+        if self._warned_no_home:
+            return
+        meta = self._stream.meta()
+        if meta is None:
+            return
+        self._warned_no_home = True
+        if meta.get("home") is False:
+            log(f"publisher runs hand={'+'.join(meta.get('sides') or ['?'])}; "
+                "the home gesture needs both -- homing is off this session",
+                style="yellow", prefix="aria")
 
     def _engage_pose(self, side: str, state: TeleopState) -> mink.SE3:
         """Where to anchor the clutch: the robot's actual EE, or the local target."""
@@ -207,7 +285,8 @@ class AriaSource(InputSource):
             key = f"{side}_ee_wxyz_xyz"
             if srv and srv.get(key) is not None:
                 return mink.SE3(np.array(srv[key]))
-            print(f"\n[aria] {side} engage reseed failed -- using local target")
+            log(f"{side} engage reseed failed -- using local target",
+                style="yellow", prefix="aria")
         return getattr(state, f"{side}_target")
 
     def _model_anchors(self) -> tuple[dict[str, np.ndarray], dict[str, mink.SO3]]:
