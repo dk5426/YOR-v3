@@ -31,4 +31,4 @@ CLAUDE.md
 .vscode/
 
 # Sim console logs
-artifacts/wholebody_logs/yor_mujoco_*.log
+artifacts/

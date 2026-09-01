@@ -57,7 +57,7 @@ THOR_IP = '192.168.1.11'
 
 YOR_PORT = 5557
 LIFT_STARTUP_HOME_WAIT_S = 30.0
-LIFT_STARTUP_HEIGHT_M = 0.450
+LIFT_STARTUP_HEIGHT_M = 0.625
 
 
 def require_initialization(func):
@@ -884,7 +884,7 @@ class YOR:
         try:
             # Home means "return to a known pose", and the hand is part of
             # that. First, before the lift moves, so anything being held falls
-            # from where it is rather than from 450 mm up. Safe as a gesture
+            # from where it is rather than from 625 mm up. Safe as a gesture
             # because the home gesture needs both hands *released*.
             if self.hands is not None:
                 self.hands.open_hands(sides)
@@ -915,7 +915,7 @@ class YOR:
                 f"{LIFT_STARTUP_HEIGHT_M * 1000:.0f} mm from zero"
             )
             if not self.base.lift_to_height(LIFT_STARTUP_HEIGHT_M):
-                raise RuntimeError("lift did not reach the 450 mm arm-home height")
+                raise RuntimeError("lift did not reach the 625 mm arm-home height")
 
             for side in sides:
                 arm = self.left_arm if side == "left" else self.right_arm
@@ -954,12 +954,12 @@ class YOR:
 
     @require_initialization
     def home_left_arm(self) -> bool:
-        """Quest Y: lock base, lift to 450 mm, then home all left joints."""
+        """Quest Y: lock base, lift to 625 mm, then home all left joints."""
         return self._home_arm_joints(("left",))
 
     @require_initialization
     def home_right_arm(self) -> bool:
-        """Quest B: lock base, lift to 450 mm, then home all right joints."""
+        """Quest B: lock base, lift to 625 mm, then home all right joints."""
         return self._home_arm_joints(("right",))
 
     @require_initialization
