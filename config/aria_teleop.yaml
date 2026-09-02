@@ -139,9 +139,25 @@ hand:
   # hardware  drive real hands through wujihandpy. yor.py only.
   backend: none
 
+  # Which WUJI hands to drive: both, left, right, or none. Independent of
+  # mapping.hand, which stays `both` because whole-body IK wants both wrist
+  # targets — the fingers are a separate path, and one hand (or neither) may
+  # be plugged in. A side left out is never subscribed to, never driven and
+  # never opened by a home; its arm is teleoped exactly as before.
+  #
+  # `both` is the pre-existing behaviour: a one-armed session still gets only
+  # its own hand, since this is intersected with mapping.hand.
+  #
+  # You do not need this just because a hand is unplugged — the hardware driver
+  # opens each side on its own and drops one that does not answer, keeping the
+  # other. Set it when you have a hand plugged in and do not want it driven.
+  # `--hands both|left|right|none` overrides it for one run, since which hands
+  # are plugged in tracks the machine rather than the session.
+  sides: both
+
   # wujihandpy Hand(serial_number=...). Blank picks whichever hand the USB bus
   # enumerated first, which is fine for one hand and a coin flip for two — so
-  # with mapping.hand: both, the driver refuses to start until both are set.
+  # when two hands are driven, the driver refuses to start until both are set.
   serial:
     left: "386C36603533"
     right: "347238733433"

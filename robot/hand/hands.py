@@ -67,8 +67,7 @@ class Hands:
                  tracking_csv: Path | None = None):
         self.cfg = cfg
         hand_cfg = cfg.hand
-        mapped = cfg.mapping["hand"]
-        self.sides = ("left", "right") if mapped == "both" else (mapped,)
+        self.sides = cfg.hand_sides()
         self.backend = str(hand_cfg["backend"])
         self.rate_hz = int(hand_cfg["rate_hz"])
         self.rpc_port = int(hand_cfg["rpc_port"]) if rpc else 0
@@ -104,6 +103,10 @@ class Hands:
             return
         self._started = True
         self.driver.start()
+        # The hardware driver drops a side whose hand did not answer -- one
+        # unplugged hand must not cost the other. Follow it, so nothing
+        # subscribes to, reports or sends at a device that is not there.
+        self._narrow(tuple(self.driver.sides))
         if self._want_aria:
             from robot.teleop.aria.stream import AriaHandStream
 
@@ -128,6 +131,19 @@ class Hands:
         print(f"[wuji] hands={'+'.join(self.sides)} backend={self.backend} "
               f"aria={'on' if self._want_aria else 'off'} "
               f"rpc={self.rpc_port or 'off'} rate={self.rate_hz} Hz")
+
+    def _narrow(self, sides: tuple[str, ...]) -> None:
+        """Serve only `sides` from here on. Called once, before the loop runs."""
+        if tuple(sides) == self.sides:
+            return
+        print(f"[wuji] serving {'+'.join(sides) or 'no hands'}, "
+              f"not {'+'.join(self.sides)}")
+        self.sides = tuple(sides)
+        with self._lock:
+            for d in (self._target, self._engaged, self._origin, self._sent,
+                      self._sends):
+                for side in [s for s in d if s not in self.sides]:
+                    del d[side]
 
     def stop(self) -> None:
         """Release the hands, then the sockets. Safe to call twice, or early."""
@@ -308,6 +324,11 @@ def hands_from_args(args, force_backend: str | None = None) -> Hands | None:
     cfg = AriaConfig.load(getattr(args, "aria_config", None))
     if getattr(args, "pub_host", None):
         cfg.publisher["host"] = args.pub_host
+    if getattr(args, "hands", None):
+        cfg.hand["sides"] = args.hands
+    if not cfg.hand_sides():
+        print("[wuji] no hands this session; arms only")
+        return None
     backend = force_backend or getattr(args, "hand_backend", None)
     if backend:
         cfg.hand["backend"] = str(backend)
@@ -325,6 +346,10 @@ def add_hand_args(parser, backend_flag: bool = True) -> None:
                         help="settings file (default: config/aria_teleop.yaml)")
     parser.add_argument("--pub-host", default=None,
                         help="override hand publisher host -- where stream_pub runs")
+    parser.add_argument("--hands", choices=["both", "left", "right", "none"],
+                        default=None,
+                        help="which WUJI hands to drive (default: hand.sides); "
+                             "the arms are teleoped either way")
     if backend_flag:
         parser.add_argument("--hand-backend", choices=["none", "hardware"],
                             default=None, help="override hand.backend for one run")

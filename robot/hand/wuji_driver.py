@@ -139,25 +139,44 @@ class HardwareWujiDriver(WujiDriver):
                 "two hands need a serial each so the sides cannot swap; set "
                 f"hand.serial.{{{','.join(missing)}}} in config/aria_teleop.yaml"
             )
+        opened = []
         for side in self.sides:
             serial = self.serials.get(side) or ""
-            hand = (wujihandpy.Hand(serial_number=serial) if serial
-                    else wujihandpy.Hand())
-            # The server sends from its own loop thread and closes from the
-            # signal handler; the SDK's check would reject the second thread
-            disable_check = getattr(hand, "disable_thread_safe_check", None)
-            if callable(disable_check):
-                disable_check()
-            hand.write_joint_enabled(True)
+            try:
+                hand = (wujihandpy.Hand(serial_number=serial) if serial
+                        else wujihandpy.Hand())
+                # The server sends from its own loop thread and closes from the
+                # signal handler; the SDK's check would reject the second thread
+                disable_check = getattr(hand, "disable_thread_safe_check", None)
+                if callable(disable_check):
+                    disable_check()
+                hand.write_joint_enabled(True)
+                # enable_upstream costs bandwidth streaming state back; only pay
+                # it when something is going to read it
+                controller = hand.realtime_controller(
+                    enable_upstream=self.tracking_csv is not None,
+                    filter=wujihandpy.filter.LowPass(cutoff_freq=self.lowpass_hz),
+                )
+            except Exception as exc:
+                # One hand unplugged must not cost the other one. Opening by
+                # serial is unambiguous, so a side that does not answer is
+                # absent, not mistaken for its twin -- and the blank-serial
+                # refusal above has already run, so this cannot mask a swap.
+                print(f"[wuji] {side} hand did not open ({exc}); "
+                      "continuing without it")
+                continue
             self._hands[side] = hand
-            # enable_upstream costs bandwidth streaming state back; only pay it
-            # when something is going to read it
-            self._controllers[side] = hand.realtime_controller(
-                enable_upstream=self.tracking_csv is not None,
-                filter=wujihandpy.filter.LowPass(cutoff_freq=self.lowpass_hz),
-            )
+            self._controllers[side] = controller
+            opened.append(side)
             print(f"[wuji] {side} hand open"
                   + (f" (serial {serial})" if serial else " (first on the bus)"))
+        if not opened:
+            raise RuntimeError(
+                "no WUJI hand opened; check the USB connection, ~/.wuji "
+                f"provisioning and hand.serial for {'+'.join(self.sides)}")
+        # Everything downstream keys off this, so narrow it to what is really
+        # there rather than sending at a device that is not.
+        self.sides = tuple(opened)
         time.sleep(0.5)
 
         if self.tracking_csv is not None:

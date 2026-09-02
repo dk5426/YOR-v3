@@ -26,7 +26,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             "viser_port": 8080, "share": False},
     # robot/hand/hands.py -- the finger path, which both nodes own in-process
     # and which reads this same publisher on a thread of its own.
-    "hand": {"backend": "none", "serial": {"left": "", "right": ""},
+    "hand": {"backend": "none", "sides": "both",
+             "serial": {"left": "", "right": ""},
              "rpc_port": 5558, "rate_hz": 100, "ramp_s": 1.5,
              "lowpass_hz": 5.0},
 }
@@ -55,6 +56,23 @@ class AriaConfig:
         scene = Path(self.mapping["scene"])
         self.mapping["scene"] = scene if scene.is_absolute() else _REPO / scene
 
+    def hand_sides(self) -> tuple[str, ...]:
+        """Which WUJI hands to drive: a subset of the teleoped arms, possibly none.
+
+        Whole-body IK needs both wrist targets, so `mapping.hand` stays the
+        arms' setting; the fingers are a separate path and one hand -- or
+        neither -- may be plugged in. The default `both` is what every session
+        did before the key existed: the intersection below means a one-armed
+        session still gets exactly its own hand.
+        """
+        want = str(self.hand["sides"] or "both").lower()
+        if want == "none":
+            return ()
+        arms = (("left", "right") if self.mapping["hand"] == "both"
+                else (self.mapping["hand"],))
+        sides = ("left", "right") if want == "both" else (want,)
+        return tuple(s for s in sides if s in arms)
+
     @classmethod
     def load(cls, path: str | Path | None = None) -> AriaConfig:
         """Read the YAML, or return pure defaults if the file is absent."""
@@ -73,7 +91,8 @@ class AriaConfig:
         src = self.path.name if self.path else "defaults"
         return (f"[aria] config {src}: "
                 f"{self.publisher['host']}:{self.publisher['port']} "
-                f"hand={self.mapping['hand']} "
+                f"arms={self.mapping['hand']} "
+                f"hands={'+'.join(self.hand_sides()) or 'none'} "
                 f"scale={self.mapping['position_scale']} "
                 f"follow_orientation={self.mapping['follow_orientation']} "
                 f"translation={self.mapping['translation_frame']}")

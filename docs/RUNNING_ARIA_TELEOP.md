@@ -103,14 +103,14 @@ running. The startup line echoes what it resolved, so a typo is visible
 immediately:
 
 ```
-[aria] config aria_teleop.yaml: 10.21.63.99:5555 hand=both scale=1.0 …
+[aria] config aria_teleop.yaml: 10.21.63.99:5555 arms=both hands=left scale=1.0 …
 ```
 
 | Key | Default | Effect |
 | ----- | --------- | -------- |
 | `publisher.host` / `.port` | `localhost` / `5555` | where the publisher is; `--pub-host` overrides the host per run |
 | `publisher.stale_s` | `0.5` | release if the publisher goes quiet this long; `0` disables |
-| `mapping.hand` | `both` | the idle arm is never commanded |
+| `mapping.hand` | `both` | which **arms** are teleoped; the idle arm is never commanded. Not the hands — see `hand.sides` |
 | `mapping.position_scale` | `1.0` | robot EE travel per metre of wrist travel |
 | `mapping.follow_orientation` | `true` | `false` pins the EE to the model's home orientation — the way to check the position mapping alone |
 | `mapping.translation_frame` | `world` | which frame hand *translation* is read in. `world` keeps up meaning up; `wrist` is the older behaviour where translation rides the engage orientation too. Rotation is wrist-framed either way — see §3 |
@@ -120,6 +120,7 @@ immediately:
 | `home.gesture` | `true` | act on the publisher's two-thumbs home, which homes both arms **and opens both hands**. The dwell is `stream_pub --home-dwell-s`; this is the local veto |
 | `sim.*` | — | `sim_viz.py` only: solve rate, base posture cost, QP solver, viser port, share |
 | `hand.backend` | `none` | `none` commands nothing; the simulator still moves its fingers, since it reads the targets in-process. `hardware` drives real hands through `wujihandpy` (`yor.py` only) |
+| `hand.sides` | `both` | which **hands** are driven: `both`, `left`, `right`, `none`. Independent of `mapping.hand` — both arms stay teleoped either way. `--hands` overrides it per run. See §5 |
 | `hand.serial.left` / `.right` | `""` | which physical hand is which — **required for two hands**, see §5 |
 | `hand.rpc_port` | `5558` | a socket of the hands' own, separate from the node's — see §5. `0` disables it |
 | `hand.rate_hz` | `100` | hand loop rate; it sends on change only |
@@ -344,11 +345,13 @@ mjpython robot/yor_mujoco.py --pub-host <ip>                 # sim; backend is
                                                              # always "none"
 python robot/yor.py --pub-host <ip> --hand-backend hardware   # real hands
 python robot/yor.py --pub-host <ip>                           # dry: nothing driven
+python robot/yor.py --pub-host <ip> --hand-backend hardware \
+    --hands right                                             # one hand, both arms
 mjpython robot/yor_mujoco.py --no-hands                       # no subscription
 python robot/yor.py --no-hands                                # arms only, as before
 ```
 
-Three flags, identical on both nodes: `--no-hands`, `--aria-config`,
+Four flags, identical on both nodes: `--no-hands`, `--hands`, `--aria-config`,
 `--pub-host`. `yor.py` adds `--hand-backend {none,hardware}` and
 `--tracking-csv`. The simulator is pinned to backend `none` — it renders
 fingers, it never drives a USB device — so `hand.backend: hardware` in the YAML
@@ -356,6 +359,70 @@ cannot reach out of a sim run.
 
 To exercise the whole path without putting the glasses on, call
 `set_hand_target` / `set_bimanual_hand_target` / `open_hands` on port 5558.
+
+### One hand, or none
+
+`mapping.hand` is the **arms** and `hand.sides` is the **hands**, and they are
+deliberately not the same setting. Whole-body IK is one QP over both arms and
+wants both wrist targets, so the arms stay a pair; the fingers are the separate
+path drawn above, and how many WUJI hands are plugged into a given robot is a
+property of that robot on that day.
+
+```yaml
+hand:
+  sides: right      # both | left | right | none (default: both)
+```
+
+`--hands both|left|right|none` overrides it for one run, on either node — the
+same reason `--pub-host` is a flag: it tracks the machine, not the session.
+`--hands none` is exactly `--no-hands`, and the node says so:
+
+```
+[wuji] no hands this session; arms only
+[wuji] hands=right backend=hardware aria=on rpc=5558 rate=100 Hz
+```
+
+A side left out is never subscribed to, never driven, and never opened by a
+home — `open_hands` filters to the sides being served, so the two-thumbs home
+still homes both arms and simply has one fewer hand to open. Its arm is
+teleoped exactly as before: the clutch, the targets and the status table are
+untouched. Nothing else changes, on either node or on the wire; the publisher
+can keep sending both hands' `qpos` and the unserved one is dropped on arrival.
+
+**You do not have to set it just because a hand is unplugged.** With both
+serials in the config, `HardwareWujiDriver.start()` opens each side
+independently and a side that does not answer is dropped with a line, not
+raised:
+
+```
+[wuji] left hand did not open (no such device); continuing without it
+[wuji] right hand open (serial B)
+[wuji] serving right, not left+right
+```
+
+`Hands` then narrows to what actually opened, so nothing subscribes to,
+reports or sends at a device that is not there. Only *no* hand opening is an
+error. Opening by serial is unambiguous and the blank-serial refusal runs
+first, so a silent side is absent rather than mistaken for its twin — which is
+why this can be tolerant without risking a swap. Set `hand.sides` when you
+want a plugged-in hand *not* driven; leave it at `both` when you simply have
+one plugged in.
+
+Two consequences worth knowing:
+
+- **One hand needs no serial.** The refusal in §5's checklist is about *two*
+  hands sharing a USB bus. With `hand.sides: right` a blank `hand.serial.right`
+  takes whichever hand enumerated first, which is the right one when it is the
+  only one plugged in. Leaving both serials filled in is harmless — the unused
+  one is ignored.
+- **`sim_viz` reads the same key.** Its `--hand` flag is still the arms; the
+  fingers of an unserved side hold the model's home pose while its arm follows
+  you. There is no `--hands` flag there, to keep the two names apart.
+
+Note `none` and the default `both` are the two ends of the key — there is no
+"unset" state to reason about. A config file written before this key gets
+`both`, and since the result is intersected with `mapping.hand`, a one-armed
+session still gets exactly its own hand.
 
 ### The shaka means something different here
 
@@ -436,8 +503,8 @@ and writes it verbatim after that. Clipping on the write instead would nudge an
    `wujihandpy.Hand()` with no serial takes whichever hand the USB bus
    enumerated first, so with two plugged in the sides are a coin flip — and a
    swap means the left hand making the right hand's grasp. The driver refuses to
-   start rather than guess. A single-hand session (`mapping.hand: left`) may
-   leave it blank.
+   start rather than guess. A single-hand session (`hand.sides: left`, or
+   `--hands left`) may leave it blank.
 2. **The hands are commanded to rest at startup**, ramping over `hand.ramp_s`,
    as the last thing `HardwareWujiDriver.start()` does. Enabling the joints
    does not place them: until this runs the hand holds whatever pose it was
@@ -453,7 +520,8 @@ and writes it verbatim after that. Clipping on the write instead would nudge an
    hands still.
 4. **`yor.py` starts the hands last**, after the arms have homed, so nothing
    closes a hand while an arm is still travelling -- and a hand that fails to
-   open is **not fatal**. The node logs `hands failed to start` and runs the
+   open is **not fatal**, at either grain: one absent side leaves the other
+   running, and only a total failure drops the fingers. The node logs `hands failed to start` and runs the
    arms without fingers, rather than discarding a completed homing cycle. If
    you expected fingers and have none, that line is the first thing to look
    for in the startup log.
@@ -622,9 +690,12 @@ break.
 | Lift drifts down under load | Expected — `hold_lift` is a soft preference, see §6. |
 | Arms follow but the sim's fingers never move | `yor_mujoco.py` was started with `--no-hands`, or without `--pub-host <publisher-ip>` so it is subscribing to `localhost`. The sim holds the home keyframe and says nothing — a silent publisher is a no-op by design. |
 | Fingers move in `sim_viz` but not through `--input aria` | Different paths. `sim_viz` renders them off its own subscription; the node needs `--pub-host <publisher-ip>` (and not `--no-hands`) to reach the same stream. §5. |
+| One hand never moves; the other is fine | `hand.sides` (or `--hands`) is naming one side. The startup line `[wuji] hands=…` says which. §5. |
+| Fingers never move, `[wuji] no hands this session` in the log | `hand.sides: none` or `--hands none` — the arms-only setting. §5. |
 | Real hands do not move, sim fingers do | `hand.backend` is still `none` (the default). `--backend hardware`, and check the startup line names the serials. |
 | `two hands need a serial each so the sides cannot swap` | `hand.serial.left` / `.right` are unset. Deliberate refusal — a bare `Hand()` picks by USB enumeration order, so the sides would be a coin flip. §5. |
 | The left hand makes the right hand's grasp | The two serials are swapped in the config. |
+| One hand opens, the other logs `did not open` | Deliberate: that side is unplugged or unprovisioned, and the other keeps working. `[wuji] serving …` names what is left. §5. |
 | Arms work, fingers never move, no error | The node caught a hand failure and carried on. Search the startup log for `hands failed to start` — the exception is printed verbatim. Usual causes: `wujihandpy` not installed in the node's env, `~/.wuji` not provisioned for that serial, USB permissions, or the device still held by a previous run. |
 | The hand jumps when the operator first engages | Expected only if the startup rest ramp did not run — i.e. the driver failed to start, or a previous process left the hand enabled. §5.2. |
 | Hands stay closed after the operator shakas off | Working as designed — `held` means the pose stopped changing, not that the hand opened. §5. |

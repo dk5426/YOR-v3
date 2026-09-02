@@ -227,6 +227,72 @@ def test_hardware_zeroes_at_startup() -> None:
           src.find("realtime_controller") < src.find("self.home()"))
 
 
+def test_one_hand_unplugged_keeps_the_other() -> None:
+    """A hand that does not answer costs itself, not the pair.
+
+    The failure this replaces was total: `Hand(serial)` raised for the absent
+    side, `Hands.start()` propagated, and `yor.py` dropped `self.hands`
+    entirely -- so an operator with one hand plugged in got none. Opening by
+    serial is unambiguous, and the blank-serial refusal runs first, so a side
+    that stays silent is absent rather than mistaken for its twin.
+    """
+    print("\nunplugged hand")
+    import sys
+    import types
+
+    from robot.hand.hands import Hands
+    from robot.teleop.aria.config import AriaConfig
+
+    class _FakeHand:
+        def __init__(self, serial_number=""):
+            if serial_number == "GONE":
+                raise RuntimeError("no such device")
+            self.serial = serial_number
+
+        def disable_thread_safe_check(self): pass
+        def write_joint_enabled(self, on): pass
+        def realtime_controller(self, **kw): return _FakeController()
+
+    fake = types.ModuleType("wujihandpy")
+    fake.Hand = _FakeHand
+    fake.filter = types.SimpleNamespace(LowPass=lambda cutoff_freq: None)
+    saved = sys.modules.get("wujihandpy")
+    sys.modules["wujihandpy"] = fake
+    try:
+        d = HardwareWujiDriver(SIDES, serials={"left": "GONE", "right": "B"},
+                               ramp_s=0.0, ramp_steps=2)
+        d.start()
+        check("the hand that is there still opens", d.sides == ("right",))
+        check("and it was commanded to rest", np.allclose(d.commanded("right"), 0.0))
+        check("the absent one holds no controller", "left" not in d._controllers)
+
+        cfg = AriaConfig({})
+        cfg.hand["backend"] = "hardware"
+        cfg.hand["serial"] = {"left": "GONE", "right": "B"}
+        cfg.hand["ramp_s"] = 0.0
+        srv = Hands(cfg, aria=False, rpc=False)
+        srv.start()
+        try:
+            check("Hands follows the driver", srv.sides == ("right",))
+            check("the absent side is not reported",
+                  list(srv.get_hand_state()["qpos"]) == ["right"])
+            check("nor commandable", not srv.set_hand_target("left", np.zeros(N_JOINTS)))
+        finally:
+            srv.stop()
+
+        d = HardwareWujiDriver(SIDES, serials={"left": "GONE", "right": "GONE"})
+        try:
+            d.start()
+            check("no hands at all is still an error", False, "no raise")
+        except RuntimeError as exc:
+            check("no hands at all is still an error", "no WUJI hand" in str(exc))
+    finally:
+        if saved is None:
+            del sys.modules["wujihandpy"]
+        else:
+            sys.modules["wujihandpy"] = saved
+
+
 def test_hands_start_is_not_fatal() -> None:
     """A finger fault must not take down a node whose arms are already homed.
 
@@ -335,6 +401,47 @@ def test_server_hold_last() -> None:
     srv._pull_aria()
     check("lost tracking holds the last grasp",
           np.allclose(srv._target["left"], grasp))
+
+
+def test_hand_sides_are_independent_of_the_arms() -> None:
+    """`hand.sides` picks the hands; `mapping.hand` still picks the arms.
+
+    Whole-body IK wants both wrist targets, so a one-handed operator runs both
+    arms and one hand -- the two settings must not be the same setting.
+    """
+    print("\nhand.sides vs mapping.hand")
+    from types import SimpleNamespace
+
+    from robot.hand.hands import Hands, hands_from_args
+    from robot.teleop.aria.config import AriaConfig
+
+    cfg = AriaConfig({})
+    check("both by default", cfg.hand_sides() == ("left", "right"))
+    cfg.hand["sides"] = "right"
+    check("one hand, two arms", cfg.hand_sides() == ("right",)
+          and cfg.mapping["hand"] == "both")
+    cfg.hand["sides"] = "none"
+    check("none drives no hand at all", cfg.hand_sides() == ())
+    cfg.hand["sides"] = "both"
+    cfg.mapping["hand"] = "left"
+    check("never a hand on an unteleoped arm", cfg.hand_sides() == ("left",))
+
+    cfg = AriaConfig({})
+    cfg.hand["sides"] = "right"
+    srv = Hands(cfg, aria=False, rpc=False)
+    check("only the chosen side is served", srv.sides == ("right",))
+    check("a target for the other side is refused",
+          not srv.set_hand_target("left", np.zeros(N_JOINTS)))
+    check("homing both arms only opens the hand that exists",
+          srv.open_hands(("left", "right"))
+          and list(srv.targets()) == ["right"])
+
+    args = SimpleNamespace(no_hands=False, aria_config=None, pub_host=None,
+                           hands="none", hand_backend=None, tracking_csv=None)
+    check("--hands none is --no-hands", hands_from_args(args) is None)
+    args.hands = "left"
+    check("--hands left overrides the config",
+          hands_from_args(args).sides == ("left",))
 
 
 def test_server_rpc() -> None:
@@ -550,8 +657,10 @@ def main() -> int:
         test_hardware_ramp,
         test_hardware_needs_serials,
         test_hardware_zeroes_at_startup,
+        test_one_hand_unplugged_keeps_the_other,
         test_hands_start_is_not_fatal,
         test_server_hold_last,
+        test_hand_sides_are_independent_of_the_arms,
         test_server_rpc,
         test_server_sends_on_change_only,
         test_home_opens_the_hands,

@@ -61,7 +61,11 @@ sys.path.insert(0, str(_REPO))
 from robot.arm.wholebody_ik import WholeBodyIK, WholeBodyIKConfig
 from robot.teleop.aria.clutch import Clutch
 from robot.teleop.aria.config import AriaConfig
-from robot.teleop.aria.stream import AriaHandStream, HomeSeqWatcher, canonical_joint_names
+from robot.teleop.aria.stream import (
+    AriaHandStream,
+    HomeSeqWatcher,
+    canonical_joint_names,
+)
 from robot.teleop.status import console, fmt_xyz
 from robot.teleop.status import log as _log
 
@@ -142,6 +146,7 @@ def main() -> int:
 
     hand = cfg.mapping["hand"]
     sides = ("left", "right") if hand == "both" else (hand,)
+    wuji_sides = cfg.hand_sides()
     ik_rate = int(cfg.sim["ik_rate_hz"])
 
     log(f"scene: {cfg.mapping['scene']}")
@@ -154,7 +159,7 @@ def main() -> int:
     ik.init_from_keyframe("home")
     model, mj_data = ik.model, ik.data
     log(f"IK: {ik_rate} Hz, {ik.n_collision_pairs} collision pairs, "
-        f"sides={'+'.join(sides)}")
+        f"arms={'+'.join(sides)} hands={'+'.join(wuji_sides) or 'none'}")
 
     # The MJCF names hand joints exactly as wuji-description does, so the
     # published (20,) vector maps straight across with no reordering
@@ -388,7 +393,7 @@ def main() -> int:
                     # Shaka stops everything: the arm target freezes because the
                     # clutch is released, and the fingers freeze here rather than
                     # relying on the publisher to stop updating qpos while paused
-                    if not s.paused and s.qpos is not None:
+                    if side in wuji_sides and not s.paused and s.qpos is not None:
                         hand_cmd[side] = np.clip(s.qpos[:20], hand_lo[side],
                                                  hand_hi[side])
 
