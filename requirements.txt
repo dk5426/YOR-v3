@@ -42,3 +42,7 @@ scipy==1.16.3        # pose maths in base.py
 # sparkcan_py   git submodule; swerve motor control over CAN
 # pyodin        compiled in-tree from pyodin/ + odin_sdk/ via pyodin/build.sh;
 #               Linux + libusb only, so the SLAM stack does not run on macOS
+
+# Upgraded 2026-08-31 on Thor and Pi. 0.4.x replaced PUB/SUB with ROUTER/DEALER,
+# so it is wire-incompatible with 0.3.x: every machine on the bus must match.
+commlink>=0.4.2
