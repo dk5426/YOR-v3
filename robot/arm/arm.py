@@ -48,9 +48,9 @@ class ArmNode:
         self.is_left_arm = is_left_arm
         # URDF is for nerolib's own dynamics (gravity compensation), not IK.
         if is_left_arm:
-            self.urdf_path = (_ROOT / "nerolib/urdf/nero_cone-e_left_fixed_wuji.urdf").as_posix()
+            self.urdf_path = (_ROOT / "nerolib/urdf/nero_cone-e_left_fixed_tether.urdf").as_posix()
         else:
-            self.urdf_path = (_ROOT / "nerolib/urdf/right_arm_final_wuji.urdf").as_posix()
+            self.urdf_path = (_ROOT / "nerolib/urdf/right_arm_final_tether.urdf").as_posix()
 
         # Initialize nerolib NeroController
         self.control_mode_set = False

@@ -189,8 +189,8 @@ hand:
   # /dev/ttyUSB0). Blank auto-detects, which only works with exactly one Aero
   # hand on the bus — same two-hands-need-both-set rule as serial above.
   port:
-    left: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_10:20:BA:04:FF:A4-if00   # device 016
-    right: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_98:A3:16:F7:61:74-if00  # device 015
+    left: /dev/ttyACM0
+    right: /dev/ttyACM1
 
   # type: aero only. Per-actuator caps (0..32766 / 0..1000), re-applied on
   # every start since firmware resets to max on every power cycle.
