@@ -33,7 +33,7 @@ from robot.hand.wuji_driver import (
 )
 
 SIDES = ("left", "right")
-SCENE = _REPO / "description" / "scene_wholebody.xml"
+SCENE = _REPO / "description" / "scene_wholebody_wuji.xml"
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -267,6 +267,7 @@ def test_one_hand_unplugged_keeps_the_other() -> None:
         check("the absent one holds no controller", "left" not in d._controllers)
 
         cfg = AriaConfig({})
+        cfg.hand["type"] = "wuji"
         cfg.hand["backend"] = "hardware"
         cfg.hand["serial"] = {"left": "GONE", "right": "B"}
         cfg.hand["ramp_s"] = 0.0
@@ -358,6 +359,7 @@ def _server(sides=SIDES):
     from robot.teleop.aria.config import AriaConfig
 
     cfg = AriaConfig({})
+    cfg.hand["type"] = "wuji"
     cfg.mapping["hand"] = "both" if len(sides) == 2 else sides[0]
     srv = Hands(cfg, aria=False, rpc=False)
     srv._stream = _FakeStream()
@@ -427,6 +429,7 @@ def test_hand_sides_are_independent_of_the_arms() -> None:
     check("never a hand on an unteleoped arm", cfg.hand_sides() == ("left",))
 
     cfg = AriaConfig({})
+    cfg.hand["type"] = "wuji"
     cfg.hand["sides"] = "right"
     srv = Hands(cfg, aria=False, rpc=False)
     check("only the chosen side is served", srv.sides == ("right",))
@@ -437,7 +440,8 @@ def test_hand_sides_are_independent_of_the_arms() -> None:
           and list(srv.targets()) == ["right"])
 
     args = SimpleNamespace(no_hands=False, aria_config=None, pub_host=None,
-                           hands="none", hand_backend=None, tracking_csv=None)
+                           hands="none", hand="wuji", hand_backend=None,
+                           tracking_csv=None)
     check("--hands none is --no-hands", hands_from_args(args) is None)
     args.hands = "left"
     check("--hands left overrides the config",
@@ -555,6 +559,53 @@ def test_rpc_surface_is_narrow() -> None:
           np.allclose(srv._target["left"], 0.25))
 
 
+def test_hand_type_mismatch_is_fatal() -> None:
+    """A publisher declaring a different hand than configured must stop the node.
+
+    A mismatch here means every joint vector is misread -- an Aero-shaped
+    vector driven as WUJI's, or the reverse -- so this is fatal, not a
+    warning: on real hardware that is the wrong actuators moving to the
+    wrong angles. `_check_hand_type()` uses `os._exit()` rather than
+    `raise` because it runs on `_loop()`'s daemon thread, which wraps its
+    body in `except Exception` and would otherwise just print and swallow it.
+    """
+    print("\nhand.type vs publisher mismatch")
+    import os
+
+    class _FakeMetaStream:
+        def __init__(self, hand):
+            self._hand = hand
+
+        def meta(self):
+            return {"hand": self._hand} if self._hand else None
+
+    srv = _server()
+    srv._stream = _FakeMetaStream("aero")  # mismatch: _server() is wuji
+    calls = []
+    real_exit = os._exit
+    os._exit = lambda code: calls.append(code) or (_ for _ in ()).throw(SystemExit())
+    try:
+        srv._check_hand_type()
+        check("a mismatch calls os._exit", False, "no exit")
+    except SystemExit:
+        check("a mismatch calls os._exit", calls == [1], str(calls))
+    finally:
+        os._exit = real_exit
+    srv.stop()
+
+    srv2 = _server()
+    srv2._stream = _FakeMetaStream("wuji")  # matches
+    srv2._check_hand_type()
+    check("a match does not exit", srv2._hand_type_warned)
+    srv2.stop()
+
+    srv3 = _server()
+    srv3._stream = _FakeMetaStream(None)  # old publisher, no meta at all
+    srv3._check_hand_type()
+    check("no meta at all is not fatal", not srv3._hand_type_warned)
+    srv3.stop()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The sim injection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -665,6 +716,7 @@ def main() -> int:
         test_server_sends_on_change_only,
         test_home_opens_the_hands,
         test_rpc_surface_is_narrow,
+        test_hand_type_mismatch_is_fatal,
         test_sim_injection,
         test_injection_runs_after_the_solver,
     ):

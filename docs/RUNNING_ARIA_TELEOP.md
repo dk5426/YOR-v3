@@ -33,21 +33,37 @@ architecture is in [CLAUDE.md](../CLAUDE.md).
 
 ```bash
 # 1. publisher, from ~/nyu/aria2robot
-python -m aria2robot.stream_pub --wifi
+python -m aria2robot.stream_pub --wifi --hand wuji # or: --hand aero
 
-# 2. here
-python robot/teleop/aria/sim_viz.py --pub-host <publisher-ip>
+# 2. here -- --hand must match the publisher's own --hand above (see below)
+python robot/teleop/aria/sim_viz.py --pub-host <publisher-ip>                # arms only (default)
+python robot/teleop/aria/sim_viz.py --pub-host <publisher-ip> --hand wuji
+python robot/teleop/aria/sim_viz.py --pub-host <publisher-ip> --hand aero
 # -> http://localhost:8080
 ```
 
 Subscribes, runs YOR's own whole-body IK over `description/scene_wholebody.xml`
 and renders through mjviser. No RPC hop, no `mjpython`, no `yor_mujoco.py`, and
-no `Hands` — it drives the 20 finger joints straight into the same model, so
-it stays the **shortest** way to see them, and the only one where you can see the
-operator triad against the target. Use it to validate a frame change before
-touching hardware.
+no `Hands` — it drives the finger joints straight into the same model (20 for
+WUJI, 16 for Aero, none for arms-only), so it stays the **shortest** way to
+see them, and the only one where you can see the operator triad against the
+target. Use it to validate a frame change before touching hardware.
 
-Three flags: `--config`, `--pub-host`, `--hand`. Everything else is YAML.
+Four flags: `--config`, `--pub-host`, `--side` (arm side, `left|right|both` —
+`mapping.hand` in the YAML), `--hand` (`wuji`/`aero`, which hand to render —
+same name and meaning as `yor.py`/`yor_mujoco.py`'s own `--hand`; no
+collision, since the arm-side flag here is `--side`, not `--hand`).
+Everything else is YAML.
+
+**`--hand` is never auto-detected, but it is checked against the
+publisher.** Before opening its browser tab, `sim_viz.py` blocks briefly on
+the publisher's `meta` topic (`AriaHandStream.wait_for_meta()`) and, if
+`meta["hand"]` disagrees with `--hand`/`hand.type` here, exits immediately
+with an error rather than silently misreading every joint — exactly what
+`Hands` does on the RPC path (§1B) too, via `_check_hand_type()`. Only a
+publisher that never sends `meta["hand"]` at all (an older, pre-wire-2
+build) skips the check silently, since there is nothing to compare against;
+otherwise, mismatched `--hand` flags are refused, not silently wrong.
 
 ### B. `--input aria` — the RPC path (sim or robot)
 
@@ -56,12 +72,21 @@ so any of them can be restarted underneath the others:
 
 ```bash
 # 1. publisher — on the machine the glasses stream to, from ~/nyu/aria2robot
-python -m aria2robot.stream_pub --wifi
+python -m aria2robot.stream_pub --wifi --hand wuji # or: --hand aero
 
-# 2. the whole-body server — the hands live in here too (§5)
-mjpython robot/yor_mujoco.py --pub-host <publisher-ip>   # sim,   :8081
-python robot/yor.py --pub-host <publisher-ip> \
-    --hand-backend hardware                              # robot, :5557
+# 2. the whole-body server — the hands live in here too (§5). --hand also
+#    picks the matching MJCF scene variant (bare/wuji/aero, see §2's
+#    hand.type row) on both nodes.
+mjpython robot/yor_mujoco.py --pub-host <publisher-ip>                # sim,   :8081, arms only (default)
+mjpython robot/yor_mujoco.py --pub-host <publisher-ip> --hand wuji    # sim,   WUJI fingers rendered
+mjpython robot/yor_mujoco.py --pub-host <publisher-ip> --hand aero    # sim,   Aero fingers rendered
+
+python robot/yor.py --pub-host <publisher-ip>                         # robot, :5557, arms only (default)
+python robot/yor.py --pub-host <publisher-ip> --hand wuji              # robot, real WUJI hand
+python robot/yor.py --pub-host <publisher-ip> --hand aero              # robot, real Aero hand
+#   yor.py is hardware-only, so --hand-backend defaults to hardware once a
+#   hand is actually given -- add --hand-backend none yourself for the rare
+#   case of exercising the software path with no hand plugged in.
 
 # 3. the client — same machine as step 1, so publisher.host defaults to localhost
 python robot/teleop/wholebody_teleop.py --input aria --target sim      # sim
@@ -71,6 +96,11 @@ python robot/teleop/wholebody_teleop.py --input aria --host <robot-ip> # robot
 python robot/teleop/wholebody_teleop.py --input aria \
     --host localhost --pub-host <publisher-ip>
 ```
+
+`--hand` is optional and defaults to `hand.type` in `config/aria_teleop.yaml`
+(itself `none` — arms only, out of the box). Step 3's client never takes
+`--hand` itself; which hand (if any) is driven is entirely a property of
+step 2's server, picked once when it starts.
 
 `--target hw` is the default, so the robot form is the shorter one. Nothing on
 the robot changes between Aria and Quest — the backend is entirely client-side.
@@ -114,18 +144,21 @@ immediately:
 | `mapping.position_scale` | `1.0` | robot EE travel per metre of wrist travel |
 | `mapping.follow_orientation` | `true` | `false` pins the EE to the model's home orientation — the way to check the position mapping alone |
 | `mapping.translation_frame` | `world` | which frame hand *translation* is read in. `world` keeps up meaning up; `wrist` is the older behaviour where translation rides the engage orientation too. Rotation is wrist-framed either way — see §3 |
-| `mapping.scene` | `description/scene_wholebody.xml` | where the flange→wrist offset and pinned home orientation are read from |
+| `mapping.scene` | `""` (auto) | where the flange→wrist offset and pinned home orientation are read from. Empty auto-picks the scene for `hand.type`; an explicit path always overrides it |
 | `clutch.reseed` | `true` | engage anchors on the robot's actual EE, not the local target |
 | `clutch.hold_lift` | `true` | claim the lift on the first tick — see §6 |
 | `home.gesture` | `true` | act on the publisher's two-thumbs home, which homes both arms **and opens both hands**. The dwell is `stream_pub --home-dwell-s`; this is the local veto |
 | `sim.*` | — | `sim_viz.py` only: solve rate, base posture cost, QP solver, viser port, share |
-| `hand.backend` | `none` | `none` commands nothing; the simulator still moves its fingers, since it reads the targets in-process. `hardware` drives real hands through `wujihandpy` (`yor.py` only) |
+| `hand.type` | `none` | which hand hardware: `none` (arms only, no hand constructed at all — the default), `wuji` (WUJI five-finger) or `aero` (Tetheria Aero Hand Open). Both `wuji` and `aero` are sim-renderable, each with its own MJCF scene variant (`description/scene_wholebody{,_wuji,_aero}.xml`). Picked explicitly, never auto-detected from the publisher. `--hand` overrides it per run, the same flag name and meaning on `yor.py`, `yor_mujoco.py` and `sim_viz.py` (whose arm-side flag is `--side`, not `--hand`, so there is no collision). Checked once against the publisher's own declared `--hand`, and a mismatch is **fatal** — every joint vector is misread otherwise (an Aero-shaped vector driven as WUJI's, or the reverse), which on real hardware is the wrong actuators moving to the wrong angles. Skipped entirely when `hand.type: none` — arms-only never cares what hand the publisher retargets. Silent (not fatal) only when the publisher never sends `meta["hand"]` at all — an older, pre-wire-2 publisher |
+| `hand.backend` | `none` | `none` commands nothing; the simulator still moves its fingers, since it reads the targets in-process. `hardware` drives real hands through `wujihandpy` or `aero_open_sdk`, per `hand.type` (`yor.py` only) |
 | `hand.sides` | `both` | which **hands** are driven: `both`, `left`, `right`, `none`. Independent of `mapping.hand` — both arms stay teleoped either way. `--hands` overrides it per run. See §5 |
-| `hand.serial.left` / `.right` | `""` | which physical hand is which — **required for two hands**, see §5 |
+| `hand.serial.left` / `.right` | `""` | `hand.type: wuji` only — which physical hand is which — **required for two hands**, see §5 |
+| `hand.port.left` / `.right` | `""` | `hand.type: aero` only — the serial port per hand — **required for two hands**, same rule as `hand.serial` |
+| `hand.aero_speed` / `.aero_torque` | `32766` / `700` | `hand.type: aero` only — per-actuator caps, re-applied on every start since firmware resets to max on every power cycle |
 | `hand.rpc_port` | `5558` | a socket of the hands' own, separate from the node's — see §5. `0` disables it |
 | `hand.rate_hz` | `100` | hand loop rate; it sends on change only |
-| `hand.ramp_s` | `1.5` | how long the *first* command to each hand takes to arrive — see §5 |
-| `hand.lowpass_hz` | `5.0` | cutoff of wujihandpy's own controller-side filter |
+| `hand.ramp_s` | `1.5` | how long the *first* command to each hand takes to arrive — see §5. `hand.type: aero` also runs a one-time firmware homing (~175 s per hand, both hands in parallel) before this, at process startup only — **never repeated by a mid-session thumbs-up re-home** |
+| `hand.lowpass_hz` | `5.0` | `hand.type: wuji` only — cutoff of wujihandpy's own controller-side filter |
 
 `mapping.scene` must be the same robot the server is running. That offset is
 applied *through a rotation*, so a value that disagrees is not a constant bias —
@@ -310,18 +343,23 @@ gesture. It, too, only stops new targets.
 
 ## 5. The hands: a second subscriber, inside the node
 
-The arms and the fingers come off the **same** `wuji` payload, but they are read
+The arms and the fingers come off the **same** `qpos` payload, but they are read
 by two different subscribers that share nothing else:
 
 ```
-aria2robot stream_pub ──PUB "wuji"──┬──▶ wholebody_teleop.py --input aria
+aria2robot stream_pub ──PUB "qpos"──┬──▶ wholebody_teleop.py --input aria
    (publisher host)                  │      ──RPC :5557/:8081──▶ arms, lift, base
                                      │
                                      └──▶ Hands, inside yor.py / yor_mujoco.py
                                             ├─ RPC :5558   other clients (own socket)
-                                            ├─ wujihandpy ──▶ the real hands
+                                            ├─ wujihandpy or aero_open_sdk ──▶ the real hands
                                             └─ targets() ──▶ the simulator's data.qpos
 ```
+
+The examples below stay WUJI-specific — `hand.type: aero` swaps in
+`robot/hand/aero_driver.py` behind the same `Hands` orchestration, and has
+its own MJCF scene variant now too, so §7/§7b's sim viewing applies to it as
+well (pass `--hand aero` / `hand.type: aero` in place of `wuji` throughout).
 
 The hands are part of the robot node — started with it, stopped with it, and
 reported in its `get_state()` as `left_hand_qpos` / `right_hand_qpos`, so one
@@ -415,9 +453,10 @@ Two consequences worth knowing:
   takes whichever hand enumerated first, which is the right one when it is the
   only one plugged in. Leaving both serials filled in is harmless — the unused
   one is ignored.
-- **`sim_viz` reads the same key.** Its `--hand` flag is still the arms; the
-  fingers of an unserved side hold the model's home pose while its arm follows
-  you. There is no `--hands` flag there, to keep the two names apart.
+- **`sim_viz` reads the same key.** Its `--side` flag is the arms (its own
+  `--hand` is hand type, not this); the fingers of an unserved side hold the
+  model's home pose while its arm follows you. There is no `--hands` flag
+  there, to keep the two names apart.
 
 Note `none` and the default `both` are the two ends of the key — there is no
 "unset" state to reason about. A config file written before this key gets
@@ -597,7 +636,7 @@ instead — arms, stream, hands. Layout and columns:
 here specifically.
 
 **The `Stream` table is the client's own link, and it is where a bad session
-shows up first.** `wuji` FPS well under the publisher's rate means packets are
+shows up first.** `qpos` FPS well under the publisher's rate means packets are
 not arriving, not that the mapping is wrong; a `p95` far above `p50` is a
 link that stalls in bursts, which reaches the arms as stutter. Compare it
 against the publisher's own table (`stream_sub.py`) — same columns, same
@@ -630,7 +669,8 @@ change there (§1A, §7); these tables are for watching a session run.
 
 ```bash
 python tests/test_aria_mapping.py     # 112 checks — the arm mapping
-python tests/test_wuji_hand.py        #  60 checks — the finger path
+python tests/test_wuji_hand.py        #  92 checks — the finger path
+python tests/test_aero_hand.py        #  30 checks — the aero finger path
 python tests/test_teleop_status.py    #  44 checks — the client status table
 cd ../aria2robot && pytest            #  27 tests — gestures, wire, frames
 ```
@@ -650,17 +690,25 @@ rendering fixes — the marker one measured as 0.0000 mm on the hand versus
 The publisher's suite covers what moved up there: the thumbs-up detector, that
 it and the shaka can never both read true, `HoldTrigger`'s dwell and latch
 semantics, that a two-hand hold fires exactly once when driven at 200 Hz off a
-30 Hz gesture update (the trap that a naive port falls into), the `wuji`
+30 Hz gesture update (the trap that a naive port falls into), the `qpos`
 payload's key set and dtypes, and — load-bearing for the whole pre-composition
 — that `mano_wrist_frame` commutes with a rigid transform.
 
-`test_wuji_hand.py` covers the finger path with no hand and no publisher: the
-`(20,)` → `(5, 4)` layout against the MJCF's own joint names, that every hand
-joint address is contiguous so the published vector writes as one slice, the
-hold-last policy on all four of its cases (paused, pre-engage, lost tracking,
-nothing sent), the RPC surface's refusals and that it stays narrow,
-send-on-change, the hardware ramp being a ramp and not a step, and the
-simulator's injection — including that it lands *after* `apply_to_sim_kinematic` at every
+`test_wuji_hand.py` and `test_aero_hand.py` cover the finger path with no hand
+and no publisher: the `(20,)` → `(5, 4)` layout against the MJCF's own joint
+names (Aero's 16-joint order against `aero_open_sdk` when it is installed),
+that every hand joint address is contiguous against each hand's own scene
+variant (`scene_wholebody_wuji.xml` / `scene_wholebody_aero.xml`) so the
+published vector writes as one slice, that `hand.type` defaults to `none`
+(no `Hands` constructed at all) and `Hands` picks the right driver module for
+`wuji`/`aero`, that a publisher-declared hand disagreeing with `hand.type`
+calls `os._exit(1)` — not just a print a real exception handler would
+swallow — while a match, or an old publisher with no `meta["hand"]` at all,
+does not, the hold-last policy on all four of its cases (paused,
+pre-engage, lost tracking, nothing sent), the RPC surface's refusals and that
+it stays narrow, send-on-change, the hardware ramp being a ramp and not a
+step, that Aero's firmware homing runs only from `start()` and never from
+`home()`, and the simulator's injection — including that it lands *after* `apply_to_sim_kinematic` at every
 branch of the control loop, which is the one ordering a refactor can quietly
 break.
 

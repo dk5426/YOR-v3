@@ -5,14 +5,20 @@ The publisher stays in the aria2robot repo (`python -m aria2robot.stream_pub
 retargeting. Nothing here imports any of that. This module duck-types the
 payload, so the whole YOR side runs on a Jetson with no Aria dependency at all.
 
-Wire format, commlink topic `wuji`, version 2
+Wire format, commlink topic `qpos`, version 2
 ---------------------------------------------
   envelope   {"wire": 2, "seq": int, "home_seq": int,
               "t_pub": float, "t_wall": float,
               "left": {...}, "right": {...}}
-  per side   {"qpos":        (20,)  finger angles, wuji-description order
-              "T_odom_hand": (4,4)  the WUJI hand root in odom — drives control
+  per side   {"qpos":        (N,)   finger angles, in the active hand's own
+                                    joint order (WUJI: 20, Aero: 16)
+              "T_odom_hand": (4,4)  the hand root in odom — drives control
               "paused":      bool   the shaka toggle}
+
+Which hand (WUJI or Aero) is picked by config (`hand.type`), not by this
+payload -- the publisher also names it once, at low rate, in `meta["hand"]`,
+which `robot/hand/hands.py` checks against the configured type and warns
+loudly (never fatally) on a mismatch.
 
 `T_odom_hand` arrives pre-composed. It used to be `T_odom_device` and
 `T_device_hand` shipped separately for this module to multiply together, along
@@ -58,8 +64,8 @@ __all__ = ["AriaHandStream", "HomeSeqWatcher", "SideSample",
 
 class SideSample(NamedTuple):
     """One hand's worth of the latest payload."""
-    T_odom_wrist: np.ndarray | None  # the WUJI hand root in odom
-    qpos: np.ndarray | None          # (20,) finger angles, unclipped
+    T_odom_wrist: np.ndarray | None  # the hand root in odom
+    qpos: np.ndarray | None          # (N,) finger angles, unclipped
     paused: bool
 
 
@@ -93,7 +99,7 @@ class HomeSeqWatcher:
 
 
 class AriaHandStream:
-    """Background subscriber to the publisher's `meta` and `wuji` topics.
+    """Background subscriber to the publisher's `meta` and `qpos` topics.
 
     One daemon thread per topic pulls the newest payload and drops it into a
     lock-protected slot; `snapshot()` reads that slot. Consumers therefore run
@@ -110,7 +116,7 @@ class AriaHandStream:
             anything driving hardware.
     """
 
-    TOPICS = ("meta", "wuji")
+    TOPICS = ("meta", "qpos")
     STREAM_POLL_S = 0.005
     STATE_POLL_S = 0.2
 
@@ -218,7 +224,7 @@ class AriaHandStream:
                 self._ingest(msg)
 
     def _ingest(self, msg: dict) -> None:
-        """Decode one `wuji` payload into per-side samples. Pure: dict in, slot out."""
+        """Decode one `qpos` payload into per-side samples. Pure: dict in, slot out."""
         # Pre-wire-2 publishers shipped the two halves separately and left the
         # multiply to us. Kept for one release: the two repos deploy to
         # different machines, and "the arms do not move" is a worse thing to

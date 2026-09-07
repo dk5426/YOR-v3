@@ -14,7 +14,7 @@
     No physics / no mj_step needed.
   -->
 
-  <include file="robot_wholebody.xml"/>
+  <include file="robot_wholebody_aero.xml"/>
 
   <!-- ======================== SCENE SETUP ======================== -->
   <statistic center="0 0 1.0" extent="2.0" meansize="0.05"/>
@@ -88,7 +88,7 @@
   <!--
     ======================== HOME KEYFRAME ========================
     Base now has 3 planar joints: base_x, base_y, base_yaw
-    Bare scene, no hand mounted: Total nq = 26
+    Aero hand mounted (16 joints/side): Total nq = 58
   -->
   <keyframe>
     <!--
@@ -99,7 +99,9 @@
             0 0 0 0
             0.2
             0.0 1.32 -1.71 1.31 0.0 0.0 0.0
+            0 0 0 0  0 0 0 0  0 0 0 0  0 0 0 0
             0.0 1.32  1.71 1.31 0.0 0.0 0.0
+            0 0 0 0  0 0 0 0  0 0 0 0  0 0 0 0
             0 0 0 0"/>
   </keyframe>
 

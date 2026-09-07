@@ -1,0 +1,163 @@
+<!-- Aero Right hand; wire order matches robot/hand/aero_driver.py::
+     canonical_joint_names('right') exactly (16 joints, no reordering).
+     Body pos/quat and joint axis/range are derived directly from the ROS2
+     URDF (aero-hand-open/ros2/src/aero_hand_open_description/urdf/
+     aero_hand_open_right.urdf) via tools/rebuild_aero_skeleton.py -- NOT
+     from aero-hand-open/sim_rl's MuJoCo Playground scene. That scene and the
+     URDF are two independently-parameterized sources (not just mirrored
+     differently -- e.g. the thumb's CMC-abduction axis sign is flipped
+     between them), and mixing them with the URDF-sourced palm mesh produced
+     a real mismatch between the mesh's knuckle bumps and the finger
+     skeleton. The URDF's own `{finger}_f_link` spring-visualization stub
+     bodies (Playground-RL-tendon-model-only, no URDF equivalent) are
+     dropped; each finger's proximal link is a direct child of this body,
+     matching the URDF's own base_link -> proximal_link joint. Per-joint
+     damping/armature/frictionloss aren't in the URDF and are kept from the
+     original Playground-derived values, keyed by joint role. Inertials and
+     the primitive-box collision proxies are also kept as-is (Playground- and
+     hand-tuned respectively; not implicated in the mesh/skeleton mismatch).
+     MuJoCo ignores euler/quat on the root body of an included fragment --
+     mount frame lives in the parent scene file (right_aero_hand_orient). -->
+<body name="right_aero_hand" gravcomp="1">
+    <geom type="mesh" mesh="right_frame_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+    <geom type="mesh" mesh="right_frame_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+    <geom type="box" size="0.006 0.006 0.006" pos="0.031 -0.0045 0.096" quat="-0.5 -0.5 -0.5 0.5" name="right_palm_collision_1" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.006 0.006 0.006" pos="0.009 -0.0045 0.096" quat="-0.5 -0.5 -0.5 0.5" name="right_palm_collision_2" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.006 0.006 0.006" pos="-0.014 -0.0045 0.096" quat="-0.5 -0.5 -0.5 0.5" name="right_palm_collision_3" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.006 0.006 0.006" pos="-0.036 -0.0045 0.081" quat="-0.5 -0.5 -0.5 0.5" name="right_palm_collision_4" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.029 0.01 0.023" pos="-0.028 -0.0015 0.034" quat="0.420605 -0.420605 -0.568411 -0.568411" name="right_palm_collision_5" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.016 0.044 0.015" pos="0.0 0.007 0.07" quat="-0.5 -0.5 -0.5 0.5" name="right_palm_collision_6" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.0071 0.042 0.013" pos="0.002 -0.014 0.0745" quat="0.700443 -0.092458 -0.092458 -0.700443" name="right_palm_collision_7" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.012 0.042 0.023" pos="0.002 -0.0015 0.052" quat="-0.5 -0.5 -0.5 0.5" name="right_palm_collision_8" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.022 0.020 0.023" pos="-0.003 -0.0015 0.022" quat="-0.5 -0.5 -0.5 0.5" name="right_palm_collision_9" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.002 0.018 0.017" pos="0.041 0.004 0.002" quat="-0.5 -0.5 -0.5 0.5" name="right_palm_collision_10" contype="1" conaffinity="1" group="3" />
+    <geom type="box" size="0.022 0.028 0.002" pos="0.047 0.02 0.022" quat="-0.5 -0.5 -0.5 0.5" name="right_palm_collision_11" contype="1" conaffinity="1" group="3" />
+    <body name="right_t_link" pos="0.028112 -0.0145 0.025363" quat="0.5794647295 -0.4057324126 0.4054094456 -0.5790034698">
+      <inertial pos="-0.000792597 0.00920489 0.00837042" quat="0.968785 -0.231969 -0.0564922 0.066746" mass="0.00893482" diaginertia="1.11708e-06 8.42419e-07 4.36164e-07" />
+      <joint name="right_thumb_cmc_abd" pos="0 0 0" axis="0 1 0" range="0 1.7453" damping="0.02" armature="0.001559127" frictionloss="0.02" />
+      <geom type="mesh" mesh="right_t_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+      <geom type="mesh" mesh="right_t_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+      <geom type="box" size="0.015 0.008 0.008" pos="-0.01 0.015 0.005" name="right_th_mp_collision" contype="1" conaffinity="1" group="3" />
+      <body name="right_thumb_mcp_link" pos="-0.003475 0.003808 0.019656" quat="0.9845249296 0.07702312228 -0.07983883099 0.135660837">
+        <inertial pos="-3.98621e-09 -0.0014303 0.0147562" quat="0.706814 0.0205256 -0.020536 0.706804" mass="0.0102694" diaginertia="1.58158e-06 1.39018e-06 6.7267e-07" />
+        <joint name="right_thumb_cmc_flex" pos="0 0 0" axis="1 0 0" range="0 0.9599" damping="0.02" armature="0.001559127" frictionloss="0.02" />
+        <geom type="mesh" mesh="right_thumb_mcp_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+        <geom type="mesh" mesh="right_thumb_mcp_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+        <geom type="box" size="0.008 0.01 0.016" pos="0 0.0 0.014" name="right_th_bs_collision_1" contype="1" conaffinity="1" group="3" />
+        <body name="right_thumb_proximal_link" pos="0 0.0033822 0.035848">
+          <inertial pos="-9.60413e-08 -0.00147723 0.0133935" quat="0.707028 -0.010773 0.0107885 0.707021" mass="0.00574573" diaginertia="6.77924e-07 5.00351e-07 3.51862e-07" />
+          <joint name="right_thumb_mcp" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.02" armature="0.001559127" frictionloss="0.02" />
+          <geom type="mesh" mesh="right_thumb_proximal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_thumb_proximal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+          <geom type="box" size="0.008 0.006 0.012" pos="0 -0.002 0.012" name="right_th_px_collision_1" contype="1" conaffinity="1" group="3" />
+          <body name="right_thumb_distal_link" pos="0 0.002206 0.029919">
+            <inertial pos="-0.00113926 -0.00130909 0.0133464" quat="0.698666 -0.140008 0.0513212 0.699736" mass="0.00692863" diaginertia="6.65186e-07 5.66522e-07 2.78338e-07" />
+            <joint name="right_thumb_ip" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.02" armature="0.001559127" frictionloss="0.02" />
+            <geom type="mesh" mesh="right_thumb_distal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+            <geom type="mesh" mesh="right_thumb_distal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+            <geom type="mesh" mesh="right_thumb_tip_link" pos="0 0.0059474 0.031823" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+            <geom type="mesh" mesh="right_thumb_tip_link" pos="0 0.0059474 0.031823" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+            <geom type="box" size="0.008 0.006 0.012" pos="0 -0.002 0.015" name="right_th_tip" contype="1" conaffinity="1" group="3" />
+            <site name="right_thumb_tip" pos="0 -0.005 0.027" size="0.009" rgba="1 0.35 0.35 1" />
+          </body>
+        </body>
+      </body>
+    </body>
+    <body name="right_index_proximal_link" pos="0.030626 -0.0011782 0.10542" quat="0.9995050671 0.0004568572396 0.02617302253 -0.01744663328">
+      <inertial pos="-6.14568e-08 -0.00357858 0.0205176" quat="0.706858 0.0179374 -0.0179385 0.7069" mass="0.00600337" diaginertia="8.89988e-07 8.65278e-07 2.05352e-07" />
+      <joint name="right_index_mcp_flex" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.1" armature="0.001559127" frictionloss="0.02" />
+      <geom type="mesh" mesh="right_index_proximal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+      <geom type="mesh" mesh="right_index_proximal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+      <geom type="box" size="0.006 0.006 0.013" pos="0 -0.003 0.019" contype="1" conaffinity="1" group="3" />
+      <body name="right_index_middle_link" pos="0 -0.0014554 0.043">
+        <inertial pos="2.38785e-08 -0.00110516 0.00939619" quat="0.706833 -0.0191908 0.0192032 0.70686" mass="0.0023759" diaginertia="1.62521e-07 1.35575e-07 7.42871e-08" />
+        <joint name="right_index_pip" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.05" armature="0.001559127" frictionloss="0.02" />
+        <geom type="mesh" mesh="right_index_middle_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+        <geom type="mesh" mesh="right_index_middle_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+        <geom type="box" size="0.006 0.005 0.010" pos="0 -0.001 0.006" contype="1" conaffinity="1" group="3" />
+        <body name="right_index_distal_link" pos="0 0 0.022">
+          <inertial pos="-0.00184412 0.000358323 0.0107277" quat="0.696253 -0.184428 0.0500635 0.69189" mass="0.00309312" diaginertia="1.89064e-07 1.75544e-07 6.39413e-08" />
+          <joint name="right_index_dip" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.05" armature="0.001559127" frictionloss="0.02" />
+          <geom type="mesh" mesh="right_index_distal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_index_distal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_index_tip_link" pos="0 0.003512 0.026776" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_index_tip_link" pos="0 0.003512 0.026776" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+          <geom type="box" size="0.005 0.005 0.01" pos="0 -0.003 0.014" name="right_if_tip" contype="1" conaffinity="1" group="3" />
+          <site name="right_index_tip" pos="0 -0.003 0.023" size="0.009" rgba="1 0.35 0.35 1" />
+        </body>
+      </body>
+    </body>
+    <body name="right_middle_proximal_link" pos="0.0075 0 0.106">
+      <inertial pos="-5.79907e-08 -0.00357858 0.0205176" quat="0.706861 0.0179374 -0.0179384 0.706897" mass="0.00600338" diaginertia="8.89988e-07 8.65279e-07 2.05352e-07" />
+      <joint name="right_middle_mcp_flex" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.1" armature="0.001559127" frictionloss="0.02" />
+      <geom type="mesh" mesh="right_middle_proximal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+      <geom type="mesh" mesh="right_middle_proximal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+      <geom type="box" size="0.006 0.006 0.013" pos="0 -0.003 0.019" contype="1" conaffinity="1" group="3" />
+      <body name="right_middle_middle_link" pos="0 -0.0014554 0.043">
+        <inertial pos="9.42153e-09 -0.00110516 0.00939618" quat="0.706832 -0.0191899 0.0192034 0.706861" mass="0.0023759" diaginertia="1.62521e-07 1.35575e-07 7.42872e-08" />
+        <joint name="right_middle_pip" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.05" armature="0.001559127" frictionloss="0.02" />
+        <geom type="mesh" mesh="right_middle_middle_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+        <geom type="mesh" mesh="right_middle_middle_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+        <geom type="box" size="0.006 0.005 0.010" pos="0 -0.001 0.006" contype="1" conaffinity="1" group="3" />
+        <body name="right_middle_distal_link" pos="0 0 0.022">
+          <inertial pos="-0.00184407 0.000358307 0.0107282" quat="0.696243 -0.184422 0.0500631 0.691902" mass="0.00309312" diaginertia="1.89075e-07 1.75556e-07 6.39407e-08" />
+          <joint name="right_middle_dip" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.05" armature="0.001559127" frictionloss="0.02" />
+          <geom type="mesh" mesh="right_middle_distal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_middle_distal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_middle_tip_link" pos="0 0.003512 0.026776" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_middle_tip_link" pos="0 0.003512 0.026776" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+          <geom type="box" size="0.005 0.005 0.01" pos="0 -0.003 0.014" name="right_mf_tip" contype="1" conaffinity="1" group="3" />
+          <site name="right_middle_tip" pos="0 -0.003 0.023" size="0.009" rgba="1 0.35 0.35 1" />
+        </body>
+      </body>
+    </body>
+    <body name="right_ring_proximal_link" pos="-0.015626 -0.0011782 0.10542" quat="0.9995050671 0.0004568572396 -0.02617302253 0.01744663328">
+      <inertial pos="-4.27735e-08 -0.00357857 0.0205176" quat="0.706879 0.0179383 -0.0179383 0.706879" mass="0.00600337" diaginertia="8.89987e-07 8.65277e-07 2.05351e-07" />
+      <joint name="right_ring_mcp_flex" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.1" armature="0.001559127" frictionloss="0.02" />
+      <geom type="mesh" mesh="right_ring_proximal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+      <geom type="mesh" mesh="right_ring_proximal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+      <geom type="box" size="0.006 0.006 0.013" pos="0 -0.003 0.019" contype="1" conaffinity="1" group="3" />
+      <body name="right_ring_middle_link" pos="0 -0.0014554 0.043">
+        <inertial pos="5.2917e-09 -0.00110519 0.0093962" quat="0.706846 -0.0191893 0.019202 0.706846" mass="0.00237591" diaginertia="1.62521e-07 1.35575e-07 7.42877e-08" />
+        <joint name="right_ring_pip" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.05" armature="0.001559127" frictionloss="0.02" />
+        <geom type="mesh" mesh="right_ring_middle_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+        <geom type="mesh" mesh="right_ring_middle_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+        <geom type="box" size="0.006 0.005 0.010" pos="0 -0.001 0.006" contype="1" conaffinity="1" group="3" />
+        <body name="right_ring_distal_link" pos="0 0 0.022">
+          <inertial pos="-0.00184407 0.000358289 0.0107282" quat="0.696244 -0.184422 0.050064 0.691901" mass="0.00309314" diaginertia="1.89076e-07 1.75558e-07 6.39409e-08" />
+          <joint name="right_ring_dip" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.05" armature="0.001559127" frictionloss="0.02" />
+          <geom type="mesh" mesh="right_ring_distal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_ring_distal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_ring_tip_link" pos="0 0.003512 0.026776" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_ring_tip_link" pos="0 0.003512 0.026776" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+          <geom type="box" size="0.005 0.005 0.01" pos="0 -0.003 0.014" name="right_rf_tip" contype="1" conaffinity="1" group="3" />
+          <site name="right_ring_tip" pos="0 -0.003 0.023" size="0.009" rgba="1 0.35 0.35 1" />
+        </body>
+      </body>
+    </body>
+    <body name="right_pinky_proximal_link" pos="-0.038266 -0.0036416 0.092393" quat="0.9980188733 0.001829976577 -0.05230407537 0.03491795139">
+      <inertial pos="-4.24866e-08 -0.00357857 0.0205176" quat="0.706879 0.0179383 -0.0179383 0.706879" mass="0.00600337" diaginertia="8.89987e-07 8.65277e-07 2.05351e-07" />
+      <joint name="right_pinky_mcp_flex" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.1" armature="0.001559127" frictionloss="0.02" />
+      <geom type="mesh" mesh="right_pinky_proximal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+      <geom type="mesh" mesh="right_pinky_proximal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+      <geom type="box" size="0.006 0.006 0.013" pos="0 -0.003 0.019" contype="1" conaffinity="1" group="3" />
+      <body name="right_pinky_middle_link" pos="0 -0.0014554 0.043">
+        <inertial pos="1.1729e-08 -0.00110519 0.0093962" quat="0.706846 -0.0191898 0.019202 0.706846" mass="0.00237591" diaginertia="1.6252e-07 1.35575e-07 7.42876e-08" />
+        <joint name="right_pinky_pip" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.05" armature="0.001559127" frictionloss="0.02" />
+        <geom type="mesh" mesh="right_pinky_middle_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+        <geom type="mesh" mesh="right_pinky_middle_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+        <geom type="box" size="0.006 0.005 0.010" pos="0 -0.001 0.006" contype="1" conaffinity="1" group="3" />
+        <body name="right_pinky_distal_link" pos="0 0 0.022">
+          <inertial pos="-0.00184407 0.000358264 0.0107282" quat="0.696242 -0.184421 0.0500633 0.691903" mass="0.00309314" diaginertia="1.89076e-07 1.75557e-07 6.3941e-08" />
+          <joint name="right_pinky_dip" pos="0 0 0" axis="1 0 0" range="0 1.5708" damping="0.05" armature="0.001559127" frictionloss="0.02" />
+          <geom type="mesh" mesh="right_pinky_distal_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_pinky_distal_link" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_pinky_tip_link" pos="0 0.003512 0.026776" contype="0" conaffinity="0" group="1" density="0" rgba="0.75 0.75 0.78 1" />
+          <geom type="mesh" mesh="right_pinky_tip_link" pos="0 0.003512 0.026776" contype="1" conaffinity="1" rgba="0.75 0.75 0.78 1" />
+          <geom type="box" size="0.005 0.005 0.01" pos="0 -0.003 0.014" name="right_pf_tip" contype="1" conaffinity="1" group="3" />
+          <site name="right_pinky_tip" pos="0 -0.003 0.023" size="0.009" rgba="1 0.35 0.35 1" />
+        </body>
+      </body>
+    </body>
+  </body>
+

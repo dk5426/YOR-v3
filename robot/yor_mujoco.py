@@ -17,7 +17,9 @@ sys.path.insert(0, str(_REPO))
 from commlink import RPCServer
 
 from robot.arm.wholebody_ik import DEFAULT_SCENE, WholeBodyIK, WholeBodyIKConfig
-from robot.hand.hands import Hands, add_hand_args, hands_from_args
+from robot.hand.hands import (
+    Hands, add_hand_args, hands_from_args, resolved_aria_config,
+)
 from robot.hand.wuji_driver import canonical_joint_names
 
 
@@ -29,12 +31,13 @@ class YORMujoco:
     serves the same RPC surface as the hardware node, so
     robot/teleop/wholebody_teleop.py drives either by changing only the port.
 
-    The WUJI fingers are owned by this process too, through `Hands`, but they
-    are deliberately *not* on that RPC surface: a REP socket serves one caller
-    at a time, so a finger target sent here would queue behind the 30 Hz arm
-    targets. `Hands` subscribes to the same aria2robot publisher the arm
-    client reads, on a thread of its own -- see robot/hand/hands.py. No
-    publisher is not an error: the hands hold whatever pose they already have.
+    The fingers (WUJI or Aero, per `hand.type`) are owned by this process too,
+    through `Hands`, but they are deliberately *not* on that RPC surface: a
+    REP socket serves one caller at a time, so a finger target sent here would
+    queue behind the 30 Hz arm targets. `Hands` subscribes to the same
+    aria2robot publisher the arm client reads, on a thread of its own -- see
+    robot/hand/hands.py. No publisher is not an error: the hands hold
+    whatever pose they already have.
     """
 
     _SWERVE_MODULES = (
@@ -71,6 +74,9 @@ class YORMujoco:
 
         self.model = self.ik.model
         self.data = self.ik.data
+        # Set before _init_hand_joints() so it can ask `hands` which joint
+        # names to look for (WUJI's 20 or Aero's 16, per hand.type).
+        self.hands: Hands | None = hands
         self._init_swerve_animation()
         self._init_target_markers()
         self._init_hand_joints()
@@ -123,7 +129,10 @@ class YORMujoco:
             side: self.data.qpos[adrs].copy()
             for side, adrs in self._hand_qpos_adrs.items()
         }
-        self.hands: Hands | None = hands if self._hand_qpos_adrs else None
+        # Narrow: drop `Hands` entirely if the scene has no matching joints
+        # for any side (e.g. hand.type: aero, which has no MJCF model yet).
+        if not self._hand_qpos_adrs:
+            self.hands = None
 
         # ── Control Loop ──────────────────────────────────────────────────────
         self.control_loop_thread: threading.Thread | None = None
@@ -475,19 +484,22 @@ class YORMujoco:
     # ── WUJI fingers ────────────────────────────────────────────────────────
 
     def _init_hand_joints(self) -> None:
-        """Cache each hand's 20 qpos addresses and joint ranges.
+        """Cache each hand's qpos addresses and joint ranges.
 
         A scene without hands still runs -- the fingers are simply not driven.
-        The order is `canonical_joint_names`, which is also the order
-        aria2robot publishes in, so a published (20,) vector writes as one
-        slice with no reordering.
+        The order is `self.hands.joint_names(side)` -- WUJI's 20 or Aero's 16,
+        per hand.type -- falling back to WUJI's own names when no `Hands` was
+        constructed at all, which is also the order aria2robot publishes in,
+        so a published vector writes as one slice with no reordering.
         """
+        names_fn = (self.hands.joint_names if self.hands is not None
+                    else canonical_joint_names)
         self._hand_qpos_adrs: dict[str, np.ndarray] = {}
         self._hand_qpos_lo: dict[str, np.ndarray] = {}
         self._hand_qpos_hi: dict[str, np.ndarray] = {}
         for side in ("left", "right"):
             try:
-                joints = [self.model.joint(n) for n in canonical_joint_names(side)]
+                joints = [self.model.joint(n) for n in names_fn(side)]
             except KeyError:
                 print(f"[sim] scene has no {side} hand joints; fingers not driven")
                 continue
@@ -674,8 +686,13 @@ if __name__ == "__main__":
 
     start_console_log("yor_mujoco", _REPO / "artifacts" / "wholebody_logs")
 
+    # --hand also picks the MJCF loaded below (which hand, if any, is
+    # mounted) -- even under --no-hands, which only short-circuits Hands
+    # construction, not scene selection.
+    scene_xml = str(resolved_aria_config(args).scene_path())
     # backend "none" always in sim: the fingers are rendered, not driven
-    yor_mujoco = YORMujoco(hands=hands_from_args(args, force_backend="none"))
+    yor_mujoco = YORMujoco(mjcf_path=scene_xml,
+                           hands=hands_from_args(args, force_backend="none"))
     yor_mujoco.start_control()
 
     rpc_server = RPCServer(yor_mujoco, 8081, threaded=False)

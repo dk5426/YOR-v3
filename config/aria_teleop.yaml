@@ -11,7 +11,7 @@
 
 publisher:
   # Where `python -m aria2robot.stream_pub` is running. Port 5555 is its
-  # commlink default; the topics consumed are `meta` and `wuji`.
+  # commlink default; the topics consumed are `meta` and `qpos`.
   host: localhost
   port: 5555
 
@@ -71,7 +71,12 @@ mapping:
   # offset is applied through a rotation — a value that disagrees becomes an arc
   # the hand swings through, not a constant bias. Relative paths resolve against
   # the repo root.
-  scene: description/scene_wholebody.xml
+  #
+  # "" (the default) auto-picks the scene for hand.type below -- the bare,
+  # hand-agnostic scene for "none", or the matching per-hand-type scene
+  # otherwise (see robot/hand/hands.py::scene_for_hand_type). Set this only to
+  # override that, e.g. to point at a scene this repo does not know about.
+  scene: ""
 
 clutch:
   # On engage, anchor to the robot's *actual* end-effector pose (one get_state
@@ -126,7 +131,7 @@ sim:
   viser_port: 8080         # browser UI
   share: false             # request a public share URL
 
-# robot/hand/hands.py — the WUJI finger path. Ignored by the arm client and by
+# robot/hand/hands.py — the finger path. Ignored by the arm client and by
 # sim_viz.
 #
 # The hands live *inside* yor.py and yor_mujoco.py, but not on either node's
@@ -134,12 +139,29 @@ sim:
 # sent there would queue behind the 30 Hz arm targets. Instead they subscribe
 # to the same publisher the arm client reads, on a thread of their own.
 hand:
+  # none  no hand -- arms only, the default. Nothing is constructed here at
+  #       all: no driver, no publisher subscription, no homing. A fresh
+  #       checkout runs arms-only with zero flags.
+  # wuji  the WUJI five-finger hand, via wujihandpy. Sim-renderable.
+  # aero  the Tetheria Aero Hand Open, via aero_open_sdk. Sim-renderable too,
+  #       as well as hardware.
+  # Picked explicitly, never auto-detected from the publisher — but checked
+  # once against the publisher's own declared hand and warned loudly (not
+  # fatally) on a mismatch, on the RPC path only (sim_viz.py never reads the
+  # publisher's meta topic at all, so a mismatch there just silently
+  # misreads the joint vector). `--hand wuji|aero` overrides for one run --
+  # same flag name and meaning on robot/yor.py, robot/yor_mujoco.py and
+  # sim_viz.py (whose arm side is --side, not --hand, so there is no
+  # collision).
+  type: none
+
   # none      command nothing. The simulator still moves its fingers, because
   #           it reads the targets in-process. The right setting for sim.
-  # hardware  drive real hands through wujihandpy. yor.py only.
+  # hardware  drive real hands through wujihandpy (type: wuji) or
+  #           aero_open_sdk (type: aero). yor.py only.
   backend: none
 
-  # Which WUJI hands to drive: both, left, right, or none. Independent of
+  # Which hands to drive: both, left, right, or none. Independent of
   # mapping.hand, which stays `both` because whole-body IK wants both wrist
   # targets — the fingers are a separate path, and one hand (or neither) may
   # be plugged in. A side left out is never subscribed to, never driven and
@@ -155,12 +177,25 @@ hand:
   # are plugged in tracks the machine rather than the session.
   sides: both
 
-  # wujihandpy Hand(serial_number=...). Blank picks whichever hand the USB bus
-  # enumerated first, which is fine for one hand and a coin flip for two — so
-  # when two hands are driven, the driver refuses to start until both are set.
+  # type: wuji only. wujihandpy Hand(serial_number=...). Blank picks whichever
+  # hand the USB bus enumerated first, which is fine for one hand and a coin
+  # flip for two — so when two hands are driven, the driver refuses to start
+  # until both are set.
   serial:
     left: "386C36603533"
     right: "347238733433"
+
+  # type: aero only. AeroHand(port=...), a serial device path (e.g.
+  # /dev/ttyUSB0). Blank auto-detects, which only works with exactly one Aero
+  # hand on the bus — same two-hands-need-both-set rule as serial above.
+  port:
+    left: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_10:20:BA:04:FF:A4-if00   # device 016
+    right: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_98:A3:16:F7:61:74-if00  # device 015
+
+  # type: aero only. Per-actuator caps (0..32766 / 0..1000), re-applied on
+  # every start since firmware resets to max on every power cycle.
+  aero_speed: 32766
+  aero_torque: 700
 
   # A socket of the hands' own, for clients other than the Aria stream
   # (set_hand_target / set_bimanual_hand_target / get_hand_state / home_hands /
@@ -174,7 +209,11 @@ hand:
   # after an operator engages is a whole grasp and stepping to it from rest is
   # a real hazard, so each side ramps once and streams after that. Hardware
   # only — nothing to ramp when the backend commands nothing.
+  #
+  # type: aero also runs a one-time firmware homing (~175s per hand, both
+  # hands in parallel) before this ramp, at process startup only — never
+  # repeated by a mid-session thumbs-up re-home.
   ramp_s: 1.5
 
-  # Cutoff of wujihandpy's own controller-side low-pass, in Hz.
+  # type: wuji only. Cutoff of wujihandpy's own controller-side low-pass, Hz.
   lowpass_hz: 5.0

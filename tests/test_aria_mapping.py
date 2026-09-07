@@ -39,7 +39,7 @@ from robot.teleop.aria.stream import (
 
 SIDES = ("left", "right")
 AXES = ("middle", "palm", "thumb")
-SCENE = _REPO / "description" / "scene_wholebody.xml"
+SCENE = _REPO / "description" / "scene_wholebody_wuji.xml"
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -827,12 +827,12 @@ def test_config():
     cfg = AriaConfig.load()
     check("every section parses",
           all(hasattr(cfg, s) for s in ("publisher", "mapping", "clutch", "sim")))
-    # Relative paths resolve against the repo root, since either entry point may
-    # be run from anywhere.
-    check("scene resolves to an absolute path that exists",
-          Path(cfg.mapping["scene"]).is_absolute()
-          and Path(cfg.mapping["scene"]).exists(),
-          str(cfg.mapping["scene"]))
+    # scene_path() auto-resolves from hand.type ("" default) against the repo
+    # root, since either entry point may be run from anywhere; an explicit
+    # mapping.scene always overrides it.
+    check("scene_path() resolves to an absolute path that exists",
+          cfg.scene_path().is_absolute() and cfg.scene_path().exists(),
+          str(cfg.scene_path()))
     check("hand is one the sources accept",
           cfg.mapping["hand"] in ("left", "right", "both"))
     check("translation_frame is one the clutch accepts",

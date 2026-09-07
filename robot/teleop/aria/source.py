@@ -81,6 +81,10 @@ class AriaSource(InputSource):
         hold_lift: pin the lift to its current height on the first tick, so the
             solver cannot claim it. Off leaves the lift a free DOF.
         scene_xml: MJCF the flange->wrist offset and home orientation come from.
+        hand_type: "wuji"/"aero"/None -- which hand (if any) that scene has
+            mounted, so the flange->wrist offset can be read off the right
+            body. None/"none" means no hand: the offset is zero, mapping the
+            operator's hand straight onto the bare flange.
         home_gesture: act on the publisher's two-hand thumbs-up home. Needs
             hand="both"; a single-hand session has no way to make the gesture,
             and this is the local veto on one that can. The dwell itself is a
@@ -91,10 +95,12 @@ class AriaSource(InputSource):
                  position_scale: float = 1.0, follow_orientation: bool = True,
                  clutch_reseed: bool = True, stale_s: float | None = 0.5,
                  hold_lift: bool = True, scene_xml: str | None = None,
+                 hand_type: str | None = None,
                  home_gesture: bool = True,
                  translation_frame: str = "world", stats: bool = True,
                  clock_port: int = 5556):
         self._sides = ("left", "right") if hand == "both" else (hand,)
+        self._hand_type = str(hand_type or "none").lower()
         self._position_scale = float(position_scale)
         self._follow_orientation = bool(follow_orientation)
         self._translation_frame = Clutch._checked_frame(str(translation_frame))
@@ -133,7 +139,8 @@ class AriaSource(InputSource):
             clutch_reseed=cfg.clutch["reseed"],
             stale_s=cfg.publisher["stale_s"] or None,
             hold_lift=cfg.clutch["hold_lift"],
-            scene_xml=cfg.mapping["scene"],
+            scene_xml=str(cfg.scene_path()),
+            hand_type=cfg.hand["type"],
             home_gesture=cfg.home["gesture"],
             stats=cfg.publisher["stats"],
             clock_port=cfg.publisher["clock_port"],
@@ -299,11 +306,17 @@ class AriaSource(InputSource):
         through as the wrist turns. Reading it from the same description the
         server loads is the only way it cannot drift.
 
+        With no hand mounted (or a scene/hand.type mismatch -- the mount body
+        this hand.type names is simply absent), the offset is zero: the
+        operator's hand maps straight onto the bare flange.
+
         Deliberately no WholeBodyIK here: after init_from_keyframe("home") its
         forward kinematics is this same qpos, and skipping the solver keeps the
         RPC client down to mujoco + mink + numpy + commlink.
         """
         import mujoco
+
+        from robot.hand.hands import hand_mount_body
 
         model = mujoco.MjModel.from_xml_path(str(self._scene_xml))
         data = mujoco.MjData(model)
@@ -312,9 +325,14 @@ class AriaSource(InputSource):
         offset, home_rot = {}, {}
         for side in self._sides:
             R_ee = data.site(f"{side}_arm_ee").xmat.reshape(3, 3)
-            offset[side] = R_ee.T @ (
-                data.body(f"{side}_wuji_hand_orient").xpos
-                - data.site(f"{side}_arm_ee").xpos
-            )
+            ee_pos = data.site(f"{side}_arm_ee").xpos
+            mount_name = hand_mount_body(self._hand_type, side)
+            mount_pos = ee_pos
+            if mount_name is not None:
+                try:
+                    mount_pos = data.body(mount_name).xpos
+                except KeyError:
+                    pass
+            offset[side] = R_ee.T @ (mount_pos - ee_pos)
             home_rot[side] = mink.SO3.from_matrix(R_ee)
         return offset, home_rot

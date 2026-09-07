@@ -59,13 +59,12 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal
 
+import mink
 import mujoco
 import numpy as np
 import qpsolvers
-
-import mink
 
 # Repo-relative description paths (repo_root/description/…), so the solver
 # works the same from a checkout on the robot as it does on a dev machine.
@@ -737,38 +736,44 @@ class WholeBodyIK:
     # only (proximal links sit 1-2 cm from the chassis at home and would lock).
     _BODY_COLLISION_LINKS = ["lift_slide_1"]
     _BASE_LINK            = "base_link"
-    _LEFT_ARM_LINKS  = (
-        [f"left_arm_link{i}"  for i in range(1, 8)]
-        + ["left_arm_end_effector", "left_wuji_nero_mount"]
-    )
-    _RIGHT_ARM_LINKS = (
-        [f"right_arm_link{i}" for i in range(1, 8)]
-        + ["right_arm_end_effector", "right_wuji_nero_mount"]
-    )
+    # Mount-body name appended once self._hand_kind is known (see __init__) --
+    # these base lists are hand-agnostic.
+    _LEFT_ARM_LINKS_BASE  = [f"left_arm_link{i}"  for i in range(1, 8)] + ["left_arm_end_effector"]
+    _RIGHT_ARM_LINKS_BASE = [f"right_arm_link{i}" for i in range(1, 8)] + ["right_arm_end_effector"]
     # Distal links only — safe to avoid against the chassis (≥7.7 cm at home).
-    _LEFT_DISTAL_LINKS  = (
-        [f"left_arm_link{i}"  for i in (5, 6, 7)]
-        + ["left_arm_end_effector", "left_wuji_nero_mount"]
-    )
-    _RIGHT_DISTAL_LINKS = (
-        [f"right_arm_link{i}" for i in (5, 6, 7)]
-        + ["right_arm_end_effector", "right_wuji_nero_mount"]
-    )
+    _LEFT_DISTAL_LINKS_BASE  = [f"left_arm_link{i}"  for i in (5, 6, 7)] + ["left_arm_end_effector"]
+    _RIGHT_DISTAL_LINKS_BASE = [f"right_arm_link{i}" for i in (5, 6, 7)] + ["right_arm_end_effector"]
     # Ground avoidance: floor plane vs arm spheres AND the hand's actual
     # collision meshes (palm + fingers). The finger meshes matter — fingertips
     # reach ~5 cm below the EE proxy sphere, so spheres alone would either
     # miss finger strikes or need a buffer so large the hand couldn't reach low.
     _FLOOR_GEOM = "floor"
-    _HAND_BODIES = {
-        side: [f"{side}_wuji_hand_orient"]
-        + [f"{side}_finger{f}_link{l}" for f in range(1, 6) for l in range(1, 5)]
-        for side in ("left", "right")
-    }
+    # Per-hand-type mount body and finger link names, keyed the same way
+    # robot/hand/hands.py's hand.type is -- "none" mounts nothing. Detected
+    # once from the loaded model in __init__ (self._hand_kind), never
+    # auto-guessed per call, so a scene/hand.type mismatch degrades the same
+    # way an unmatched name always has here: try/except KeyError, fewer
+    # collision pairs, never a crash.
+    _MOUNT_BODY = {"wuji": "{side}_wuji_nero_mount", "aero": "{side}_aero_mount"}
+    _ORIENT_BODY = {"wuji": "{side}_wuji_hand_orient", "aero": "{side}_aero_hand_orient"}
+
+    @staticmethod
+    def _hand_link_names(kind: str, side: str) -> list[str]:
+        if kind == "wuji":
+            return [f"{side}_finger{f}_link{l}" for f in range(1, 6) for l in range(1, 5)]
+        if kind == "aero":
+            fingers = [f"{side}_{fn}_{part}"
+                       for fn in ("index", "middle", "ring", "pinky")
+                       for part in ("f_link", "proximal_link", "middle_link", "distal_link")]
+            thumb = [f"{side}_t_link", f"{side}_thumb_mcp_link",
+                     f"{side}_thumb_proximal_link", f"{side}_thumb_distal_link"]
+            return fingers + thumb
+        return []
 
     def __init__(
         self,
-        scene_xml: Optional[str] = None,
-        config: Optional[WholeBodyIKConfig] = None,
+        scene_xml: str | None = None,
+        config: WholeBodyIKConfig | None = None,
     ) -> None:
         self.config = config or WholeBodyIKConfig()
         self.scene_xml = str(Path(scene_xml or DEFAULT_SCENE).resolve())
@@ -776,6 +781,36 @@ class WholeBodyIK:
         # ── Load model ───────────────────────────────────────────────────────
         self.model = mujoco.MjModel.from_xml_path(self.scene_xml)
         self.data  = mujoco.MjData(self.model)
+
+        # Which hand (if any) this scene has mounted, detected once from the
+        # model itself rather than trusted from the caller -- so self-
+        # collision and ground-avoidance (built below) protect whatever is
+        # actually loaded. Probed by mount-body name, the one thing every
+        # hand type's scene variant declares differently; a scene with
+        # neither (the bare, arms-only variant) leaves this None, exactly
+        # like today's already-safe degrade-to-fewer-collision-pairs path.
+        self._hand_kind: str | None = None
+        for _cand in ("wuji", "aero"):
+            try:
+                self.model.body(self._MOUNT_BODY[_cand].format(side="left"))
+                self._hand_kind = _cand
+                break
+            except KeyError:
+                continue
+        _mount = ([self._MOUNT_BODY[self._hand_kind].format(side="left")]
+                   if self._hand_kind else [])
+        _mount_r = ([self._MOUNT_BODY[self._hand_kind].format(side="right")]
+                    if self._hand_kind else [])
+        self._LEFT_ARM_LINKS = self._LEFT_ARM_LINKS_BASE + _mount
+        self._RIGHT_ARM_LINKS = self._RIGHT_ARM_LINKS_BASE + _mount_r
+        self._LEFT_DISTAL_LINKS = self._LEFT_DISTAL_LINKS_BASE + _mount
+        self._RIGHT_DISTAL_LINKS = self._RIGHT_DISTAL_LINKS_BASE + _mount_r
+        self._HAND_BODIES = {
+            side: ([self._ORIENT_BODY[self._hand_kind].format(side=side)]
+                    + self._hand_link_names(self._hand_kind, side))
+                  if self._hand_kind else []
+            for side in ("left", "right")
+        }
 
         # ── Base / Arm / Lift DOF ids ────────────────────────────────────────
         self.base_dof_ids = [self.model.joint(j).dofadr[0] for j in self._BASE_JOINTS]
@@ -870,24 +905,24 @@ class WholeBodyIK:
         # fix_base/fix_lift zeroing), used by the continuity objective.
         # _swivel_target latches per side so the arm keeps the elbow branch
         # it started in; None means "latch on next solve".
-        self._prev_vel: Optional[np.ndarray] = None
-        self._swivel_target: dict[str, Optional[float]] = {
+        self._prev_vel: np.ndarray | None = None
+        self._swivel_target: dict[str, float | None] = {
             side: self.config.elbow_swivel_targets.get(side)
             for side in ("left", "right")
         }
         # [S5a] Parallel-transported swivel reference, per side: the in-plane
         # reference vector and the shoulder->wrist axis it was last valid
         # for. None = seed from the discrete convention on next use.
-        self._swivel_ref: dict[str, Optional[np.ndarray]] = {"left": None, "right": None}
-        self._swivel_u_prev: dict[str, Optional[np.ndarray]] = {"left": None, "right": None}
+        self._swivel_ref: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        self._swivel_u_prev: dict[str, np.ndarray | None] = {"left": None, "right": None}
         # [S5b] When each side's swivel error first exceeded the re-latch
         # threshold (monotonic time), or None while below it.
-        self._swivel_err_since: dict[str, Optional[float]] = {"left": None, "right": None}
+        self._swivel_err_since: dict[str, float | None] = {"left": None, "right": None}
         # [S1] Home-keyframe arm posture (14 values, left 1-7 then right
         # 1-7), latched by init_from_keyframe/init_from_qpos.
-        self._home_arm_q: Optional[np.ndarray] = None
-        self._recenter_offset_body: Optional[np.ndarray] = None
-        self._shoulder_yaw_home: Optional[np.ndarray] = None
+        self._home_arm_q: np.ndarray | None = None
+        self._recenter_offset_body: np.ndarray | None = None
+        self._shoulder_yaw_home: np.ndarray | None = None
         self._arm_qpos_adrs_all = np.concatenate(
             [self._left_arm_qpos_adrs, self._right_arm_qpos_adrs])
         # The two shoulder-yaw joints, whose drift from the latched values
@@ -978,10 +1013,10 @@ class WholeBodyIK:
 
     def set_measured_state(
         self,
-        left_q: Optional[np.ndarray] = None,
-        right_q: Optional[np.ndarray] = None,
-        lift: Optional[float] = None,
-        base: Optional[np.ndarray] = None,
+        left_q: np.ndarray | None = None,
+        right_q: np.ndarray | None = None,
+        lift: float | None = None,
+        base: np.ndarray | None = None,
     ) -> np.ndarray:
         """Overwrite the measured DOFs of the IK configuration, keep the rest.
 
@@ -1012,15 +1047,15 @@ class WholeBodyIK:
         """Clamp a lift height to the travel declared by the description."""
         return float(np.clip(height, self.lift_range[0], self.lift_range[1]))
 
-    def toggle_fix_base(self, fix: Optional[bool] = None) -> bool:
+    def toggle_fix_base(self, fix: bool | None = None) -> bool:
         self.fix_base = (not self.fix_base) if fix is None else fix
         return self.fix_base
 
-    def toggle_fix_lift(self, fix: Optional[bool] = None) -> bool:
+    def toggle_fix_lift(self, fix: bool | None = None) -> bool:
         self.fix_lift = (not self.fix_lift) if fix is None else fix
         return self.fix_lift
 
-    def toggle_collision_avoidance(self, enable: Optional[bool] = None) -> bool:
+    def toggle_collision_avoidance(self, enable: bool | None = None) -> bool:
         """Enable/disable self-collision avoidance live. No-op if no limit built."""
         if self.collision_limit is None:
             return False
@@ -1033,7 +1068,7 @@ class WholeBodyIK:
         self,
         T_left: mink.SE3,
         T_right: mink.SE3,
-        lift_target: Optional[float] = None,
+        lift_target: float | None = None,
     ) -> WholeBodyIKResult:
         """
         Solve whole-body IK for given EE targets.
@@ -1744,8 +1779,8 @@ class WholeBodyIK:
         self._last_swivel = {}
 
     def set_elbow_swivel_target(
-        self, side: str, angle: Optional[float] = None
-    ) -> Optional[float]:
+        self, side: str, angle: float | None = None
+    ) -> float | None:
         """Set (or re-latch, with angle=None) one arm's target swivel angle.
 
         Safe to call while the control loop runs -- the next solve picks it
@@ -1756,7 +1791,7 @@ class WholeBodyIK:
         self._swivel_target[side] = None if angle is None else float(angle)
         return self._swivel_target[side]
 
-    def elbow_swivel_angle(self, side: str) -> Optional[float]:
+    def elbow_swivel_angle(self, side: str) -> float | None:
         """Current swivel angle (rad) of one arm, or None where undefined.
 
         None means the elbow is too close to the shoulder-wrist axis for the
@@ -1784,7 +1819,7 @@ class WholeBodyIK:
         sx: float, sy: float, sz: float,
         ex: float, ey: float, ez: float,
         wx: float, wy: float, wz: float,
-        ref: Optional[tuple[float, float, float]] = None,
+        ref: tuple[float, float, float] | None = None,
     ) -> tuple[float, float]:
         """Swivel angle and perpendicular offset, in plain floats.
 
@@ -1837,7 +1872,7 @@ class WholeBodyIK:
     @classmethod
     def _swivel_from_points(
         cls, S: np.ndarray, E: np.ndarray, W: np.ndarray,
-        ref: Optional[tuple[float, float, float]] = None,
+        ref: tuple[float, float, float] | None = None,
     ) -> tuple[float, float]:
         """Swivel angle of the elbow about the shoulder->wrist axis.
 
@@ -1849,7 +1884,7 @@ class WholeBodyIK:
         return cls._swivel_scalar(S[0], S[1], S[2], E[0], E[1], E[2],
                                   W[0], W[1], W[2], ref=ref)
 
-    def _swivel_reference(self, side: str, u: np.ndarray) -> Optional[np.ndarray]:
+    def _swivel_reference(self, side: str, u: np.ndarray) -> np.ndarray | None:
         """[S5a] Continuous in-plane reference vector for one arm's swivel.
 
         Parallel-transports a stored per-side reference along changes of the
@@ -2060,7 +2095,7 @@ class WholeBodyIK:
         x = float(np.clip((on - mu) / (on - full), 0.0, 1.0))
         return x * x * (3.0 - 2.0 * x)
 
-    def _limit_inequalities(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    def _limit_inequalities(self) -> tuple[np.ndarray, np.ndarray] | None:
         """Stacked (G, h) of every active limit's Δq inequalities, or None.
 
         Shared by [S3]'s constrained primary and `_project_onto_limits`, so
@@ -2087,7 +2122,7 @@ class WholeBodyIK:
 
     def _project_onto_limits(
         self, vel: np.ndarray,
-        ineq: Optional[tuple[np.ndarray, np.ndarray]] = None,
+        ineq: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> np.ndarray:
         """Clip a velocity onto the same hard joint/collision limits the
         other two modes get for free from mink's QP, by solving the
@@ -2261,7 +2296,7 @@ class WholeBodyIK:
                     geoms.append(g)
         return geoms
 
-    def _build_collision_limit(self) -> Optional["mink.CollisionAvoidanceLimit"]:
+    def _build_collision_limit(self) -> mink.CollisionAvoidanceLimit | None:
         """Build a CollisionAvoidanceLimit for arm↔body and arm↔arm pairs.
 
         mink's pair filter (`_is_pass_contype_conaffinity_check`) only keeps a

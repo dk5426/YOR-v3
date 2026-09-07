@@ -29,11 +29,63 @@
     <mesh name="link6" file="Link6.STL" />
     <mesh name="link7" file="Link7.STL" />
     <mesh name="stand_v2" file="stand_v2.STL" />
-    <!-- No hand mesh assets here -- this is the bare, hand-agnostic scene.
-         See robot_wholebody_wuji.xml / robot_wholebody_aero.xml for the
-         per-hand-type variants (MuJoCo's <include> is a fixed textual
-         splice, not a body-injection mechanism, so there is no way for a
-         hand-agnostic core to be extended from outside -- see CLAUDE.md). -->
+    <!-- Aero hand fingers (paths relative to meshdir meshes/) -- no mount mesh:
+         no physical Aero mount exists, see left_aero_mount's comment below. -->
+    <!-- Every Aero mesh below comes from the ROS2 URDF's own meshes/ dir
+         (aero-hand-open/ros2/src/aero_hand_open_description/meshes/), not
+         aero-hand-open/sim_rl's MuJoCo Playground scene -- see
+         tools/rebuild_aero_skeleton.py and left_aero_hand_orient's comment.
+         The Playground scene shared one generic, non-chiral base_link.STL
+         between both hands (physics-only training approximation; a real
+         palm is chiral, confirmed visually), and its other 24 meshes/side
+         differ from the URDF's real ones too (byte-for-byte, confirmed via
+         md5). The Playground-only `{finger}_f_link` spring-visualization
+         stub meshes have no URDF equivalent and are dropped entirely (see
+         aero_mjcf/{side}_hand_attach.xml's header comment). -->
+    <mesh name="left_frame_link" content_type="model/stl" file="aero_meshes/left/left_base_link.STL"/>
+    <mesh name="right_frame_link" content_type="model/stl" file="aero_meshes/right/right_base_link.STL"/>
+    <mesh name="left_index_proximal_link" content_type="model/stl" file="aero_meshes/left/left_index_proximal_link.STL"/>
+    <mesh name="left_index_middle_link" content_type="model/stl" file="aero_meshes/left/left_index_middle_link.STL"/>
+    <mesh name="left_index_distal_link" content_type="model/stl" file="aero_meshes/left/left_index_distal_link.STL"/>
+    <mesh name="left_index_tip_link" content_type="model/stl" file="aero_meshes/left/left_index_tip_link.STL"/>
+    <mesh name="left_middle_proximal_link" content_type="model/stl" file="aero_meshes/left/left_middle_proximal_link.STL"/>
+    <mesh name="left_middle_middle_link" content_type="model/stl" file="aero_meshes/left/left_middle_middle_link.STL"/>
+    <mesh name="left_middle_distal_link" content_type="model/stl" file="aero_meshes/left/left_middle_distal_link.STL"/>
+    <mesh name="left_middle_tip_link" content_type="model/stl" file="aero_meshes/left/left_middle_tip_link.STL"/>
+    <mesh name="left_ring_proximal_link" content_type="model/stl" file="aero_meshes/left/left_ring_proximal_link.STL"/>
+    <mesh name="left_ring_middle_link" content_type="model/stl" file="aero_meshes/left/left_ring_middle_link.STL"/>
+    <mesh name="left_ring_distal_link" content_type="model/stl" file="aero_meshes/left/left_ring_distal_link.STL"/>
+    <mesh name="left_ring_tip_link" content_type="model/stl" file="aero_meshes/left/left_ring_tip_link.STL"/>
+    <mesh name="left_pinky_proximal_link" content_type="model/stl" file="aero_meshes/left/left_pinky_proximal_link.STL"/>
+    <mesh name="left_pinky_middle_link" content_type="model/stl" file="aero_meshes/left/left_pinky_middle_link.STL"/>
+    <mesh name="left_pinky_distal_link" content_type="model/stl" file="aero_meshes/left/left_pinky_distal_link.STL"/>
+    <mesh name="left_pinky_tip_link" content_type="model/stl" file="aero_meshes/left/left_pinky_tip_link.STL"/>
+    <mesh name="left_t_link" content_type="model/stl" file="aero_meshes/left/left_t_link.STL"/>
+    <mesh name="left_thumb_mcp_link" content_type="model/stl" file="aero_meshes/left/left_thumb_mcp_link.STL"/>
+    <mesh name="left_thumb_proximal_link" content_type="model/stl" file="aero_meshes/left/left_thumb_proximal_link.STL"/>
+    <mesh name="left_thumb_distal_link" content_type="model/stl" file="aero_meshes/left/left_thumb_distal_link.STL"/>
+    <mesh name="left_thumb_tip_link" content_type="model/stl" file="aero_meshes/left/left_thumb_tip_link.STL"/>
+    <mesh name="right_index_proximal_link" content_type="model/stl" file="aero_meshes/right/right_index_proximal_link.STL"/>
+    <mesh name="right_index_middle_link" content_type="model/stl" file="aero_meshes/right/right_index_middle_link.STL"/>
+    <mesh name="right_index_distal_link" content_type="model/stl" file="aero_meshes/right/right_index_distal_link.STL"/>
+    <mesh name="right_index_tip_link" content_type="model/stl" file="aero_meshes/right/right_index_tip_link.STL"/>
+    <mesh name="right_middle_proximal_link" content_type="model/stl" file="aero_meshes/right/right_middle_proximal_link.STL"/>
+    <mesh name="right_middle_middle_link" content_type="model/stl" file="aero_meshes/right/right_middle_middle_link.STL"/>
+    <mesh name="right_middle_distal_link" content_type="model/stl" file="aero_meshes/right/right_middle_distal_link.STL"/>
+    <mesh name="right_middle_tip_link" content_type="model/stl" file="aero_meshes/right/right_middle_tip_link.STL"/>
+    <mesh name="right_ring_proximal_link" content_type="model/stl" file="aero_meshes/right/right_ring_proximal_link.STL"/>
+    <mesh name="right_ring_middle_link" content_type="model/stl" file="aero_meshes/right/right_ring_middle_link.STL"/>
+    <mesh name="right_ring_distal_link" content_type="model/stl" file="aero_meshes/right/right_ring_distal_link.STL"/>
+    <mesh name="right_ring_tip_link" content_type="model/stl" file="aero_meshes/right/right_ring_tip_link.STL"/>
+    <mesh name="right_pinky_proximal_link" content_type="model/stl" file="aero_meshes/right/right_pinky_proximal_link.STL"/>
+    <mesh name="right_pinky_middle_link" content_type="model/stl" file="aero_meshes/right/right_pinky_middle_link.STL"/>
+    <mesh name="right_pinky_distal_link" content_type="model/stl" file="aero_meshes/right/right_pinky_distal_link.STL"/>
+    <mesh name="right_pinky_tip_link" content_type="model/stl" file="aero_meshes/right/right_pinky_tip_link.STL"/>
+    <mesh name="right_t_link" content_type="model/stl" file="aero_meshes/right/right_t_link.STL"/>
+    <mesh name="right_thumb_mcp_link" content_type="model/stl" file="aero_meshes/right/right_thumb_mcp_link.STL"/>
+    <mesh name="right_thumb_proximal_link" content_type="model/stl" file="aero_meshes/right/right_thumb_proximal_link.STL"/>
+    <mesh name="right_thumb_distal_link" content_type="model/stl" file="aero_meshes/right/right_thumb_distal_link.STL"/>
+    <mesh name="right_thumb_tip_link" content_type="model/stl" file="aero_meshes/right/right_thumb_tip_link.STL"/>
     <material name="silver_mat" rgba="0.7 0.7 0.7 1" />
     <mesh name="base_link" file="chassis_base_link.stl" scale="0.001 0.001 0.001" />
     <mesh name="front_left_steer_link_1" file="chassis_front_left_steer_link_1.stl" scale="0.001 0.001 0.001" />
@@ -157,8 +209,53 @@
                                     <geom name="left_arm_ee_axis_x" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0.08 0 0" size="0.003" rgba="1 0.35 0.35 1"/>
                                     <geom name="left_arm_ee_axis_y" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0 0.08 0" size="0.003" rgba="0.35 1 0.35 1"/>
                                     <geom name="left_arm_ee_axis_z" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0 0 0.08" size="0.003" rgba="0.35 0.35 1 1"/>
-                                    <!-- Bare scene: no hand mounted -- see robot_wholebody_wuji.xml /
-                                         robot_wholebody_aero.xml for the per-hand-type mount body. -->
+                                    <!-- No physical Aero mount exists (unlike WUJI's measured bracket) --
+                                         this body is a bare pass-through so the flange->hand transform
+                                         lives entirely on left_aero_hand_orient below. Kept, rather than
+                                         attaching the hand directly to left_arm_end_effector, only so
+                                         robot/arm/wholebody_ik.py's _MOUNT_BODY table keeps naming a real
+                                         body without a Python change. -->
+                                    <body name="left_aero_mount" pos="0 0 0" gravcomp="1">
+                                      <!-- Rotation: derived, not measured -- tools/derive_aero_mount.py
+                                           composes WUJI's own already-measured flange->wrist-frame-convention
+                                           rotation (left_wuji_nero_mount + left_wuji_hand_orient's eulers)
+                                           with calib_rotation() from aria2robot's aero_retargeting.py, which
+                                           maps a native palm frame into that same wrist-frame convention --
+                                           the same convention aria2robot's own publisher aligns the rendered
+                                           Aero hand to against live Aria tracking. Assumes Aero mounts facing
+                                           the same way WUJI does; that's the only assumption.
+                                           calib_rotation's reference points (index/middle knuckle position
+                                           relative to base_link) come straight from the ROS2 URDF
+                                           (aero_hand_open_description) -- the same, and now only, source
+                                           aero_mjcf/left_hand_attach.xml's whole finger skeleton is built
+                                           from (see that file's header comment and
+                                           tools/rebuild_aero_skeleton.py). Mesh, skeleton and this
+                                           calibration all agree on one native frame, so there's no
+                                           URDF-vs-Playground-scene reconciliation to get wrong here.
+                                           Position: derived flush-mount offset (see script) -- the flush
+                                           axis is whichever one WUJI's own mesh bbox sits entirely on one
+                                           side of 0 on (nothing pokes through behind the flange there); the
+                                           other two axes get CENTERED on 0 instead of left at 0, since the
+                                           URDF's base_link origin isn't centered under the mesh's own bulk
+                                           (a real hand's mesh needn't be symmetric about its wrist-joint
+                                           origin). An earlier pass misidentified the flush axis (picked
+                                           whichever axis had the smallest-magnitude bbox min, which for WUJI
+                                           incidentally was an axis straddling 0, not the one that's actually
+                                           flush) -- gave axis 2 a large flush-style push it didn't need and
+                                           left axis 1 (the real flush axis) uncorrected; confirmed wrong
+                                           visually (hand shifted "too far back" instead of sideways).
+                                           TODO(hardware): still no real Aero mount CAD/measurement --
+                                           recalibrate once one exists; this is a sim placement, not a
+                                           hardware claim. -->
+                                      <!-- +1cm on the flush axis beyond the derived value: the derived
+                                           push still left the palm's base slightly intersecting the flange
+                                           face; confirmed visually. See tools/derive_aero_mount.py's
+                                           _FLUSH_CLEARANCE_NUDGE. -->
+                                      <body name="left_aero_hand_orient" pos="-0.0005545 0.01243508 0.00460402"
+                                            quat="0.49525247 -0.5296403 0.50470278 0.46848825" gravcomp="1">
+                                      <include file="aero_mjcf/left_hand_attach.xml"/>
+                                      </body>
+                                    </body>
                                     <site name="left_R_B" pos="0.0015 0.055 -0.0325" rgba="0.56 0.93 0.56 1"/>
                                     <site name="left_L_B" pos="0.0015 0.055 0.0325" rgba="0.56 0.93 0.56 1"/>
                                     <site name="left_R_U" pos="0.0015 0.12 -0.0325" rgba="0.56 0.93 0.56 1"/>
@@ -230,8 +327,18 @@
                                     <geom name="right_arm_ee_axis_x" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0.08 0 0" size="0.003" rgba="1 0.35 0.35 1"/>
                                     <geom name="right_arm_ee_axis_y" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0 0.08 0" size="0.003" rgba="0.35 1 0.35 1"/>
                                     <geom name="right_arm_ee_axis_z" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0 0 0.08" size="0.003" rgba="0.35 0.35 1 1"/>
-                                    <!-- Bare scene: no hand mounted -- see robot_wholebody_wuji.xml /
-                                         robot_wholebody_aero.xml for the per-hand-type mount body. -->
+                                    <!-- See left_aero_mount's comment -- bare pass-through, no physical mount. -->
+                                    <body name="right_aero_mount" pos="0 0 0" gravcomp="1">
+                                      <!-- See left_aero_hand_orient's comment -- mesh, skeleton and
+                                           calib_rotation's reference points are all sourced from this side's
+                                           own ROS2 URDF. -->
+                                      <!-- See left_aero_hand_orient's comment -- same +1cm flush-clearance
+                                           nudge. -->
+                                      <body name="right_aero_hand_orient" pos="-0.00055298 0.01243482 -0.00460223"
+                                            quat="0.5050971 -0.46891367 0.4948505 0.52926352" gravcomp="1">
+                                      <include file="aero_mjcf/right_hand_attach.xml"/>
+                                      </body>
+                                    </body>
                                     <site name="right_R_B" pos="0.0015 0.055 -0.0325" rgba="0.56 0.93 0.56 1"/>
                                     <site name="right_L_B" pos="0.0015 0.055 0.0325" rgba="0.56 0.93 0.56 1"/>
                                     <site name="right_R_U" pos="0.0015 0.12 -0.0325" rgba="0.56 0.93 0.56 1"/>
@@ -331,8 +438,10 @@
     <position name="right_arm_joint6_pos" joint="right_arm_joint6" class="nero" kp="15" kv="1.5"/>
     <position name="right_arm_joint7_pos" joint="right_arm_joint7" class="nero" kp="15" kv="1.5"/>
 
-    <!-- No hand actuators in the bare scene -- see robot_wholebody_wuji.xml /
-         robot_wholebody_aero.xml. -->
+    <!-- No Aero finger actuators, deliberately: nothing in this codebase runs
+         the sim in dynamic/actuated mode (kinematic writes to data.qpos only,
+         see robot/yor_mujoco.py::_apply_hand_qpos) -- unlike the WUJI variant,
+         which carries 40 for a possible future dynamic-mode use. -->
 
     <!-- Chassis actuators -->
     <position name="lift_joint_pos" joint="Slider 7" kp="20000" ctrlrange="0.0 0.900" forcerange="-1000 1000"/>

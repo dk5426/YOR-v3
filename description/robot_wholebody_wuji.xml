@@ -12,9 +12,9 @@
       <joint frictionloss="0.3" armature="0.005" />
       <position inheritrange="1" forcerange="-100 100" />
     </default>
-    <!-- No hand default class here -- wuji_hand lives in robot_wholebody_wuji.xml,
-         since this bare scene mounts no hand at all. Aero's fragment writes its
-         joint dynamics inline instead of via a childclass -- see aero_mjcf/. -->
+    <default class="wuji_hand">
+      <joint armature="0.005" damping="0.05" frictionloss="0.01"/>
+    </default>
   </default>
 
   <asset>
@@ -29,11 +29,63 @@
     <mesh name="link6" file="Link6.STL" />
     <mesh name="link7" file="Link7.STL" />
     <mesh name="stand_v2" file="stand_v2.STL" />
-    <!-- No hand mesh assets here -- this is the bare, hand-agnostic scene.
-         See robot_wholebody_wuji.xml / robot_wholebody_aero.xml for the
-         per-hand-type variants (MuJoCo's <include> is a fixed textual
-         splice, not a body-injection mechanism, so there is no way for a
-         hand-agnostic core to be extended from outside -- see CLAUDE.md). -->
+    <mesh name="wuji_nero_mount_left" content_type="model/stl" file="wuji_nero_mount_left.stl"/>
+    <mesh name="wuji_nero_mount_right" content_type="model/stl" file="wuji_nero_mount_right.stl"/>
+    <!-- Wuji left hand (paths relative to meshdir meshes/); STL pack: wuji_meshes/left/ -->
+    <mesh name="left_palm_link" content_type="model/stl" file="wuji_meshes/left/left_palm_link.STL"/>
+    <mesh name="left_finger1_link1" content_type="model/stl" file="wuji_meshes/left/left_finger1_link1.STL"/>
+    <mesh name="left_finger1_link2" content_type="model/stl" file="wuji_meshes/left/left_finger1_link2.STL"/>
+    <mesh name="left_finger1_link3" content_type="model/stl" file="wuji_meshes/left/left_finger1_link3.STL"/>
+    <mesh name="left_finger1_link4" content_type="model/stl" file="wuji_meshes/left/left_finger1_link4.STL"/>
+    <mesh name="left_finger1_tip_link" content_type="model/stl" file="wuji_meshes/left/left_finger1_tip_link.STL"/>
+    <mesh name="left_finger2_link1" content_type="model/stl" file="wuji_meshes/left/left_finger2_link1.STL"/>
+    <mesh name="left_finger2_link2" content_type="model/stl" file="wuji_meshes/left/left_finger2_link2.STL"/>
+    <mesh name="left_finger2_link3" content_type="model/stl" file="wuji_meshes/left/left_finger2_link3.STL"/>
+    <mesh name="left_finger2_link4" content_type="model/stl" file="wuji_meshes/left/left_finger2_link4.STL"/>
+    <mesh name="left_finger2_tip_link" content_type="model/stl" file="wuji_meshes/left/left_finger2_tip_link.STL"/>
+    <mesh name="left_finger3_link1" content_type="model/stl" file="wuji_meshes/left/left_finger3_link1.STL"/>
+    <mesh name="left_finger3_link2" content_type="model/stl" file="wuji_meshes/left/left_finger3_link2.STL"/>
+    <mesh name="left_finger3_link3" content_type="model/stl" file="wuji_meshes/left/left_finger3_link3.STL"/>
+    <mesh name="left_finger3_link4" content_type="model/stl" file="wuji_meshes/left/left_finger3_link4.STL"/>
+    <mesh name="left_finger3_tip_link" content_type="model/stl" file="wuji_meshes/left/left_finger3_tip_link.STL"/>
+    <mesh name="left_finger4_link1" content_type="model/stl" file="wuji_meshes/left/left_finger4_link1.STL"/>
+    <mesh name="left_finger4_link2" content_type="model/stl" file="wuji_meshes/left/left_finger4_link2.STL"/>
+    <mesh name="left_finger4_link3" content_type="model/stl" file="wuji_meshes/left/left_finger4_link3.STL"/>
+    <mesh name="left_finger4_link4" content_type="model/stl" file="wuji_meshes/left/left_finger4_link4.STL"/>
+    <mesh name="left_finger4_tip_link" content_type="model/stl" file="wuji_meshes/left/left_finger4_tip_link.STL"/>
+    <mesh name="left_finger5_link1" content_type="model/stl" file="wuji_meshes/left/left_finger5_link1.STL"/>
+    <mesh name="left_finger5_link2" content_type="model/stl" file="wuji_meshes/left/left_finger5_link2.STL"/>
+    <mesh name="left_finger5_link3" content_type="model/stl" file="wuji_meshes/left/left_finger5_link3.STL"/>
+    <mesh name="left_finger5_link4" content_type="model/stl" file="wuji_meshes/left/left_finger5_link4.STL"/>
+    <mesh name="left_finger5_tip_link" content_type="model/stl" file="wuji_meshes/left/left_finger5_tip_link.STL"/>
+    <!-- Wuji right hand; STL pack: wuji_meshes/right/ (same filenames as wuji_mjcf/right.xml) -->
+    <mesh name="right_palm_link" content_type="model/stl" file="wuji_meshes/right/right_palm_link.STL"/>
+    <mesh name="right_finger1_link1" content_type="model/stl" file="wuji_meshes/right/right_finger1_link1.STL"/>
+    <mesh name="right_finger1_link2" content_type="model/stl" file="wuji_meshes/right/right_finger1_link2.STL"/>
+    <mesh name="right_finger1_link3" content_type="model/stl" file="wuji_meshes/right/right_finger1_link3.STL"/>
+    <mesh name="right_finger1_link4" content_type="model/stl" file="wuji_meshes/right/right_finger1_link4.STL"/>
+    <mesh name="right_finger1_tip_link" content_type="model/stl" file="wuji_meshes/right/right_finger1_tip_link.STL"/>
+    <mesh name="right_finger2_link1" content_type="model/stl" file="wuji_meshes/right/right_finger2_link1.STL"/>
+    <mesh name="right_finger2_link2" content_type="model/stl" file="wuji_meshes/right/right_finger2_link2.STL"/>
+    <mesh name="right_finger2_link3" content_type="model/stl" file="wuji_meshes/right/right_finger2_link3.STL"/>
+    <mesh name="right_finger2_link4" content_type="model/stl" file="wuji_meshes/right/right_finger2_link4.STL"/>
+    <mesh name="right_finger2_tip_link" content_type="model/stl" file="wuji_meshes/right/right_finger2_tip_link.STL"/>
+    <mesh name="right_finger3_link1" content_type="model/stl" file="wuji_meshes/right/right_finger3_link1.STL"/>
+    <mesh name="right_finger3_link2" content_type="model/stl" file="wuji_meshes/right/right_finger3_link2.STL"/>
+    <mesh name="right_finger3_link3" content_type="model/stl" file="wuji_meshes/right/right_finger3_link3.STL"/>
+    <mesh name="right_finger3_link4" content_type="model/stl" file="wuji_meshes/right/right_finger3_link4.STL"/>
+    <mesh name="right_finger3_tip_link" content_type="model/stl" file="wuji_meshes/right/right_finger3_tip_link.STL"/>
+    <mesh name="right_finger4_link1" content_type="model/stl" file="wuji_meshes/right/right_finger4_link1.STL"/>
+    <mesh name="right_finger4_link2" content_type="model/stl" file="wuji_meshes/right/right_finger4_link2.STL"/>
+    <mesh name="right_finger4_link3" content_type="model/stl" file="wuji_meshes/right/right_finger4_link3.STL"/>
+    <mesh name="right_finger4_link4" content_type="model/stl" file="wuji_meshes/right/right_finger4_link4.STL"/>
+    <mesh name="right_finger4_tip_link" content_type="model/stl" file="wuji_meshes/right/right_finger4_tip_link.STL"/>
+    <mesh name="right_finger5_link1" content_type="model/stl" file="wuji_meshes/right/right_finger5_link1.STL"/>
+    <mesh name="right_finger5_link2" content_type="model/stl" file="wuji_meshes/right/right_finger5_link2.STL"/>
+    <mesh name="right_finger5_link3" content_type="model/stl" file="wuji_meshes/right/right_finger5_link3.STL"/>
+    <mesh name="right_finger5_link4" content_type="model/stl" file="wuji_meshes/right/right_finger5_link4.STL"/>
+    <mesh name="right_finger5_tip_link" content_type="model/stl" file="wuji_meshes/right/right_finger5_tip_link.STL"/>
+  
     <material name="silver_mat" rgba="0.7 0.7 0.7 1" />
     <mesh name="base_link" file="chassis_base_link.stl" scale="0.001 0.001 0.001" />
     <mesh name="front_left_steer_link_1" file="chassis_front_left_steer_link_1.stl" scale="0.001 0.001 0.001" />
@@ -157,8 +209,15 @@
                                     <geom name="left_arm_ee_axis_x" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0.08 0 0" size="0.003" rgba="1 0.35 0.35 1"/>
                                     <geom name="left_arm_ee_axis_y" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0 0.08 0" size="0.003" rgba="0.35 1 0.35 1"/>
                                     <geom name="left_arm_ee_axis_z" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0 0 0.08" size="0.003" rgba="0.35 0.35 1 1"/>
-                                    <!-- Bare scene: no hand mounted -- see robot_wholebody_wuji.xml /
-                                         robot_wholebody_aero.xml for the per-hand-type mount body. -->
+                                    <body name="left_wuji_nero_mount" pos="0 0.0015 0" euler="-1.5708 0 -1.5708" gravcomp="1">
+                                      <inertial pos="0 0 0.018" mass="0.08" diaginertia="1e-5 1e-5 1e-5"/>
+                                      <geom mesh="wuji_nero_mount_left" class="visual" material="light_medium_gray_mat"/>
+                                      <geom mesh="wuji_nero_mount_left" class="collision"/>
+                                      <!-- euler on included file root body is ignored by MuJoCo; orient here -->
+                                      <body name="left_wuji_hand_orient" pos="-0.001 0 0.036" euler="0 0 1.57" gravcomp="1">
+                                      <include file="wuji_mjcf/left_hand_attach.xml"/>
+                                      </body>
+                                    </body>
                                     <site name="left_R_B" pos="0.0015 0.055 -0.0325" rgba="0.56 0.93 0.56 1"/>
                                     <site name="left_L_B" pos="0.0015 0.055 0.0325" rgba="0.56 0.93 0.56 1"/>
                                     <site name="left_R_U" pos="0.0015 0.12 -0.0325" rgba="0.56 0.93 0.56 1"/>
@@ -230,8 +289,14 @@
                                     <geom name="right_arm_ee_axis_x" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0.08 0 0" size="0.003" rgba="1 0.35 0.35 1"/>
                                     <geom name="right_arm_ee_axis_y" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0 0.08 0" size="0.003" rgba="0.35 1 0.35 1"/>
                                     <geom name="right_arm_ee_axis_z" type="capsule" contype="0" conaffinity="0" group="2" density="0" fromto="0 0 0 0 0 0.08" size="0.003" rgba="0.35 0.35 1 1"/>
-                                    <!-- Bare scene: no hand mounted -- see robot_wholebody_wuji.xml /
-                                         robot_wholebody_aero.xml for the per-hand-type mount body. -->
+                                    <body name="right_wuji_nero_mount" pos="0 0.0015 0" euler="-1.5708 0 -1.5708" gravcomp="1">
+                                      <inertial pos="0 0 0.018" mass="0.08" diaginertia="1e-5 1e-5 1e-5"/>
+                                      <geom mesh="wuji_nero_mount_right" class="visual" material="light_medium_gray_mat"/>
+                                      <geom mesh="wuji_nero_mount_right" class="collision"/>
+                                      <body name="right_wuji_hand_orient" pos="0.001 0 0.036" euler="0 0 1.57" gravcomp="1">
+                                      <include file="wuji_mjcf/right_hand_attach.xml"/>
+                                      </body>
+                                    </body>
                                     <site name="right_R_B" pos="0.0015 0.055 -0.0325" rgba="0.56 0.93 0.56 1"/>
                                     <site name="right_L_B" pos="0.0015 0.055 0.0325" rgba="0.56 0.93 0.56 1"/>
                                     <site name="right_R_U" pos="0.0015 0.12 -0.0325" rgba="0.56 0.93 0.56 1"/>
@@ -331,9 +396,50 @@
     <position name="right_arm_joint6_pos" joint="right_arm_joint6" class="nero" kp="15" kv="1.5"/>
     <position name="right_arm_joint7_pos" joint="right_arm_joint7" class="nero" kp="15" kv="1.5"/>
 
-    <!-- No hand actuators in the bare scene -- see robot_wholebody_wuji.xml /
-         robot_wholebody_aero.xml. -->
+    <!-- Left Wuji hand (20 DOF), from wuji_mjcf/left.xml -->
+    <position name="left_finger1_joint1_actuator" joint="left_finger1_joint1" kp="0.5" ctrlrange="0.0583 1.5941" forcerange="-0.4452 0.4452"/>
+    <position name="left_finger1_joint2_actuator" joint="left_finger1_joint2" kp="0.5" ctrlrange="-0.1199 0.9335" forcerange="-0.4259 0.4259"/>
+    <position name="left_finger1_joint3_actuator" joint="left_finger1_joint3" kp="0.5" ctrlrange="-0.4646 1.5639" forcerange="-0.1888 0.1888"/>
+    <position name="left_finger1_joint4_actuator" joint="left_finger1_joint4" kp="0.5" ctrlrange="-0.457 1.5684" forcerange="-0.1468 0.1468"/>
+    <position name="left_finger2_joint1_actuator" joint="left_finger2_joint1" kp="0.5" ctrlrange="-0.156 1.5619" forcerange="-0.6188 0.6188"/>
+    <position name="left_finger2_joint2_actuator" joint="left_finger2_joint2" kp="0.5" ctrlrange="-0.4095 0.2921" forcerange="-0.1822 0.1822"/>
+    <position name="left_finger2_joint3_actuator" joint="left_finger2_joint3" kp="0.5" ctrlrange="-0.4839 1.5466" forcerange="-0.2251 0.2251"/>
+    <position name="left_finger2_joint4_actuator" joint="left_finger2_joint4" kp="0.5" ctrlrange="-0.4723 1.5754" forcerange="-0.217 0.217"/>
+    <position name="left_finger3_joint1_actuator" joint="left_finger3_joint1" kp="0.5" ctrlrange="-0.1569 1.5536" forcerange="-0.6494 0.6494"/>
+    <position name="left_finger3_joint2_actuator" joint="left_finger3_joint2" kp="0.5" ctrlrange="-0.3977 0.3115" forcerange="-0.1827 0.1827"/>
+    <position name="left_finger3_joint3_actuator" joint="left_finger3_joint3" kp="0.5" ctrlrange="-0.4847 1.5411" forcerange="-0.2078 0.2078"/>
+    <position name="left_finger3_joint4_actuator" joint="left_finger3_joint4" kp="0.5" ctrlrange="-0.4671 1.5788" forcerange="-0.2018 0.2018"/>
+    <position name="left_finger4_joint1_actuator" joint="left_finger4_joint1" kp="0.5" ctrlrange="-0.1507 1.5636" forcerange="-0.6389 0.6389"/>
+    <position name="left_finger4_joint2_actuator" joint="left_finger4_joint2" kp="0.5" ctrlrange="-0.4101 0.3014" forcerange="-0.1832 0.1832"/>
+    <position name="left_finger4_joint3_actuator" joint="left_finger4_joint3" kp="0.5" ctrlrange="-0.4747 1.5526" forcerange="-0.2249 0.2249"/>
+    <position name="left_finger4_joint4_actuator" joint="left_finger4_joint4" kp="0.5" ctrlrange="-0.4729 1.5718" forcerange="-0.2044 0.2044"/>
+    <position name="left_finger5_joint1_actuator" joint="left_finger5_joint1" kp="0.5" ctrlrange="-0.1578 1.5632" forcerange="-0.6441 0.6441"/>
+    <position name="left_finger5_joint2_actuator" joint="left_finger5_joint2" kp="0.5" ctrlrange="-0.4103 0.2949" forcerange="-0.1798 0.1798"/>
+    <position name="left_finger5_joint3_actuator" joint="left_finger5_joint3" kp="0.5" ctrlrange="-0.4733 1.556" forcerange="-0.2384 0.2384"/>
+    <position name="left_finger5_joint4_actuator" joint="left_finger5_joint4" kp="0.5" ctrlrange="-0.4662 1.576" forcerange="-0.1866 0.1866"/>
 
+    <!-- Right Wuji hand (20 DOF), from wuji_mjcf/right.xml -->
+    <position name="right_finger1_joint1_actuator" joint="right_finger1_joint1" kp="0.5" ctrlrange="0.0368 1.6125" forcerange="-0.4452 0.4452"/>
+    <position name="right_finger1_joint2_actuator" joint="right_finger1_joint2" kp="0.5" ctrlrange="-0.1576 0.9312" forcerange="-0.4259 0.4259"/>
+    <position name="right_finger1_joint3_actuator" joint="right_finger1_joint3" kp="0.5" ctrlrange="-0.4638 1.5607" forcerange="-0.1888 0.1888"/>
+    <position name="right_finger1_joint4_actuator" joint="right_finger1_joint4" kp="0.5" ctrlrange="-0.4829 1.5451" forcerange="-0.1468 0.1468"/>
+    <position name="right_finger2_joint1_actuator" joint="right_finger2_joint1" kp="0.5" ctrlrange="-0.1611 1.5588" forcerange="-0.6188 0.6188"/>
+    <position name="right_finger2_joint2_actuator" joint="right_finger2_joint2" kp="0.5" ctrlrange="-0.4044 0.3054" forcerange="-0.1822 0.1822"/>
+    <position name="right_finger2_joint3_actuator" joint="right_finger2_joint3" kp="0.5" ctrlrange="-0.4714 1.5504" forcerange="-0.2251 0.2251"/>
+    <position name="right_finger2_joint4_actuator" joint="right_finger2_joint4" kp="0.5" ctrlrange="-0.4644 1.5753" forcerange="-0.217 0.217"/>
+    <position name="right_finger3_joint1_actuator" joint="right_finger3_joint1" kp="0.5" ctrlrange="-0.1719 1.5496" forcerange="-0.6494 0.6494"/>
+    <position name="right_finger3_joint2_actuator" joint="right_finger3_joint2" kp="0.5" ctrlrange="-0.4014 0.2996" forcerange="-0.1827 0.1827"/>
+    <position name="right_finger3_joint3_actuator" joint="right_finger3_joint3" kp="0.5" ctrlrange="-0.4632 1.5613" forcerange="-0.2078 0.2078"/>
+    <position name="right_finger3_joint4_actuator" joint="right_finger3_joint4" kp="0.5" ctrlrange="-0.4697 1.5702" forcerange="-0.2018 0.2018"/>
+    <position name="right_finger4_joint1_actuator" joint="right_finger4_joint1" kp="0.5" ctrlrange="-0.1601 1.5534" forcerange="-0.6389 0.6389"/>
+    <position name="right_finger4_joint2_actuator" joint="right_finger4_joint2" kp="0.5" ctrlrange="-0.4134 0.3161" forcerange="-0.1832 0.1832"/>
+    <position name="right_finger4_joint3_actuator" joint="right_finger4_joint3" kp="0.5" ctrlrange="-0.4782 1.5448" forcerange="-0.2249 0.2249"/>
+    <position name="right_finger4_joint4_actuator" joint="right_finger4_joint4" kp="0.5" ctrlrange="-0.4825 1.555" forcerange="-0.2044 0.2044"/>
+    <position name="right_finger5_joint1_actuator" joint="right_finger5_joint1" kp="0.5" ctrlrange="-0.1674 1.5539" forcerange="-0.6441 0.6441"/>
+    <position name="right_finger5_joint2_actuator" joint="right_finger5_joint2" kp="0.5" ctrlrange="-0.4203 0.2931" forcerange="-0.1798 0.1798"/>
+    <position name="right_finger5_joint3_actuator" joint="right_finger5_joint3" kp="0.5" ctrlrange="-0.4804 1.542" forcerange="-0.2384 0.2384"/>
+    <position name="right_finger5_joint4_actuator" joint="right_finger5_joint4" kp="0.5" ctrlrange="-0.4705 1.5709" forcerange="-0.1866 0.1866"/>
+  
     <!-- Chassis actuators -->
     <position name="lift_joint_pos" joint="Slider 7" kp="20000" ctrlrange="0.0 0.900" forcerange="-1000 1000"/>
     <position name="front_left_steer_joint_pos" joint="front_left_steer_joint" kp="100"/>

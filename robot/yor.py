@@ -41,7 +41,12 @@ from robot.arm.wholebody_ik import WholeBodyIKConfig
 from robot.base import BaseController
 from robot.base_motor import DRIVE_VEL_SCALE as _DRIVE_VEL_SCALE
 from robot.base_motor import MODULE_ORDER
-from robot.hand.hands import Hands, add_hand_args, hands_from_args
+from robot.hand.hands import (
+    Hands,
+    add_hand_args,
+    hands_from_args,
+    resolved_aria_config,
+)
 from robot.swerve_log import DEFAULT_HZ as SWERVE_LOG_HZ
 from robot.swerve_log import SwerveRecorder
 from robot.wholebody_control import WholeBodyController, WholeBodyHardwareConfig
@@ -99,6 +104,7 @@ class YOR:
         swerve_log_hz: float = SWERVE_LOG_HZ,
         gripper: str = "none",
         hands: Hands | None = None,
+        scene_xml: str | None = None,
     ):
         self._initialized = False
         self._flash_base_pid = bool(flash_base_pid)
@@ -162,6 +168,10 @@ class YOR:
         self._wholebody_requested = wholebody and not no_arms
         self._wholebody_config = wholebody_config
         self._ik_config = ik_config
+        # Which MJCF the whole-body IK solver loads -- picks up whichever
+        # hand (if any) is mounted, per --hand / hand.type. None means
+        # WholeBodyIK's own default (the bare, hand-agnostic scene).
+        self._scene_xml = scene_xml
         self._homing_lock = threading.Lock()
 
         # Which gripper hardware is fitted, if any. Off by default: with no
@@ -282,6 +292,7 @@ class YOR:
                 base_controller=self.base_controller,
                 config=self._wholebody_config,
                 ik_config=self._ik_config,
+                scene_xml=self._scene_xml,
             )
             if not self.wholebody.config.enable_base_motion:
                 self.wholebody.toggle_fix_base(True)
@@ -933,6 +944,7 @@ class YOR:
                     base_controller=self.base_controller,
                     config=runtime_config,
                     ik_config=self._ik_config,
+                    scene_xml=self._scene_xml,
                 )
                 self.wholebody.toggle_fix_base(previous_fix_base)
                 self.wholebody.ik.toggle_fix_lift(previous_fix_lift)
@@ -1123,6 +1135,7 @@ class YOR:
                 base_controller=self.base_controller,
                 config=self._wholebody_config,
                 ik_config=self._ik_config,
+                scene_xml=self._scene_xml,
             )
             if not self.wholebody.config.enable_base_motion:
                 self.wholebody.toggle_fix_base(True)
@@ -1810,6 +1823,7 @@ def main():
         base_pid_stock_manifest=args.base_pid_stock_manifest,
         gripper=args.gripper,
         hands=hands_from_args(args),
+        scene_xml=str(resolved_aria_config(args).scene_path()),
     )
     server = None
     shutdown_started = False

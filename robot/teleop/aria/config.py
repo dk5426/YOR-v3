@@ -19,15 +19,20 @@ DEFAULTS: dict[str, dict[str, Any]] = {
                   "clock_port": 5556, "stats": True},
     "mapping": {"hand": "both", "position_scale": 1.0,
                 "follow_orientation": True, "translation_frame": "world",
-                "scene": "description/scene_wholebody.xml"},
+                # "" -- auto-resolve from hand.type (robot/hand/hands.py::
+                # scene_for_hand_type). An explicit path here always wins;
+                # see AriaConfig.scene_path().
+                "scene": ""},
     "clutch": {"reseed": True, "hold_lift": True},
     "home": {"gesture": True},
     "sim": {"ik_rate_hz": 100, "base_posture_cost": 1e-4, "solver": "pyqpmad",
             "viser_port": 8080, "share": False},
     # robot/hand/hands.py -- the finger path, which both nodes own in-process
     # and which reads this same publisher on a thread of its own.
-    "hand": {"backend": "none", "sides": "both",
-             "serial": {"left": "", "right": ""},
+    "hand": {"type": "none", "backend": "none", "sides": "both",
+             "serial": {"left": "", "right": ""},        # wuji: wujihandpy addressing
+             "port": {"left": "", "right": ""},           # aero: serial port per side
+             "aero_speed": 32766, "aero_torque": 700,
              "rpc_port": 5558, "rate_hz": 100, "ramp_s": 1.5,
              "lowpass_hz": 5.0},
 }
@@ -53,8 +58,24 @@ class AriaConfig:
                 if isinstance(value, dict) and isinstance(given.get(key), dict):
                     merged[key] = {**value, **given[key]}
             setattr(self, section, merged)
-        scene = Path(self.mapping["scene"])
-        self.mapping["scene"] = scene if scene.is_absolute() else _REPO / scene
+
+    def scene_path(self) -> Path:
+        """The MJCF scene for this session.
+
+        `mapping.scene`, if set, always wins; otherwise auto-resolved from
+        `hand.type` (robot/hand/hands.py::scene_for_hand_type). Call this
+        *after* applying any CLI override to `hand.type` (e.g. `--hand`),
+        not at construction time -- `hands_from_args()`/`resolved_aria_
+        config()` mutate `cfg.hand["type"]` after `AriaConfig.load()`
+        returns, so resolving eagerly in `__init__` would ignore it.
+        """
+        raw = self.mapping["scene"]
+        if raw:
+            p = Path(raw)
+            return p if p.is_absolute() else _REPO / p
+        from robot.hand.hands import scene_for_hand_type
+
+        return scene_for_hand_type(self.hand["type"])
 
     def hand_sides(self) -> tuple[str, ...]:
         """Which WUJI hands to drive: a subset of the teleoped arms, possibly none.
@@ -89,10 +110,13 @@ class AriaConfig:
 
     def describe(self) -> str:
         src = self.path.name if self.path else "defaults"
+        hand_type = str(self.hand["type"] or "none").lower()
+        hands = ("none" if hand_type == "none"
+                 else f"{'+'.join(self.hand_sides()) or 'none'} ({hand_type})")
         return (f"[aria] config {src}: "
                 f"{self.publisher['host']}:{self.publisher['port']} "
                 f"arms={self.mapping['hand']} "
-                f"hands={'+'.join(self.hand_sides()) or 'none'} "
+                f"hands={hands} "
                 f"scale={self.mapping['position_scale']} "
                 f"follow_orientation={self.mapping['follow_orientation']} "
                 f"translation={self.mapping['translation_frame']}")

@@ -8,17 +8,19 @@ Each wrist pose commands one arm's end-effector; base, lift and both 7-DOF arms
 are solved together, so the chassis rolls and the lift extends on their own once
 you reach past the arms. The retargeted finger angles go straight into the hand
 joints of the same model — no wire, no `Hands`, so this stays the shortest way
-to see all 20 of them. The node path reaches them too, through
-robot/hand/hands.py, which is the one that also drives real hands.
+to see all of them. Which hand (if any) renders is `hand.type` / `--hand`
+(wuji/aero/none, default none -- arms only). The node path reaches the fingers
+too, through robot/hand/hands.py, which is the one that also drives real hands.
 
     # publisher, from the aria2robot repo
     python -m aria2robot.stream_pub --wifi
     # here
-    python robot/teleop/aria/sim_viz.py --pub-host <ip>
+    python robot/teleop/aria/sim_viz.py --pub-host <ip> --hand wuji
     # -> http://localhost:8080
 
 Settings live in config/aria_teleop.yaml, shared with `--input aria`; only
---config, --pub-host and --hand are on the command line.
+--config, --pub-host, --side (arm side) and --hand (which hand) are on
+the command line.
 
 Hold a shaka for ~0.5 s to engage or disengage a side. Engaging pins your wrist
 frame to the robot's; everything after is a delta in that frame. While
@@ -26,8 +28,9 @@ disengaged the arm target and the fingers both freeze.
 
 Two things on screen are worth knowing how to read:
 
-  the ik_target sphere sits INSIDE the WUJI palm, not on the thin flange triad
-  37.5 mm behind it -- the marker rides the wrist, not the site the IK targets.
+  with a hand mounted, the ik_target sphere sits INSIDE its palm, not on the
+  thin flange triad 37.5 mm behind it -- the marker rides the wrist, not the
+  site the IK targets. Arms-only, it sits on the bare flange (zero offset).
 
   the mapped operator triad (long thin needles) sits coincident and parallel
   with that sphere's own thick capsules. Mirrored or 90-degrees-off means an
@@ -59,13 +62,12 @@ _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO))
 
 from robot.arm.wholebody_ik import WholeBodyIK, WholeBodyIKConfig
+from robot.hand.aero_driver import canonical_joint_names as aero_joint_names
+from robot.hand.hands import hand_mount_body
+from robot.hand.wuji_driver import canonical_joint_names as wuji_joint_names
 from robot.teleop.aria.clutch import Clutch
 from robot.teleop.aria.config import AriaConfig
-from robot.teleop.aria.stream import (
-    AriaHandStream,
-    HomeSeqWatcher,
-    canonical_joint_names,
-)
+from robot.teleop.aria.stream import AriaHandStream, HomeSeqWatcher
 from robot.teleop.status import console, fmt_xyz
 from robot.teleop.status import log as _log
 
@@ -74,6 +76,11 @@ DEFAULT_SCENE = _REPO / "description" / "scene_wholebody.xml"
 SIDE_INDEX = {"left": 0, "right": 1}
 # Pushing every solve to the browser is wasted work; 1-in-3 of 100 Hz is plenty
 RENDER_EVERY = 3
+
+# hand.type -> its canonical_joint_names(). Not a `Hands` object -- this
+# script reads qpos itself via AriaHandStream, and doesn't want the
+# publisher/driver machinery a full Hands would pull in.
+_JOINT_NAMES = {"wuji": wuji_joint_names, "aero": aero_joint_names}
 
 
 def log(msg: str, style: str = "cyan") -> None:
@@ -133,25 +140,37 @@ def main() -> int:
                    help="settings file (default: config/aria_teleop.yaml)")
     p.add_argument("--pub-host", default=None,
                    help="override the config's publisher host")
-    p.add_argument("--hand", choices=["left", "right", "both"], default=None,
-                   help="override the config's hand")
+    p.add_argument("--side", choices=["left", "right", "both"], default=None,
+                   help="override the config's arm side (mapping.hand) -- "
+                        "not the same as --hand, which is which hand to "
+                        "render")
+    p.add_argument("--hand", choices=["wuji", "aero"], default=None,
+                   help="override hand.type for rendering fingers this run "
+                        "(default: hand.type in config, itself 'none' -- "
+                        "arms only)")
     args = p.parse_args()
 
     cfg = AriaConfig.load(args.config)
     if args.pub_host:
         cfg.publisher["host"] = args.pub_host
+    if args.side:
+        cfg.mapping["hand"] = args.side
     if args.hand:
-        cfg.mapping["hand"] = args.hand
+        cfg.hand["type"] = args.hand
+    hand_type = str(cfg.hand["type"] or "none").lower()
+    if hand_type not in ("none", "wuji", "aero"):
+        raise SystemExit(f"--hand must be wuji|aero, got {hand_type!r}")
     console.print(cfg.describe(), markup=False, highlight=False)
 
     hand = cfg.mapping["hand"]
     sides = ("left", "right") if hand == "both" else (hand,)
-    wuji_sides = cfg.hand_sides()
+    finger_sides = cfg.hand_sides()
     ik_rate = int(cfg.sim["ik_rate_hz"])
 
-    log(f"scene: {cfg.mapping['scene']}")
+    scene = cfg.scene_path()
+    log(f"scene: {scene}")
     ik = WholeBodyIK(
-        str(cfg.mapping["scene"]),
+        str(scene),
         WholeBodyIKConfig(dt=1.0 / ik_rate, solver=cfg.sim["solver"],
                           max_iters=10,
                           base_posture_cost=float(cfg.sim["base_posture_cost"])),
@@ -159,30 +178,44 @@ def main() -> int:
     ik.init_from_keyframe("home")
     model, mj_data = ik.model, ik.data
     log(f"IK: {ik_rate} Hz, {ik.n_collision_pairs} collision pairs, "
-        f"arms={'+'.join(sides)} hands={'+'.join(wuji_sides) or 'none'}")
+        f"arms={'+'.join(sides)} hands={'+'.join(finger_sides) or 'none'} "
+        f"({hand_type})")
 
-    # The MJCF names hand joints exactly as wuji-description does, so the
-    # published (20,) vector maps straight across with no reordering
+    # The MJCF names hand joints exactly as the driver's canonical_joint_names
+    # does, so the published vector maps straight across with no reordering.
+    # No entry at all for a side means "no hand joints to drive" -- the bare
+    # scene (hand_type == 'none'), or (a scene/hand.type mismatch aside) an
+    # arm side simply not in `sides`.
+    joint_names_fn = _JOINT_NAMES.get(hand_type)
     hand_adrs: dict[str, np.ndarray] = {}
     hand_lo: dict[str, np.ndarray] = {}
     hand_hi: dict[str, np.ndarray] = {}
-    for side in sides:
-        joints = [model.joint(n) for n in canonical_joint_names(side)]
-        hand_adrs[side] = np.array([int(j.qposadr[0]) for j in joints])
-        hand_lo[side] = np.array([float(j.range[0]) for j in joints])
-        hand_hi[side] = np.array([float(j.range[1]) for j in joints])
+    if joint_names_fn is not None:
+        for side in sides:
+            joints = [model.joint(n) for n in joint_names_fn(side)]
+            hand_adrs[side] = np.array([int(j.qposadr[0]) for j in joints])
+            hand_lo[side] = np.array([float(j.range[0]) for j in joints])
+            hand_hi[side] = np.array([float(j.range[1]) for j in joints])
 
     mocap_id = {side: int(model.body(f"{side}_ik_target").mocapid[0])
                 for side in ("left", "right")}
 
     # The IK site is the arm's flange, ~3.7 cm behind the hand it carries. Rigid,
-    # so one reading at home holds for every configuration.
+    # so one reading at home holds for every configuration. No hand mounted (or
+    # a scene/hand.type mismatch) degrades to zero offset rather than a crash.
+    def _mount_xpos(side: str) -> np.ndarray:
+        ee_pos = mj_data.site(f"{side}_arm_ee").xpos
+        name = hand_mount_body(hand_type, side)
+        if name is None:
+            return ee_pos
+        try:
+            return mj_data.body(name).xpos
+        except KeyError:
+            return ee_pos
+
     wrist_offset = {
         side: mj_data.site(f"{side}_arm_ee").xmat.reshape(3, 3).T
-        @ (
-            mj_data.body(f"{side}_wuji_hand_orient").xpos
-            - mj_data.site(f"{side}_arm_ee").xpos
-        )
+        @ (_mount_xpos(side) - mj_data.site(f"{side}_arm_ee").xpos)
         for side in ("left", "right")
     }
 
@@ -206,6 +239,29 @@ def main() -> int:
     stream = AriaHandStream(cfg.publisher["host"], cfg.publisher["port"],
                             sides=sides, stale_s=None)
     stream.start()
+
+    # Fail fast, before a browser tab even opens: a hand mismatch here means
+    # every joint is misread (an Aero-shaped vector rendered as WUJI's, or
+    # the reverse), so this is fatal, exactly like the RPC path's Hands
+    # (see hands.py::_check_hand_type). Skipped entirely for arms-only
+    # (hand_type == "none"): nothing here cares what hand the publisher
+    # happens to be retargeting. None after the timeout means an older,
+    # pre-wire-2 publisher that never sent `meta` at all -- nothing to
+    # validate against, so proceed rather than block forever.
+    if hand_type != "none":
+        meta = stream.wait_for_meta(timeout=5.0)
+        if meta is None:
+            log("no meta from publisher after 5s -- cannot verify hand.type; "
+                "proceeding anyway", style="yellow")
+        else:
+            published = meta.get("hand")
+            if published is not None and published != hand_type:
+                msg = (f"publisher declares hand={published!r} but hand.type="
+                       f"{hand_type!r} is configured here -- joint vectors "
+                       "would not line up. Fix --hand here or restart the "
+                       "publisher with the matching --hand.")
+                console.print(f"[bold red]{msg}[/bold red]")
+                raise SystemExit(1)
 
     # Single-key boxes so viser callbacks hand work to the solve loop rather
     # than mutating MjData or the IK configuration off-thread
@@ -330,7 +386,7 @@ def main() -> int:
     # ── Solve loop ──────────────────────────────────────────────────────────
     rate = RateLimiter(ik_rate, warn=False)
     targets = dict(zip(("left", "right"), ik.forward_kinematics()))
-    hand_cmd = {s: mj_data.qpos[hand_adrs[s]].copy() for s in sides}
+    hand_cmd = {s: mj_data.qpos[hand_adrs[s]].copy() for s in sides if s in hand_adrs}
     was_engaged = {s: False for s in sides}
     home_watch = (HomeSeqWatcher()
                   if cfg.home["gesture"] and len(sides) == 2 else None)
@@ -393,8 +449,10 @@ def main() -> int:
                     # Shaka stops everything: the arm target freezes because the
                     # clutch is released, and the fingers freeze here rather than
                     # relying on the publisher to stop updating qpos while paused
-                    if side in wuji_sides and not s.paused and s.qpos is not None:
-                        hand_cmd[side] = np.clip(s.qpos[:20], hand_lo[side],
+                    if (side in finger_sides and side in hand_adrs
+                            and not s.paused and s.qpos is not None):
+                        n = hand_lo[side].size
+                        hand_cmd[side] = np.clip(s.qpos[:n], hand_lo[side],
                                                  hand_hi[side])
 
                 # Feed the commanded finger angles back into the IK configuration: the
@@ -402,14 +460,16 @@ def main() -> int:
                 # stale home-pose hand would let the fingertips clip through the floor
                 q = ik.configuration.q.copy()
                 for side in sides:
-                    q[hand_adrs[side]] = hand_cmd[side]
+                    if side in hand_adrs:
+                        q[hand_adrs[side]] = hand_cmd[side]
                 ik.update_configuration(q)
 
                 result = ik.solve(targets["left"], targets["right"], lift_target=None)
 
                 ik.apply_to_sim_kinematic(mj_data, result)
                 for side in sides:
-                    mj_data.qpos[hand_adrs[side]] = hand_cmd[side]
+                    if side in hand_adrs:
+                        mj_data.qpos[hand_adrs[side]] = hand_cmd[side]
                     # Marker rides the wrist, not the flange, so it sits on the hand
                     R = targets[side].rotation()
                     mj_data.mocap_pos[mocap_id[side]] = (

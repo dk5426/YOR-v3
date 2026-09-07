@@ -18,16 +18,21 @@ pyserial==3.5        # PicoLift serial link
 scipy==1.16.3        # pose maths in base.py
 rich==14.3.4         # status tables: the teleop client and sim_viz.py
 pyyaml==6.0.3        # config/aria_teleop.yaml, read by both aria entry points
-                     # and by robot/hand/wuji_server.py
+                     # and by robot/hand/hands.py
 
 # Optional: only the gamepad teleop backend and joystick.py need this.
 # pygame
 
-# Optional: only `robot/hand/wuji_server.py --backend hardware` needs this --
+# Optional: only `--hand-backend hardware` with `hand.type: wuji` needs this --
 # the WUJI SDK, for driving real hands. `--backend none` (the default, and what
 # the simulator runs against) never imports it: the import lives inside
 # HardwareWujiDriver.start(). Manylinux wheels only, so no macOS build.
 # wujihandpy
+
+# `--hand-backend hardware` with `hand.type: aero` needs this -- the Aero Hand
+# Open SDK, for driving real hands. `--backend none` (the default) never
+# imports it: the import lives inside HardwareAeroDriver.start()
+# aero-open-sdk
 
 # Optional: only the Aria hand-teleop backend needs these, and only its
 # in-process sim viewer (robot/teleop/aria/sim_viz.py) at that. The RPC path

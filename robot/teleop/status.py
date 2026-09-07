@@ -38,9 +38,18 @@ from robot.teleop.aria.stats import fmt_bw
 # so every teleop line goes through `log` below and scrolls above it instead.
 console = Console()
 
-# joint1 of each finger in the canonical (20,) vector -- the MCP flexion, the
-# one angle per finger that reads as "how curled is this" at a glance
-_MCP_ADRS = [0, 4, 8, 12, 16]
+# The first/primary flexion joint of each finger (thumb, index, middle, ring,
+# pinky, matching _FINGERS below) -- "how curled is this" at a glance -- in
+# each hand type's own canonical qpos vector, keyed by vector length since
+# that's all get_state()'s qpos array carries; there's no hand-type field on
+# this RPC to key off instead. WUJI is 5 fingers x 4 joints, uniform stride 4
+# (wuji_driver.canonical_joint_names). Aero is thumb(4) + index/middle/ring/
+# pinky(3 each) (aero_driver._JOINT_SUFFIXES), so the stride isn't uniform:
+# thumb's first joint is at 0, then 4, 7, 10, 13.
+_MCP_ADRS_BY_LEN = {
+    20: [0, 4, 8, 12, 16],
+    16: [0, 4, 7, 10, 13],
+}
 _FINGERS = ("thumb", "index", "middle", "ring", "pinky")
 
 
@@ -257,7 +266,11 @@ class StatusDisplay:
             qpos = srv.get(f"{side}_hand_qpos")
             if qpos is None:
                 continue
-            mcp = np.rad2deg(np.asarray(qpos, dtype=float)[_MCP_ADRS])
+            qpos = np.asarray(qpos, dtype=float)
+            mcp_adrs = _MCP_ADRS_BY_LEN.get(qpos.size)
+            if mcp_adrs is None:
+                continue
+            mcp = np.rad2deg(qpos[mcp_adrs])
             total = sends.get(side)
             prev = self._sends.get(side)
             # First redraw has no interval to divide by, and a restarted node
