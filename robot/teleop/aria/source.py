@@ -22,8 +22,18 @@ once costs one RPC and makes "Aria moves the arms" true of the hardware as
 well. Pass `hold_lift=False` for the free-lift behaviour, which is what
 sim_viz.py runs.
 
-Engagement is the publisher's shaka toggle, sent as `paused`. Engaging pins the
-operator's wrist frame to the robot's; everything after that is a delta from
+Engagement is the recording station's (Thor) `clutch_cmd`, latched: engage
+takes both arms, disengage releases them, and nothing else engages anything.
+The publisher's shaka is an emergency stop and only that -- it stops both arms
+and latches, and only the station's next engage clears it. The shaka is read as
+a *gesture*, not as the `paused` level it toggles: the publisher comes up
+paused, so the level says nothing about intent, and it is the change that means
+stop. A publisher that goes quiet trips the same stop through `stale_s`.
+
+With no station in the session (`--cmd-host none`) the latch is on for good and
+the shaka goes back to being the clutch, read as a level -- how this backend
+behaved before Thor had a say. Engaging pins
+the operator's wrist frame to the robot's; everything after that is a delta from
 that anchor -- rotation read in the wrist frame, translation in the world with
 only its heading taken from engage, so up stays up (see clutch.py, which
 carries the reasoning, and `mapping.translation_frame` for the older
@@ -98,7 +108,8 @@ class AriaSource(InputSource):
                  hand_type: str | None = None,
                  home_gesture: bool = True,
                  translation_frame: str = "world", stats: bool = True,
-                 clock_port: int = 5556):
+                 clock_port: int = 5556,
+                 cmd_sub: object | None = None):
         self._sides = ("left", "right") if hand == "both" else (hand,)
         self._hand_type = str(hand_type or "none").lower()
         self._position_scale = float(position_scale)
@@ -126,11 +137,36 @@ class AriaSource(InputSource):
         self._home = (HomeSeqWatcher()
                       if home_gesture and len(self._sides) == 2 else None)
         self._warned_no_home = False
+        # Engage/disengage from the recording station (Thor), latched: it is
+        # the authority, and the shaka is an emergency stop ANDed against it
+        # (see update()). A background thread owns the blocking commlink
+        # get(); update() only reads the latest value -- a control loop must
+        # never sit on a socket.
+        #
+        # No recording station this session means latched on for good and the
+        # shaka read as a level -- the shaka-only clutch this backend had
+        # before Thor had a say, which `_shaka_is_clutch` selects.
+        self._cmd_sub = cmd_sub
+        self._shaka_is_clutch = cmd_sub is None
+        self._thor_engaged = cmd_sub is None
+        self._last_ext: bool | None = None
+        # `cmd_sub` is a ClutchCmdWatcher: it owns the socket, the thread and
+        # the recovery, so nothing here ever waits on the station. Its
+        # `engaged` goes False when the feed goes stale, which arrives below
+        # as an ordinary disengage -- the station going quiet releases the
+        # arms rather than leaving them latched to a value nobody is refreshing.
+        # The emergency stop: latched per side, cleared only by a fresh engage
+        # from the station. `_prev_paused` is what turns the publisher's shaka
+        # *toggle* into a gesture edge -- see update().
+        self._stopped: dict[str, bool] = {s: False for s in self._sides}
+        self._prev_paused: dict[str, bool | None] = {
+            s: None for s in self._sides}
 
     @classmethod
-    def from_config(cls, cfg: AriaConfig) -> AriaSource:
+    def from_config(cls, cfg: AriaConfig, cmd_sub: object | None = None) -> AriaSource:
         """Build from config/aria_teleop.yaml — the way main() constructs one."""
         return cls(
+            cmd_sub=cmd_sub,
             host=cfg.publisher["host"], port=cfg.publisher["port"],
             hand=cfg.mapping["hand"],
             position_scale=cfg.mapping["position_scale"],
@@ -170,6 +206,8 @@ class AriaSource(InputSource):
             log("home gesture off: it needs both hands "
                 f"(hand={'+'.join(self._sides)})", style="yellow", prefix="aria")
         self._stream.start()
+        if self._cmd_sub is not None:
+            self._cmd_sub.start()
         # Best-effort and off-thread: the first handshake retries for several
         # seconds against a publisher that has no clock socket, and the arms
         # are waiting on start(). Latency reads '--' until it lands.
@@ -187,6 +225,8 @@ class AriaSource(InputSource):
                 f"(rtt {sample[1] * 1e3:.2f} ms)", prefix="aria")
 
     def stop(self) -> None:
+        if self._cmd_sub is not None:
+            self._cmd_sub.stop()
         if self._clock_sync is not None:
             self._clock_sync.stop()
         self._stream.stop()
@@ -200,19 +240,52 @@ class AriaSource(InputSource):
             cmd.lift_target = float(state.lift_target)
             log(f"lift pinned at {cmd.lift_target:.3f} m", prefix="aria")
         snap = self._stream.snapshot()
+        ext = self._poll_ext_cmd()
+        if ext is not None:
+            self._thor_engaged = ext
+            if ext:
+                # Engage doubles as the stop reset: the station is the only
+                # thing that clears a shaka, which is what makes it a stop
+                # rather than a pause.
+                for s_ in self._sides:
+                    self._stopped[s_] = False
+            log(f"thor: {'engage' if ext else 'disengage'}",
+                style="green" if ext else "yellow", prefix="aria")
+        # Any change to `paused` is a stop, whichever way it lands. It is a
+        # toggle the operator flips by shaka, and nothing else here reads its
+        # level -- the publisher keeps streaming poses while paused, so a
+        # paused arm can be engaged and moving. Trip on the rising edge only
+        # and stopping would take one shaka or two depending on a state the
+        # operator cannot see; on the change, one shaka always stops. One hand
+        # stops both: an emergency stop that left the other arm running would
+        # not be one. A publisher that goes quiet trips it too, since
+        # `stale_s` reports silence as paused.
+        if not self._shaka_is_clutch:
+            shaka = False
+            for side in self._sides:
+                prev, now = self._prev_paused[side], snap[side].paused
+                self._prev_paused[side] = now
+                shaka = shaka or (prev is not None and now != prev)
+            if shaka and self._thor_engaged and not all(
+                    self._stopped[s_] for s_ in self._sides):
+                for s_ in self._sides:
+                    self._stopped[s_] = True
+                log("STOP (shaka) -- station must re-engage",
+                    style="red", prefix="aria")
+
         for side in self._sides:
             clutch, s = self._clutches[side], snap[side]
-            # Engaged means: the publisher isn't paused and we have a wrist to
-            # follow. Deferring the anchor until both hold is what stops a hand
-            # held out of view from latching a stale pose.
-            #
-            # Unlike the Quest backend this is a level, not a button edge: the
-            # publisher's own toggle debounces with a shaka dwell (0.5 s) and comes
-            # up paused. A subscriber restarted while the publisher is running
-            # therefore engages on the first packet -- harmless, because the
-            # reseed below anchors on the robot's real pose, so zero delta is
-            # zero motion.
-            want = not s.paused and s.T_odom_wrist is not None
+            # The switch. The station engages and disengages; the shaka only
+            # ever stops. Deferring the anchor until a wrist is actually
+            # tracked is what stops a hand held out of view from latching a
+            # stale pose -- an arm whose hand is not in view engages as soon
+            # as it is, without the station saying anything again.
+            want = (self._thor_engaged and not self._stopped[side]
+                    and s.T_odom_wrist is not None)
+            if self._shaka_is_clutch:
+                # No station: the shaka is the clutch, read as a level, the
+                # way this backend behaved before Thor had a say.
+                want = not s.paused and s.T_odom_wrist is not None
             if want and not clutch.engaged:
                 clutch.engage(s.T_odom_wrist, self._engage_pose(side, state))
                 log(f"{side} arm: ENGAGED", style="green", prefix="aria")
@@ -227,8 +300,15 @@ class AriaSource(InputSource):
             target = clutch.target(s.T_odom_wrist)
             if target is not None:
                 setattr(cmd, f"{side}_target", target)
-            self._status[side] = SideStatus(
-                "ENGAGED" if clutch.engaged else "paused")
+            if clutch.engaged:
+                state_str = "ENGAGED"
+            elif self._shaka_is_clutch:
+                state_str = "paused"
+            elif self._stopped[side]:
+                state_str = "STOP"
+            else:
+                state_str = "standby"
+            self._status[side] = SideStatus(state_str)
         self._maybe_home(cmd, snap)
         return cmd
 
@@ -245,6 +325,19 @@ class AriaSource(InputSource):
             streams = tuple(
                 StreamRow(t, *snap[t]) for t in self._stats.topics)
         return SourceStatus(sides=dict(self._status), streams=streams)
+
+    def _poll_ext_cmd(self):
+        """The station's engagement, on the ticks it changes -- else None.
+
+        Edge-triggered so a republished value costs nothing; `update()` holds
+        the level it reports."""
+        if self._cmd_sub is None:
+            return None
+        want = bool(self._cmd_sub.engaged)
+        if want == self._last_ext:
+            return None
+        self._last_ext = want
+        return want
 
     def _maybe_home(self, cmd: TeleopCommand, snap: dict) -> None:
         """The publisher's home counter went up -> the node's home_arms."""

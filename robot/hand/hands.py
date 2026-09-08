@@ -32,19 +32,28 @@ client reads, so this subscribes to it directly, on its own thread:
     aria2robot stream_pub --PUB "qpos"--+--> teleop client --RPC :5557--> arms
                                         +--> Hands (in the node) ------> fingers
 
-Nothing shared but the publisher, and no RPC hop at all on the finger path.
+    Thor --PUB "clutch_cmd"-------------+--> teleop client   (engages arms)
+                                        +--> Hands           (engages fingers)
+
+Nothing shared but the two publishers, and no RPC hop at all on the finger
+path. The recording station is subscribed twice for the same reason the hand
+publisher is: a gate the fingers read through the arm client would put the
+finger loop behind the arm path again, which is the one thing this file
+exists to avoid. `--cmd-host` is what turns it on; without it the shaka is
+the only authority the fingers have, as it always was.
 For anything that is not a pair of glasses there is still an RPC surface, but
 it gets a socket of its own (`hand.rpc_port`, 5558) rather than the node's, so
 that path does not queue behind arm targets either.
 
 Hold-last, everywhere
 ---------------------
-A side's target changes only when a *usable* command arrives. Shaka-paused,
-publisher silent, tracking lost, nothing sent yet -- all of them hold the last
-pose rather than release it. aria2robot freezes `qpos` while paused and sends
+A side's target changes only when a *usable* command arrives. Stopped by a
+shaka, station disengaged, publisher silent, tracking lost, nothing sent yet --
+all of them hold the last pose rather than release it. aria2robot freezes `qpos` while paused and sends
 `None` before the first engage, so the hands are never touched pre-engage, and
 a link that goes quiet mid-grasp leaves the grasp alone instead of springing
-the hand open on its own. There is deliberately no staleness gate.
+the hand open on its own. There is deliberately no staleness gate on the hand
+publisher; the station's feed has one of its own, in `ClutchCmdWatcher`.
 
 Settings live in `config/aria_teleop.yaml` under `hand:`.
 
@@ -118,7 +127,8 @@ class Hands:
     """
 
     def __init__(self, cfg: AriaConfig, aria: bool = True, rpc: bool = True,
-                 tracking_csv: Path | None = None):
+                 tracking_csv: Path | None = None,
+                 cmd_host: str | None = None, cmd_port: int = 5559):
         self.cfg = cfg
         hand_cfg = cfg.hand
         self.sides = cfg.hand_sides()
@@ -133,6 +143,20 @@ class Hands:
         self.rate_hz = int(hand_cfg["rate_hz"])
         self.rpc_port = int(hand_cfg["rpc_port"]) if rpc else 0
         self._want_aria = bool(aria)
+        # The recording station (Thor) gates the fingers exactly as it gates
+        # the arms, on its own subscription -- see the module docstring for
+        # why the finger path never borrows the client's. No station given
+        # means the shaka is the whole authority, as it was before.
+        self._cmd_host = cmd_host or None
+        self._cmd_port = int(cmd_port)
+        self._clutch = None
+        # The same latch the arms run, so a hand and the arm it rides on are
+        # governed by one decision: the station engages, and a shaka is an
+        # emergency stop that only the station's next engage clears. Global,
+        # like the arms' -- one shaka stops both hands.
+        self._stopped = False
+        self._prev_station = False
+        self._prev_paused: dict[str, bool | None] = {s: None for s in self.sides}
 
         self._lock = threading.Lock()
         self._target: dict[str, np.ndarray | None] = {s: None for s in self.sides}
@@ -185,6 +209,11 @@ class Hands:
                 self.cfg.publisher["host"], self.cfg.publisher["port"],
                 sides=self.sides, stale_s=self.cfg.publisher["stale_s"] or None)
             self._stream.start()
+        if self._cmd_host:
+            from robot.teleop.aria.stream import ClutchCmdWatcher
+
+            self._clutch = ClutchCmdWatcher(self._cmd_host, self._cmd_port)
+            self._clutch.start()
         if self.rpc_port:
             from commlink import RPCServer
 
@@ -212,7 +241,7 @@ class Hands:
         self.sides = tuple(sides)
         with self._lock:
             for d in (self._target, self._engaged, self._origin, self._sent,
-                      self._sends):
+                      self._sends, self._prev_paused):
                 for side in [s for s in d if s not in self.sides]:
                     del d[side]
 
@@ -233,6 +262,9 @@ class Hands:
         if self._stream is not None:
             self._stream.stop()
             self._stream = None
+        if self._clutch is not None:
+            self._clutch.stop()
+            self._clutch = None
         if self._rpc is not None:
             try:
                 self._rpc.stop()
@@ -361,9 +393,34 @@ class Hands:
             return
         self._check_hand_type()
         snap = self._stream.snapshot()
+        station = True if self._clutch is None else self._clutch.engaged
+        if self._clutch is not None:
+            # Identical to the arms', deliberately: a hand and the arm it
+            # rides on must never disagree about whether they are being
+            # driven. The station's engage clears the stop; any change to a
+            # `paused` toggle sets it, whichever way that toggle lands, and it
+            # holds until the station engages again. `paused` is not read as a
+            # level here -- the publisher streams live finger angles whatever
+            # it says, so a hand whose shaka never toggles would otherwise
+            # never move while its arm did.
+            if station and not self._prev_station:
+                self._stopped = False
+            self._prev_station = station
+            shaka = False
+            for side in self.sides:
+                prev, now = self._prev_paused[side], snap[side].paused
+                self._prev_paused[side] = now
+                shaka = shaka or (prev is not None and now != prev)
+            if shaka and station and not self._stopped:
+                self._stopped = True
+                print(f"[{self.hand_type}] STOP (shaka) -- "
+                      "station must re-engage")
         for side in self.sides:
             s = snap[side]
-            engaged = not s.paused
+            # No station: the shaka is the whole authority, read as a level,
+            # the way this ran before the station had a say.
+            engaged = (station and not self._stopped if self._clutch is not None
+                       else not s.paused)
             with self._lock:
                 self._engaged[side] = engaged
             # Paused freezes the fingers; None is the pre-engage state, where
@@ -466,7 +523,9 @@ def hands_from_args(args, force_backend: str | None = None) -> Hands | None:
     tracking = getattr(args, "tracking_csv", None)
     if tracking and cfg.hand["backend"] != "hardware":
         raise SystemExit("--tracking-csv needs --hand-backend hardware")
-    return Hands(cfg, tracking_csv=Path(tracking) if tracking else None)
+    return Hands(cfg, tracking_csv=Path(tracking) if tracking else None,
+                 cmd_host=getattr(args, "cmd_host", None),
+                 cmd_port=getattr(args, "cmd_port", 5559))
 
 
 def add_hand_args(parser, backend_flag: bool = True) -> None:
@@ -477,6 +536,13 @@ def add_hand_args(parser, backend_flag: bool = True) -> None:
                         help="settings file (default: config/aria_teleop.yaml)")
     parser.add_argument("--pub-host", default=None,
                         help="override hand publisher host -- where stream_pub runs")
+    parser.add_argument("--cmd-host", default=None,
+                        help="recording station publishing clutch_cmd (Thor). "
+                             "Gates the fingers the way it gates the arms in "
+                             "wholebody_teleop.py; both subscribe separately. "
+                             "Unset = the shaka is the only authority.")
+    parser.add_argument("--cmd-port", type=int, default=5559,
+                        help="port for --cmd-host (default: %(default)s)")
     parser.add_argument("--hands", choices=["both", "left", "right", "none"],
                         default=None,
                         help="which hands to drive (default: hand.sides); "

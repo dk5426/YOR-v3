@@ -58,7 +58,7 @@ import numpy as np
 # here because this is where the subscriber side has always found it.
 from robot.hand.wuji_driver import canonical_joint_names
 
-__all__ = ["AriaHandStream", "HomeSeqWatcher", "SideSample",
+__all__ = ["AriaHandStream", "ClutchCmdWatcher", "HomeSeqWatcher", "SideSample",
            "canonical_joint_names"]
 
 
@@ -274,3 +274,114 @@ class AriaHandStream:
     def _qpos(side_msg: dict) -> np.ndarray | None:
         qpos = side_msg.get("qpos")
         return None if qpos is None else np.asarray(qpos, dtype=np.float64)
+
+
+class ClutchCmdWatcher:
+    """The recording station's (Thor) engage/disengage, off the control path.
+
+    Two things need the station's latch and neither may block on a socket to
+    read it: the teleop client, which gates the arms, and `Hands` inside the
+    node, which gates the fingers. They subscribe separately, for the same
+    reason the `qpos` path does -- the finger loop must never wait on anything
+    the arm path is doing.
+
+    Survives the station restarting, which is the whole reason this is not
+    three lines. commlink's pull socket is a DEALER with no receive timeout:
+    if the publisher dies between the request and its reply, `get()` blocks
+    forever, and because DEALER does not resend on reconnect the reply never
+    comes even once the station is back. The transport reconnects, `ss` shows
+    ESTABLISHED, and the value is frozen at whatever it was -- silently, for
+    the life of the process. So the fetch runs on a thread this class can
+    abandon: if nothing has arrived for `stale_s`, the subscriber is rebuilt
+    and the stuck thread is left to its fate (one leaked thread per station
+    restart, which is a price worth paying).
+
+    `engaged` is False until the station has actually said engage, and False
+    again whenever the feed goes stale. A station that cannot be heard from
+    holds the robot -- it never hands it over on the strength of a default or
+    a value that stopped being refreshed.
+    """
+
+    POLL_S = 0.02
+    STALE_S = 3.0
+    DEFAULT_PORT = 5559
+    TOPIC = "clutch_cmd"
+
+    def __init__(self, host: str, port: int = DEFAULT_PORT,
+                 stale_s: float = STALE_S):
+        self.host = str(host)
+        self.port = int(port)
+        self.stale_s = float(stale_s)
+        self._engaged = False
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._gen = 0
+        self._last_ok = 0.0
+        self._thread: threading.Thread | None = None
+
+    @property
+    def engaged(self) -> bool:
+        with self._lock:
+            return self._engaged
+
+    def start(self) -> None:
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._supervise,
+                                        name="clutch-cmd-watch", daemon=True)
+        self._thread.start()
+        print(f"[aria] clutch_cmd <- tcp://{self.host}:{self.port} "
+              f"(stale after {self.stale_s:.0f}s -> disengaged)")
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._gen += 1
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _disengage(self, why: str) -> None:
+        with self._lock:
+            was, self._engaged = self._engaged, False
+        if was:
+            print(f"[aria] clutch_cmd {why} -- holding disengaged")
+
+    def _supervise(self) -> None:
+        """Own the connection; rebuild it whenever the feed stops arriving."""
+        import commlink
+
+        while not self._stop.is_set():
+            try:
+                sub = commlink.Subscriber(self.host, self.port,
+                                          topics=[self.TOPIC], buffer=False)
+            except Exception as exc:
+                self._disengage(f"connect failed ({exc})")
+                self._stop.wait(1.0)
+                continue
+            self._gen += 1
+            gen = self._gen
+            self._last_ok = time.monotonic()
+            threading.Thread(target=self._fetch, args=(sub, gen), daemon=True,
+                             name=f"clutch-cmd-fetch-{gen}").start()
+            while not self._stop.is_set() and gen == self._gen:
+                if time.monotonic() - self._last_ok > self.stale_s:
+                    # Abandon this generation: the fetch thread may be wedged
+                    # in a recv that will never return, and nothing short of a
+                    # new socket gets us out of it.
+                    self._disengage("stale")
+                    self._gen += 1
+                    break
+                self._stop.wait(0.2)
+
+    def _fetch(self, sub, gen: int) -> None:
+        while not self._stop.is_set() and gen == self._gen:
+            try:
+                m = sub.get(self.TOPIC)
+            except Exception:
+                m = None
+            if gen != self._gen:      # abandoned while we were blocked
+                return
+            if m is not None:
+                with self._lock:
+                    self._engaged = bool(m.get("engage"))
+                self._last_ok = time.monotonic()
+            self._stop.wait(self.POLL_S)

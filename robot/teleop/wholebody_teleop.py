@@ -795,6 +795,17 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=None,
                         help="RPC server port (default: 8081 for sim, 5557 for hw)")
     parser.add_argument("--rate", type=int, default=LOOP_RATE, help="loop rate (Hz)")
+    parser.add_argument("--cmd-host", default="thor2",
+                        help="recording station publishing clutch_cmd "
+                             "(default: %(default)s), which engages and "
+                             "disengages the arms; the Aria shaka stops them "
+                             "whatever it last said. This is NOT the Aria "
+                             "publisher -- pointing it there leaves the arms "
+                             "permanently disengaged, because AriaSource "
+                             "latches off until the station says otherwise. "
+                             "`none` disables it and hands the clutch back to "
+                             "the shaka alone.")
+    parser.add_argument("--cmd-port", type=int, default=5559)
     parser.add_argument("--oculus-host", default="10.21.63.17",
                         help="Quest headset IP (oculus input only; default: "
                              "%(default)s)")
@@ -858,7 +869,24 @@ def main() -> None:
         if args.pub_host:
             cfg.publisher["host"] = args.pub_host
         console.print(cfg.describe(), markup=False, highlight=False)
-        source = AriaSource.from_config(cfg)
+        # The clutch_cmd feed is the RECORDING STATION, not the Aria
+        # publisher. It used to default to cfg.publisher["host"], which
+        # --pub-host then pointed at the glasses host -- so the station's
+        # engage never arrived. That was survivable while the shaka could
+        # still engage on its own; it is not now, because AriaSource latches
+        # `_thor_engaged` off whenever a cmd_sub exists and only the station
+        # can turn it on. A wrong host here means arms that never move, with
+        # nothing on screen to say why. Hence an explicit default and no
+        # inheritance. `none` disables and restores shaka-only control.
+        cmd_sub = None
+        if str(args.cmd_host).lower() not in ("none", "off", ""):
+            from robot.teleop.aria.stream import ClutchCmdWatcher
+            cmd_sub = ClutchCmdWatcher(args.cmd_host, args.cmd_port)
+            console.print(
+                f"[teleop] clutch_cmd <- tcp://{args.cmd_host}:{args.cmd_port}"
+                " (arms stay disengaged until it says engage; "
+                "--cmd-host none for shaka-only)")
+        source = AriaSource.from_config(cfg, cmd_sub=cmd_sub)
     else:
         source = OculusSource(host=args.oculus_host,
                               pose_filter=args.pose_filter,
