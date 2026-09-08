@@ -14,6 +14,12 @@
 # whole-body loop's authority over that subsystem for a moment
 # (manual_override_timeout_s), so the two controllers never fight over the
 # same actuator.
+#
+# A reset takes longer than a moment, so the loop can also be switched off
+# outright: set_wholebody(False) over RPC (or --no-wholebody at startup)
+# stops it and leaves the chassis to BaseController alone, the way --no-arms
+# does but without giving up the arms. set_wholebody(True) brings it back,
+# re-seeded from wherever the reset left the robot.
 
 import argparse
 import atexit
@@ -165,9 +171,17 @@ class YOR:
         # robot/hand/hands.py.
         self.hands: Hands | None = hands
         self.wholebody: WholeBodyController | None = None
+        # Whether whole-body control is wanted -- at startup, and from then
+        # on whatever set_wholebody() last asked for. Read by init() and by
+        # _home_arm_joints, which rebuilds a controller after homing.
         self._wholebody_requested = wholebody and not no_arms
         self._wholebody_config = wholebody_config
         self._ik_config = ik_config
+        # Solver toggles carried across a set_wholebody() cycle. They live on
+        # the IK object, so a rebuilt controller would otherwise come back at
+        # the config defaults; enable_base_motion needs no help here because
+        # it lives on the config object, which is reused as it stands.
+        self._wholebody_toggles: dict | None = None
         # Which MJCF the whole-body IK solver loads -- picks up whichever
         # hand (if any) is mounted, per --hand / hand.type. None means
         # WholeBodyIK's own default (the bare, hand-agnostic scene).
@@ -280,25 +294,11 @@ class YOR:
         self._initialized = True
 
         if self._wholebody_requested:
-            # Stamp the gain set into the config before the controller builds
-            # its trajectory recorder, so every log says what it was driving on.
-            if self._wholebody_config is None:
-                self._wholebody_config = WholeBodyHardwareConfig()
-            self._wholebody_config.base_pid_provenance = self._base_pid_provenance
-            self.wholebody = WholeBodyController(
-                left_arm=self.left_arm,
-                right_arm=self.right_arm,
-                base=self.base,
-                base_controller=self.base_controller,
-                config=self._wholebody_config,
-                ik_config=self._ik_config,
-                scene_xml=self._scene_xml,
-            )
-            if not self.wholebody.config.enable_base_motion:
-                self.wholebody.toggle_fix_base(True)
-            if not self.wholebody.config.enable_lift_motion:
-                self.wholebody.ik.toggle_fix_lift(True)
-            self.wholebody.start()
+            self._start_wholebody()
+        elif not self.no_arms:
+            print("[YOR] whole-body control OFF at startup (--no-wholebody); "
+                  "the base answers set_base_velocity / move_to / follow_path. "
+                  "Call set_wholebody(True) to switch it on")
 
         # Last, after the arms have homed: the first pose an engaged operator
         # sends is a whole grasp, and nothing should be closing a hand while
@@ -325,6 +325,50 @@ class YOR:
                 except Exception as stop_exc:
                     print(f"[YOR] hands cleanup also failed ({stop_exc!r})")
                 self.hands = None
+
+    def _start_wholebody(self) -> bool:
+        """Build (if needed) and start the whole-body controller.
+
+        A controller that is not currently attached is *rebuilt* rather than
+        restarted. WholeBodyController.stop() drops the SLAM listener and
+        leaves `initialized` set, so a bare start() would resume against the
+        model the loop held when it stopped -- the pose the robot was in
+        before whatever reset the operator just performed, which it would then
+        drive back to. A fresh controller runs init(), which re-seeds arms,
+        lift and base odometry from the hardware as it stands now.
+        """
+        if self.no_arms:
+            print("[YOR] cannot start whole-body control without arms")
+            return False
+        if self.wholebody is None:
+            # Stamp the gain set into the config before the controller builds
+            # its trajectory recorder, so every log says what it was driving on.
+            if self._wholebody_config is None:
+                self._wholebody_config = WholeBodyHardwareConfig()
+            self._wholebody_config.base_pid_provenance = self._base_pid_provenance
+            self.wholebody = WholeBodyController(
+                left_arm=self.left_arm,
+                right_arm=self.right_arm,
+                base=self.base,
+                base_controller=self.base_controller,
+                config=self._wholebody_config,
+                ik_config=self._ik_config,
+                scene_xml=self._scene_xml,
+            )
+            saved = self._wholebody_toggles
+            self._wholebody_toggles = None
+            if saved is not None:
+                self.wholebody.toggle_fix_base(saved["fix_base"])
+                self.wholebody.ik.toggle_fix_lift(saved["fix_lift"])
+                self.wholebody.toggle_collision_avoidance(saved["collisions"])
+            else:
+                if not self.wholebody.config.enable_base_motion:
+                    self.wholebody.toggle_fix_base(True)
+                if not self.wholebody.config.enable_lift_motion:
+                    self.wholebody.ik.toggle_fix_lift(True)
+        self.wholebody.start()
+        print("[YOR] whole-body control ON")
+        return True
 
     def _sync_base_pid_gains(self) -> None:
         """Bring the swerve controllers to the selected PID manifest.
@@ -1124,25 +1168,77 @@ class YOR:
     @require_initialization
     def resume_wholebody(self) -> bool:
         """Restart whole-body control after park() / tuck_arms() / emergency_stop()."""
-        if self.no_arms:
-            print("[YOR] cannot resume whole-body control without arms")
-            return False
-        if self.wholebody is None:
-            self.wholebody = WholeBodyController(
-                left_arm=self.left_arm,
-                right_arm=self.right_arm,
-                base=self.base,
-                base_controller=self.base_controller,
-                config=self._wholebody_config,
-                ik_config=self._ik_config,
-                scene_xml=self._scene_xml,
-            )
-            if not self.wholebody.config.enable_base_motion:
-                self.wholebody.toggle_fix_base(True)
-            if not self.wholebody.config.enable_lift_motion:
-                self.wholebody.ik.toggle_fix_lift(True)
-        self.wholebody.start()
-        return True
+        return self.set_wholebody(True)
+
+    @require_initialization
+    def set_wholebody(self, enabled: bool | None = None) -> bool:
+        """Switch between whole-body IK control and direct base control.
+
+        This is the runtime form of the choice --no-arms used to be the only
+        way to make, and it does not cost the arms:
+
+          set_wholebody(False)  stops the whole-body loop and hands the
+              chassis back to BaseController, stopped and in BASE_VEL. Nothing
+              re-commands the base at 30 Hz behind the operator any more, so
+              set_base_velocity / move_to / follow_path, the lift calls and
+              the direct joint calls own the robot -- which is what makes a
+              reset possible. The arms stay homed, powered and holding
+              wherever they were left.
+
+          set_wholebody(True)   brings the loop back, re-seeded from wherever
+              the reset left the robot (see _start_wholebody).
+
+        `enabled=None` toggles. Returns the mode now live: True for
+        whole-body, False for direct base control.
+        """
+        if enabled is None:
+            enabled = not self.wholebody_enabled()
+        if enabled:
+            started = self._start_wholebody()
+            # `_wholebody_requested` is the standing intent, not just what
+            # startup asked for: _home_arm_joints consults it to decide
+            # whether to bring a controller back after homing, and a reset
+            # that runs home_arms() must not be handed the solver back
+            # halfway through. Only a start that actually happened counts.
+            self._wholebody_requested = self._wholebody_requested or started
+            return started
+
+        self._wholebody_requested = False
+        if self.wholebody is not None:
+            # Session state, not startup config: an operator who switched
+            # collision avoidance off to get out of a corner should not have
+            # it switched back on by the reset they did next.
+            self._wholebody_toggles = {
+                "fix_base": bool(self.wholebody.ik.fix_base),
+                "fix_lift": bool(self.wholebody.ik.fix_lift),
+                "collisions": bool(self.wholebody.ik.avoid_collisions),
+            }
+            self.wholebody.stop()
+            # Dropped, not merely stopped: _start_wholebody explains why the
+            # next enable has to build a fresh controller.
+            self.wholebody = None
+        # stop() halts the base itself, but it returns early when the loop was
+        # already stopped -- after emergency_stop(), say -- so leave the
+        # chassis in a known state from here as well.
+        self.base_controller.mode = "BASE_VEL"
+        self.base_controller.target_velocity = np.zeros(3, dtype=float)
+        self.base.set_target_base_velocity(np.zeros(3), smooth=False)
+        print("[YOR] whole-body control OFF — base under direct control")
+        return False
+
+    def wholebody_enabled(self) -> bool:
+        """True when the whole-body loop is attached *and* running.
+
+        Reads the loop flag rather than just testing for a controller:
+        emergency_stop() leaves the controller attached with its threads
+        joined, and that is not whole-body control being in charge.
+        """
+        wb = self.wholebody
+        return wb is not None and bool(wb._running)
+
+    def get_control_mode(self) -> str:
+        """Which controller owns the chassis: "wholebody" or "base"."""
+        return "wholebody" if self.wholebody_enabled() else "base"
 
     @require_initialization
     def emergency_stop(self):
@@ -1420,6 +1516,15 @@ def main():
     parser.add_argument(
         "--no-arms", action="store_true",
         help="skip both arm controllers and their startup joint homing")
+    parser.add_argument(
+        "--wholebody", action=argparse.BooleanOptionalAction, default=True,
+        help="run the whole-body IK loop, which coordinates arms, lift and "
+             "base as one system (default: on). --no-wholebody homes and "
+             "powers the arms as usual but leaves the loop stopped, so the "
+             "chassis answers only set_base_velocity / move_to / follow_path "
+             "-- the mode to reset the robot in, without the solver driving "
+             "it back. Switch either way at runtime over RPC with "
+             "set_wholebody(True/False); ignored with --no-arms.")
     parser.add_argument(
         "--gripper", choices=("none", "dynamixel", "native"), default="none",
         help="which gripper hardware is fitted (default: none, gripper "
@@ -1813,6 +1918,7 @@ def main():
 
     yor = YOR(
         no_arms=args.no_arms,
+        wholebody=args.wholebody,
         wholebody_config=wholebody_config,
         ik_config=ik_config,
         flash_base_pid=args.flash_base_pid,
