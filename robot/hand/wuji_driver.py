@@ -107,19 +107,33 @@ class HardwareWujiDriver(WujiDriver):
             stepping to it from rest is a real hazard, so each side ramps once
             and then streams.
         lowpass_hz: cutoff of the controller-side filter.
+        effort_limit_a: per-joint current cap, amps (SDK range 0-3.5). Caps
+            grip force, so a squeeze on a rigid object stalls at this current
+            instead of the SDK's 0.8 A.
         tracking_csv: log per-step commanded vs measured angles here.
     """
 
     name = "hardware"
+    # wujihandpy's own default, restored on close so the next process to open
+    # the hand does not inherit a cap it never asked for
+    SDK_EFFORT_LIMIT_A = 0.8
 
-    def __init__(self, sides=SIDES, serials: dict[str, str] | None = None,
-                 ramp_s: float = 1.5, ramp_steps: int = 30,
-                 lowpass_hz: float = 5.0, tracking_csv: Path | None = None):
+    def __init__(
+        self,
+        sides=SIDES,
+        serials: dict[str, str] | None = None,
+        ramp_s: float = 1.5,
+        ramp_steps: int = 30,
+        lowpass_hz: float = 5.0,
+        effort_limit_a: float = 0.8,
+        tracking_csv: Path | None = None,
+    ):
         super().__init__(sides)
         self.serials = dict(serials or {})
         self.ramp_s = float(ramp_s)
         self.ramp_steps = max(1, int(ramp_steps))
         self.lowpass_hz = float(lowpass_hz)
+        self.effort_limit_a = float(effort_limit_a)
         self.tracking_csv = None if tracking_csv is None else Path(tracking_csv)
         self._lock = threading.Lock()
         self._hands: dict[str, object] = {}
@@ -143,14 +157,18 @@ class HardwareWujiDriver(WujiDriver):
         for side in self.sides:
             serial = self.serials.get(side) or ""
             try:
-                hand = (wujihandpy.Hand(serial_number=serial) if serial
-                        else wujihandpy.Hand())
+                hand = (
+                    wujihandpy.Hand(serial_number=serial)
+                    if serial
+                    else wujihandpy.Hand()
+                )
                 # The server sends from its own loop thread and closes from the
                 # signal handler; the SDK's check would reject the second thread
                 disable_check = getattr(hand, "disable_thread_safe_check", None)
                 if callable(disable_check):
                     disable_check()
                 hand.write_joint_enabled(True)
+                hand.write_joint_effort_limit(self.effort_limit_a)
                 # enable_upstream costs bandwidth streaming state back; only pay
                 # it when something is going to read it
                 controller = hand.realtime_controller(
@@ -162,18 +180,21 @@ class HardwareWujiDriver(WujiDriver):
                 # serial is unambiguous, so a side that does not answer is
                 # absent, not mistaken for its twin -- and the blank-serial
                 # refusal above has already run, so this cannot mask a swap.
-                print(f"[wuji] {side} hand did not open ({exc}); "
-                      "continuing without it")
+                print(f"[wuji] {side} hand did not open ({exc}); continuing without it")
                 continue
             self._hands[side] = hand
             self._controllers[side] = controller
             opened.append(side)
-            print(f"[wuji] {side} hand open"
-                  + (f" (serial {serial})" if serial else " (first on the bus)"))
+            print(
+                f"[wuji] {side} hand open"
+                + (f" (serial {serial})" if serial else " (first on the bus)")
+                + f", effort limit {self.effort_limit_a} A"
+            )
         if not opened:
             raise RuntimeError(
                 "no WUJI hand opened; check the USB connection, ~/.wuji "
-                f"provisioning and hand.serial for {'+'.join(self.sides)}")
+                f"provisioning and hand.serial for {'+'.join(self.sides)}"
+            )
         # Everything downstream keys off this, so narrow it to what is really
         # there rather than sending at a device that is not.
         self.sides = tuple(opened)
@@ -184,7 +205,8 @@ class HardwareWujiDriver(WujiDriver):
             self._csv_fh = open(self.tracking_csv, "w", newline="")
             self._csv_writer = csv.writer(self._csv_fh)
             self._csv_writer.writerow(
-                ("t_wall", "side", "finger_idx", "joint_idx", "q_cmd", "q_actual"))
+                ("t_wall", "side", "finger_idx", "joint_idx", "q_cmd", "q_actual")
+            )
             self._csv_fh.flush()
 
         # Command the rest pose before anything else can. `write_joint_enabled`
@@ -228,18 +250,28 @@ class HardwareWujiDriver(WujiDriver):
         """
         with self._lock:
             for side in self.sides:
-                self._ramp_locked(side, np.zeros(N_JOINTS, dtype=np.float32),
-                                  start=self._last.get(side))
+                self._ramp_locked(
+                    side,
+                    np.zeros(N_JOINTS, dtype=np.float32),
+                    start=self._last.get(side),
+                )
                 self._last[side] = np.zeros(N_JOINTS)
 
     def close(self) -> None:
         with self._lock:
             try:
                 for side in self.sides:
-                    self._ramp_locked(side, np.zeros(N_JOINTS, dtype=np.float32),
-                                      start=self._last.get(side))
+                    self._ramp_locked(
+                        side,
+                        np.zeros(N_JOINTS, dtype=np.float32),
+                        start=self._last.get(side),
+                    )
             finally:
                 for side, hand in self._hands.items():
+                    try:
+                        hand.write_joint_effort_limit(self.SDK_EFFORT_LIMIT_A)
+                    except Exception as exc:
+                        print(f"[wuji] {side} effort limit restore failed: {exc}")
                     try:
                         hand.write_joint_enabled(False)
                     except Exception as exc:
@@ -263,17 +295,28 @@ class HardwareWujiDriver(WujiDriver):
             return
         t_wall = time.time()
         self._csv_writer.writerows(
-            (f"{t_wall:.6f}", side, f, j,
-             f"{float(q_2d[f, j]):.6f}", f"{float(q_actual[f, j]):.6f}")
-            for f in range(5) for j in range(4)
+            (
+                f"{t_wall:.6f}",
+                side,
+                f,
+                j,
+                f"{float(q_2d[f, j]):.6f}",
+                f"{float(q_actual[f, j]):.6f}",
+            )
+            for f in range(5)
+            for j in range(4)
         )
         self._csv_fh.flush()
 
-    def _ramp_locked(self, side: str, target: np.ndarray,
-                     start: np.ndarray | None = None) -> None:
+    def _ramp_locked(
+        self, side: str, target: np.ndarray, start: np.ndarray | None = None
+    ) -> None:
         """Interpolate from `start` (rest if None) to `target` over ramp_s."""
-        q0 = (np.zeros(N_JOINTS, dtype=np.float32) if start is None
-              else np.asarray(start, dtype=np.float32).reshape(-1))
+        q0 = (
+            np.zeros(N_JOINTS, dtype=np.float32)
+            if start is None
+            else np.asarray(start, dtype=np.float32).reshape(-1)
+        )
         dt = self.ramp_s / self.ramp_steps
         for alpha in np.linspace(0.0, 1.0, self.ramp_steps, endpoint=True):
             self._write_locked(side, (1.0 - alpha) * q0 + alpha * target)

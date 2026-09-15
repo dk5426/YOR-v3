@@ -85,19 +85,17 @@ clutch:
   # never reached. Ignored by sim_viz, which reads its own live FK.
   reseed: true
 
-  # Pin the lift to its current height on the first tick.
+  # There is no lift setting. This backend never sends a lift target, so both
+  # nodes keep the `lift_target = None` they start with and the solver owns the
+  # column — which is what makes the arms' vertical reach the lift's travel
+  # plus the shoulders' rather than the shoulders' alone.
   #
-  # Both the hardware and sim nodes start with no lift target, which the solver
-  # reads as "the lift is yours" — so a client that simply never mentions the
-  # lift does not leave it where it is, it hands the solver the column. This
-  # sends one set_lift_target to claim it back.
-  #
-  # It is a preference, not a lock: the lift target is a soft posture term
-  # (lift_posture_cost, 1e-4 on the sim node), so the solver will still trade
-  # the column away to help the arms reach. Holding it hard would need a
-  # fix_lift RPC, which neither node exposes today. false leaves the lift free,
-  # which is what sim_viz runs.
-  hold_lift: true
+  # `hold_lift` used to sit here and pinned the lift on the first tick. It is
+  # gone: the pin was a one-shot on the client, while what it pinned was state
+  # the node throws away every time it rebuilds the whole-body controller, so
+  # the same command line gave a frozen lift or a free one depending on which
+  # side of a rebuild the session started. See robot/teleop/aria/source.py.
+  # A file that still sets it is ignored, not rejected.
 
 home:
   # Thumbs up on *both* hands, both disengaged, homes both arms — the node's
@@ -182,15 +180,15 @@ hand:
   # flip for two — so when two hands are driven, the driver refuses to start
   # until both are set.
   serial:
-    left: "386C36603533"
+    left: "3861366A3533"
     right: "347238733433"
 
   # type: aero only. AeroHand(port=...), a serial device path (e.g.
   # /dev/ttyUSB0). Blank auto-detects, which only works with exactly one Aero
   # hand on the bus — same two-hands-need-both-set rule as serial above.
   port:
-    left: /dev/ttyACM0
-    right: /dev/ttyACM1
+    left: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_10:20:BA:04:FF:A4-if00
+    right: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_90:70:69:12:D3:5C-if00
 
   # type: aero only. Per-actuator caps (0..32766 / 0..1000), re-applied on
   # every start since firmware resets to max on every power cycle.
@@ -217,3 +215,9 @@ hand:
 
   # type: wuji only. Cutoff of wujihandpy's own controller-side low-pass, Hz.
   lowpass_hz: 5.0
+
+  # type: wuji only. Per-joint current cap, amps (SDK default 1.5, range
+  # 0-3.5). Caps grip force: a squeeze on a rigid object stalls here rather
+  # than at the SDK's 1.5 A. Written on open, restored to 1.5 on close.
+  # 0.8 is what HuG_deployment's yor_run used.
+  effort_limit_a: 0.8

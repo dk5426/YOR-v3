@@ -116,8 +116,7 @@ and WiFi stalls the 30 Hz loop directly; the hand stream is one-way PUB/SUB that
 already drains to the newest sample and has a staleness gate, so it is the link
 that should cross the network. On a good LAN either placement works.
 
-Arms only: this backend never commands the base, and touches the lift exactly
-once (§5).
+Arms only: this backend never commands the base or the lift (§6).
 
 ---
 
@@ -146,7 +145,6 @@ immediately:
 | `mapping.translation_frame` | `world` | which frame hand *translation* is read in. `world` keeps up meaning up; `wrist` is the older behaviour where translation rides the engage orientation too. Rotation is wrist-framed either way — see §3 |
 | `mapping.scene` | `""` (auto) | where the flange→wrist offset and pinned home orientation are read from. Empty auto-picks the scene for `hand.type`; an explicit path always overrides it |
 | `clutch.reseed` | `true` | engage anchors on the robot's actual EE, not the local target |
-| `clutch.hold_lift` | `true` | claim the lift on the first tick — see §6 |
 | `home.gesture` | `true` | act on the publisher's two-thumbs home, which homes both arms **and opens both hands**. The dwell is `stream_pub --home-dwell-s`; this is the local veto |
 | `sim.*` | — | `sim_viz.py` only: solve rate, base posture cost, QP solver, viser port, share |
 | `hand.type` | `none` | which hand hardware: `none` (arms only, no hand constructed at all — the default), `wuji` (WUJI five-finger) or `aero` (Tetheria Aero Hand Open). Both `wuji` and `aero` are sim-renderable, each with its own MJCF scene variant (`description/scene_wholebody{,_wuji,_aero}.xml`). Picked explicitly, never auto-detected from the publisher. `--hand` overrides it per run, the same flag name and meaning on `yor.py`, `yor_mujoco.py` and `sim_viz.py` (whose arm-side flag is `--side`, not `--hand`, so there is no collision). Checked once against the publisher's own declared `--hand`, and a mismatch is **fatal** — every joint vector is misread otherwise (an Aero-shaped vector driven as WUJI's, or the reverse), which on real hardware is the wrong actuators moving to the wrong angles. Skipped entirely when `hand.type: none` — arms-only never cares what hand the publisher retargets. Silent (not fatal) only when the publisher never sends `meta["hand"]` at all — an older, pre-wire-2 publisher |
@@ -577,17 +575,26 @@ and writes it verbatim after that. Clipping on the write instead would nudge an
 
 ## 6. About the lift
 
-Both the hardware and sim nodes start with *no* lift target, which the solver
-reads as "the lift is yours". A client that simply never mentions the lift does
-not leave the column where it is — it hands it to the solver.
-`clutch.hold_lift` sends one `set_lift_target` on the first tick to claim it
-back, and prints `[aria] lift pinned at …`.
+Nothing here commands it. Both the hardware and sim nodes start with *no* lift
+target, which the solver reads as "the lift is yours", and this backend never
+says otherwise — so the column rises and falls to help the hands reach, and the
+arms' vertical range is the lift's travel plus the shoulders' rather than the
+shoulders' alone. Expect the lift to move during a session; that is the solver
+using it, not drift.
 
-It is a **preference, not a lock**: the lift target is a soft posture term
-(`lift_posture_cost`, `1e-4` on the sim node), so the solver still trades the
-column away to help the arms reach. Measured drift over a 12 s reachable-motion
-run: 0.200 → 0.115 m with the pin, versus 0.200 → 0.000 without. Holding it hard
-would need a `fix_lift` RPC, which neither node exposes today.
+**`clutch.hold_lift` is gone.** It used to send one `set_lift_target` on the
+first tick to claim the column back, printing `[aria] lift pinned at …`. The
+pin was a one-shot latch on the client, but what it pinned —
+`WholeBodyController.lift_target` — is per-controller state on the node, reset
+to `None` by every rebuild (`set_wholebody()`, `resume_wholebody()`, the
+thumbs-up `home_arms`). A client could never re-pin, so the same command line
+gave a lift frozen for its whole session or a free one, depending only on
+which side of a rebuild the session happened to start — with nothing on screen
+saying which. A config file that still sets the key is ignored, not rejected.
+
+Holding the column deliberately would need a `fix_lift` RPC, which neither node
+exposes today; `lift_to_height()` on the node is the way to place it before a
+session.
 
 ---
 
@@ -735,7 +742,7 @@ break.
 | Operator triad mirrored or 90° off | An axis table in `clutch.py` (`MANO_WRIST_AXES` / `YOR_WRIST_AXES`). Edit them there and nowhere else. |
 | Homing repeats while the thumb is up | `HoldTrigger.latch()` regressed to `reset()` — now in aria2robot's `utils/gesture.py`, pinned by "fires once and needs a release" there. |
 | Thumbs up never homes, everything else works | If the publisher's console shows `home: both thumbs up -> home_seq=N`, the gesture was detected and this client ignored it: check `home.gesture` and that a clutch is not still engaged. If it shows nothing, the publisher never saw it — both hands must be shaka-off *and* in view. |
-| Lift drifts down under load | Expected — `hold_lift` is a soft preference, see §6. |
+| Lift moves on its own during teleop | Expected — the solver owns the column and uses it for vertical reach, see §6. |
 | Arms follow but the sim's fingers never move | `yor_mujoco.py` was started with `--no-hands`, or without `--pub-host <publisher-ip>` so it is subscribing to `localhost`. The sim holds the home keyframe and says nothing — a silent publisher is a no-op by design. |
 | Fingers move in `sim_viz` but not through `--input aria` | Different paths. `sim_viz` renders them off its own subscription; the node needs `--pub-host <publisher-ip>` (and not `--no-hands`) to reach the same stream. §5. |
 | One hand never moves; the other is fine | `hand.sides` (or `--hands`) is naming one side. The startup line `[wuji] hands=…` says which. §5. |

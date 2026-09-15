@@ -111,6 +111,7 @@ def hand_mount_body(hand_type: str | None, side: str) -> str | None:
     tmpl = _MOUNT_ORIENT_BODY.get(str(hand_type or "none").lower())
     return tmpl.format(side=side) if tmpl else None
 
+
 # A resend of the identical vector is wasted USB traffic, but the threshold has
 # to stay well under the smallest motion an operator can see -- 1e-4 rad is
 # ~0.006 degrees, about a thousandth of a finger's travel.
@@ -126,17 +127,23 @@ class Hands:
     configured driver (`wujihandpy` or `aero_open_sdk`).
     """
 
-    def __init__(self, cfg: AriaConfig, aria: bool = True, rpc: bool = True,
-                 tracking_csv: Path | None = None,
-                 cmd_host: str | None = None, cmd_port: int = 5559):
+    def __init__(
+        self,
+        cfg: AriaConfig,
+        aria: bool = True,
+        rpc: bool = True,
+        tracking_csv: Path | None = None,
+        cmd_host: str | None = None,
+        cmd_port: int = 5559,
+    ):
         self.cfg = cfg
         hand_cfg = cfg.hand
         self.sides = cfg.hand_sides()
         self.hand_type = str(hand_cfg["type"]).lower()
         if self.hand_type not in _HAND_MODULES:
             raise ValueError(
-                f"unknown hand.type {self.hand_type!r}; want "
-                f"{'|'.join(_HAND_MODULES)}")
+                f"unknown hand.type {self.hand_type!r}; want {'|'.join(_HAND_MODULES)}"
+            )
         self._driver_mod = _HAND_MODULES[self.hand_type]
         self.n_joints = self._driver_mod.N_JOINTS
         self.backend = str(hand_cfg["backend"])
@@ -173,6 +180,7 @@ class Hands:
                 serials=hand_cfg["serial"],
                 ramp_s=float(hand_cfg["ramp_s"]),
                 lowpass_hz=float(hand_cfg["lowpass_hz"]),
+                effort_limit_a=float(hand_cfg["effort_limit_a"]),
                 tracking_csv=tracking_csv,
             )
         else:  # aero
@@ -183,7 +191,8 @@ class Hands:
                 torque=int(hand_cfg["aero_torque"]),
             )
         self.driver = self._driver_mod.make_driver(
-            self.backend, self.sides, **driver_kwargs)
+            self.backend, self.sides, **driver_kwargs
+        )
         self._stream = None
         self._rpc = None
         self._thread: threading.Thread | None = None
@@ -206,8 +215,11 @@ class Hands:
             from robot.teleop.aria.stream import AriaHandStream
 
             self._stream = AriaHandStream(
-                self.cfg.publisher["host"], self.cfg.publisher["port"],
-                sides=self.sides, stale_s=self.cfg.publisher["stale_s"] or None)
+                self.cfg.publisher["host"],
+                self.cfg.publisher["port"],
+                sides=self.sides,
+                stale_s=self.cfg.publisher["stale_s"] or None,
+            )
             self._stream.start()
         if self._cmd_host:
             from robot.teleop.aria.stream import ClutchCmdWatcher
@@ -225,23 +237,34 @@ class Hands:
             self._rpc = RPCServer(_HandRPC(self), self.rpc_port, threaded=True)
             self._rpc.start()
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="hand-loop",
-                                        daemon=True)
+        self._thread = threading.Thread(
+            target=self._loop, name="hand-loop", daemon=True
+        )
         self._thread.start()
-        print(f"[{self.hand_type}] hands={'+'.join(self.sides)} backend={self.backend} "
-              f"aria={'on' if self._want_aria else 'off'} "
-              f"rpc={self.rpc_port or 'off'} rate={self.rate_hz} Hz")
+        print(
+            f"[{self.hand_type}] hands={'+'.join(self.sides)} backend={self.backend} "
+            f"aria={'on' if self._want_aria else 'off'} "
+            f"rpc={self.rpc_port or 'off'} rate={self.rate_hz} Hz"
+        )
 
     def _narrow(self, sides: tuple[str, ...]) -> None:
         """Serve only `sides` from here on. Called once, before the loop runs."""
         if tuple(sides) == self.sides:
             return
-        print(f"[{self.hand_type}] serving {'+'.join(sides) or 'no hands'}, "
-              f"not {'+'.join(self.sides)}")
+        print(
+            f"[{self.hand_type}] serving {'+'.join(sides) or 'no hands'}, "
+            f"not {'+'.join(self.sides)}"
+        )
         self.sides = tuple(sides)
         with self._lock:
-            for d in (self._target, self._engaged, self._origin, self._sent,
-                      self._sends, self._prev_paused):
+            for d in (
+                self._target,
+                self._engaged,
+                self._origin,
+                self._sent,
+                self._sends,
+                self._prev_paused,
+            ):
                 for side in [s for s in d if s not in self.sides]:
                     del d[side]
 
@@ -277,8 +300,9 @@ class Hands:
     def targets(self) -> dict[str, np.ndarray | None]:
         """Current commanded qpos per side; None where nothing has been sent."""
         with self._lock:
-            return {s: (None if q is None else q.copy())
-                    for s, q in self._target.items()}
+            return {
+                s: (None if q is None else q.copy()) for s, q in self._target.items()
+            }
 
     # ── command surface (also the RPC surface, via _HandRPC) ────────────────
 
@@ -290,8 +314,7 @@ class Hands:
         """Command one hand: `n_joints` radians, in `joint_names(side)` order."""
         return self._store(str(side), qpos, origin="rpc")
 
-    def set_bimanual_hand_target(self, L_hand_target=None,
-                                 R_hand_target=None) -> bool:
+    def set_bimanual_hand_target(self, L_hand_target=None, R_hand_target=None) -> bool:
         """Command both hands in one call. A None side is left unchanged."""
         ok = True
         if L_hand_target is not None:
@@ -306,9 +329,10 @@ class Hands:
             return {
                 "sides": list(self.sides),
                 "backend": self.backend,
-                "qpos": {s: (None if self._target[s] is None
-                             else self._target[s].tolist())
-                         for s in self.sides},
+                "qpos": {
+                    s: (None if self._target[s] is None else self._target[s].tolist())
+                    for s in self.sides
+                },
                 "engaged": dict(self._engaged),
                 "origin": dict(self._origin),
                 "sends": dict(self._sends),
@@ -328,8 +352,9 @@ class Hands:
         Hold-last then keeps the hands open: a paused operator sends nothing
         usable, so nothing overwrites this until they engage again.
         """
-        want = (self.sides if sides is None
-                else tuple(s for s in sides if s in self.sides))
+        want = (
+            self.sides if sides is None else tuple(s for s in sides if s in self.sides)
+        )
         with self._lock:
             for s in want:
                 self._target[s] = np.zeros(self.n_joints)
@@ -340,11 +365,15 @@ class Hands:
 
     def _store(self, side: str, qpos, origin: str) -> bool:
         if side not in self.sides:
-            print(f"[{self.hand_type}] ignoring target for {side!r}; serving {self.sides}")
+            print(
+                f"[{self.hand_type}] ignoring target for {side!r}; serving {self.sides}"
+            )
             return False
         q = np.asarray(qpos, dtype=np.float64).reshape(-1)
         if q.size != self.n_joints:
-            print(f"[{self.hand_type}] {side}: want {self.n_joints} joints, got {q.size}")
+            print(
+                f"[{self.hand_type}] {side}: want {self.n_joints} joints, got {q.size}"
+            )
             return False
         with self._lock:
             self._target[side] = q
@@ -378,11 +407,13 @@ class Hands:
         if published is not None and published != self.hand_type:
             import os
 
-            msg = (f"[{self.hand_type}] FATAL: publisher declares "
-                   f"hand={published!r} but hand.type={self.hand_type!r} is "
-                   "configured here -- joint vectors would not line up. "
-                   "Fix --hand / hand.type or restart the publisher with "
-                   "the matching --hand.")
+            msg = (
+                f"[{self.hand_type}] FATAL: publisher declares "
+                f"hand={published!r} but hand.type={self.hand_type!r} is "
+                "configured here -- joint vectors would not line up. "
+                "Fix --hand / hand.type or restart the publisher with "
+                "the matching --hand."
+            )
             print(f"\033[1;31m{msg}\033[0m", flush=True)
             os._exit(1)
         self._hand_type_warned = True
@@ -413,20 +444,22 @@ class Hands:
                 shaka = shaka or (prev is not None and now != prev)
             if shaka and station and not self._stopped:
                 self._stopped = True
-                print(f"[{self.hand_type}] STOP (shaka) -- "
-                      "station must re-engage")
+                print(f"[{self.hand_type}] STOP (shaka) -- station must re-engage")
         for side in self.sides:
             s = snap[side]
             # No station: the shaka is the whole authority, read as a level,
             # the way this ran before the station had a say.
-            engaged = (station and not self._stopped if self._clutch is not None
-                       else not s.paused)
+            engaged = (
+                station and not self._stopped
+                if self._clutch is not None
+                else not s.paused
+            )
             with self._lock:
                 self._engaged[side] = engaged
             # Paused freezes the fingers; None is the pre-engage state, where
             # nothing has been retargeted yet. Both hold the last pose.
             if engaged and s.qpos is not None:
-                self._store(side, s.qpos[:self.n_joints], origin="aria")
+                self._store(side, s.qpos[: self.n_joints], origin="aria")
 
     def _push(self) -> None:
         """Hand changed targets to the driver. A no-op on the null backend."""
@@ -467,8 +500,7 @@ class _HandRPC:
     def set_hand_target(self, side: str, qpos) -> bool:
         return self._hands.set_hand_target(side, qpos)
 
-    def set_bimanual_hand_target(self, L_hand_target=None,
-                                 R_hand_target=None) -> bool:
+    def set_bimanual_hand_target(self, L_hand_target=None, R_hand_target=None) -> bool:
         return self._hands.set_bimanual_hand_target(L_hand_target, R_hand_target)
 
     def get_hand_state(self) -> dict:
@@ -523,34 +555,58 @@ def hands_from_args(args, force_backend: str | None = None) -> Hands | None:
     tracking = getattr(args, "tracking_csv", None)
     if tracking and cfg.hand["backend"] != "hardware":
         raise SystemExit("--tracking-csv needs --hand-backend hardware")
-    return Hands(cfg, tracking_csv=Path(tracking) if tracking else None,
-                 cmd_host=getattr(args, "cmd_host", None),
-                 cmd_port=getattr(args, "cmd_port", 5559))
+    return Hands(
+        cfg,
+        tracking_csv=Path(tracking) if tracking else None,
+        cmd_host=getattr(args, "cmd_host", None),
+        cmd_port=getattr(args, "cmd_port", 5559),
+    )
 
 
 def add_hand_args(parser, backend_flag: bool = True) -> None:
     """The hand flags, identical on both nodes."""
-    parser.add_argument("--no-hands", action="store_true",
-                        help="do not drive the fingers at all")
-    parser.add_argument("--aria-config", default=None,
-                        help="settings file (default: config/aria_teleop.yaml)")
-    parser.add_argument("--pub-host", default=None,
-                        help="override hand publisher host -- where stream_pub runs")
-    parser.add_argument("--cmd-host", default=None,
-                        help="recording station publishing clutch_cmd (Thor). "
-                             "Gates the fingers the way it gates the arms in "
-                             "wholebody_teleop.py; both subscribe separately. "
-                             "Unset = the shaka is the only authority.")
-    parser.add_argument("--cmd-port", type=int, default=5559,
-                        help="port for --cmd-host (default: %(default)s)")
-    parser.add_argument("--hands", choices=["both", "left", "right", "none"],
-                        default=None,
-                        help="which hands to drive (default: hand.sides); "
-                             "the arms are teleoped either way")
-    parser.add_argument("--hand", choices=["wuji", "aero"], default=None,
-                        help="which hand to drive/render this run (default: "
-                             "hand.type in config, itself 'none' -- arms "
-                             "only)")
+    parser.add_argument(
+        "--no-hands", action="store_true", help="do not drive the fingers at all"
+    )
+    parser.add_argument(
+        "--aria-config",
+        default=None,
+        help="settings file (default: config/aria_teleop.yaml)",
+    )
+    parser.add_argument(
+        "--pub-host",
+        default=None,
+        help="override hand publisher host -- where stream_pub runs",
+    )
+    parser.add_argument(
+        "--cmd-host",
+        default=None,
+        help="recording station publishing clutch_cmd (Thor). "
+        "Gates the fingers the way it gates the arms in "
+        "wholebody_teleop.py; both subscribe separately. "
+        "Unset = the shaka is the only authority.",
+    )
+    parser.add_argument(
+        "--cmd-port",
+        type=int,
+        default=5559,
+        help="port for --cmd-host (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--hands",
+        choices=["both", "left", "right", "none"],
+        default=None,
+        help="which hands to drive (default: hand.sides); "
+        "the arms are teleoped either way",
+    )
+    parser.add_argument(
+        "--hand",
+        choices=["wuji", "aero"],
+        default=None,
+        help="which hand to drive/render this run (default: "
+        "hand.type in config, itself 'none' -- arms "
+        "only)",
+    )
     if backend_flag:
         # This node (robot/yor.py) is hardware-only, so a --hand actually
         # given implies driving it for real -- defaulting this to "hardware"
@@ -560,10 +616,16 @@ def add_hand_args(parser, backend_flag: bool = True) -> None:
         # is "none" (hands_from_args returns before backend is consulted).
         # "--hand-backend none" stays available as an explicit escape hatch
         # (e.g. exercising the software path with no hand plugged in).
-        parser.add_argument("--hand-backend", choices=["none", "hardware"],
-                            default="hardware",
-                            help="override hand.backend for one run "
-                                 "(default: hardware, whenever a hand is "
-                                 "actually configured)")
-        parser.add_argument("--tracking-csv", default=None,
-                            help="log commanded vs measured finger angles")
+        parser.add_argument(
+            "--hand-backend",
+            choices=["none", "hardware"],
+            default="hardware",
+            help="override hand.backend for one run "
+            "(default: hardware, whenever a hand is "
+            "actually configured)",
+        )
+        parser.add_argument(
+            "--tracking-csv",
+            default=None,
+            help="log commanded vs measured finger angles",
+        )

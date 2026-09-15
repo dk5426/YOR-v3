@@ -13,13 +13,23 @@ robot/wholebody_control.py (hardware) or robot/yor_mujoco.py (simulation).
 
 import time
 from pathlib import Path
-from typing import Optional
+
 import numpy as np
 
 try:
-    from nerolib import NeroController, ControllerConfig, FirmwareVersion, JointState, Gain, ControlMode, MoveMode
+    from nerolib import (
+        ControllerConfig,
+        ControlMode,
+        FirmwareVersion,
+        Gain,
+        JointState,
+        MoveMode,
+        NeroController,
+    )
 except ImportError:
-    print("nerolib not found. Please install it or use the 'nerolib' conda environment.")
+    print(
+        "nerolib not found. Please install it or use the 'nerolib' conda environment."
+    )
     raise
 
 from robot.arm.gripper import Gripper
@@ -38,8 +48,8 @@ class ArmNode:
         is_left_arm: bool = True,
         dynamixel_gripper: bool = False,
         native_gripper: bool = False,
-        default_kp: Optional[float | list[float]] = 10.0,
-        default_kd: Optional[float | list[float]] = 1.0,
+        default_kp: float | list[float] | None = 10.0,
+        default_kd: float | list[float] | None = 1.0,
         gravity_comp_scale: float = 1.0,
         firmware_version=None,
     ):
@@ -48,32 +58,36 @@ class ArmNode:
         self.is_left_arm = is_left_arm
         # URDF is for nerolib's own dynamics (gravity compensation), not IK.
         if is_left_arm:
-            self.urdf_path = (_ROOT / "nerolib/urdf/nero_cone-e_left_fixed_tether.urdf").as_posix()
+            self.urdf_path = (
+                _ROOT / "nerolib/urdf/nero_cone-e_left_fixed_wuji.urdf"
+            ).as_posix()
         else:
-            self.urdf_path = (_ROOT / "nerolib/urdf/right_arm_final_tether.urdf").as_posix()
+            self.urdf_path = (
+                _ROOT / "nerolib/urdf/right_arm_final_wuji.urdf"
+            ).as_posix()
 
         # Initialize nerolib NeroController
         self.control_mode_set = False
         try:
             print(f"[ArmNode] Initializing {can_port} with nerolib...")
-            
+
             self.config = ControllerConfig()
             self.config.interface_name = can_port
             self.config.urdf_path = self.urdf_path
             # Run nerolib's native interpolation loop at its commissioned rate.
             self.config.controller_freq_hz = 250.0
-            
+
             # Defines home position (originally in ControllerConfig)
             # UPDATED: Using a safe intermediate home based on current readouts to avoid J1 limits/issues
             self.home_position = (
-                [0.0, 1.32, -1.71, 1.31, 0.0, 0.0, 0.0] 
+                [0.0, 1.32, -1.71, 1.31, 0.0, 0.0, 0.0]
                 # [1.57, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # Modified J1 from 1.38 to -1.38 to match current state sign
                 if is_left_arm
                 else [0.0, 1.32, 1.71, 1.31, 0.0, 0.0, 0.0]
             )
-            
+
             self.config.home_position = self.home_position
-            
+
             # Live-queried from both arms' firmware over CAN
             # (pyAgxArm get_joint_angle_vel_limits / get_joint_acc_limits),
             # 2026-08-20: joints 1-4 report max_vel=3.14 rad/s, joints 5-7
@@ -120,7 +134,15 @@ class ArmNode:
             # of them may reintroduce the original jitter -- if so, revert
             # to whichever earlier line was last confirmed jitter-free.
             # self.config.joint_vel_max = [2.98, 2.98, 2.98, 2.98, 3.72, 3.72, 3.72]
-            self.config.joint_vel_max = [2.98 * 4.0, 2.98 * 4.0, 2.98 * 4.0, 2.98 * 4.0, 3.72 * 4.0, 3.72 * 4.0, 3.72 * 4.0]
+            self.config.joint_vel_max = [
+                2.98 * 4.0,
+                2.98 * 4.0,
+                2.98 * 4.0,
+                2.98 * 4.0,
+                3.72 * 4.0,
+                3.72 * 4.0,
+                3.72 * 4.0,
+            ]
             # Previous (1.3x of 95%-of-firmware; smooth, still some lag):
             # self.config.joint_acc_max = [2.47, 2.47, 3.09, 3.09, 3.09, 3.09, 3.09]
             # Previous (p90 demand, 3-file estimate; better, still lag):
@@ -147,13 +169,13 @@ class ArmNode:
             # profile ever reaching joint_acc_max. Lower it on purpose if you
             # want softer starts, and expect to lose acceleration for it.
             self.config.joint_jerk_max = [2000.0] * 7
-            
+
             if default_kp is not None:
                 if isinstance(default_kp, (int, float)):
                     self.config.default_kp = [float(default_kp)] * 7
                 else:
                     self.config.default_kp = [float(x) for x in default_kp]
-            
+
             if default_kd is not None:
                 if isinstance(default_kd, (int, float)):
                     self.config.default_kd = [float(default_kd)] * 7
@@ -167,19 +189,19 @@ class ArmNode:
                 self.config.firmware_version = firmware_version
 
             self.nero = NeroController(self.config)
-            
+
             if not self.nero.start():
-                 print(f"[ArmNode] Failed to start NeroController on {can_port}")
-                 self.nero = None
+                print(f"[ArmNode] Failed to start NeroController on {can_port}")
+                self.nero = None
             else:
-                 print(f"[ArmNode] {can_port} initialized and started.")
-                 self.control_mode_set = True
-            
+                print(f"[ArmNode] {can_port} initialized and started.")
+                self.control_mode_set = True
+
         except Exception as e:
             print(f"[ArmNode] Failed to initialize arm on {can_port}: {e}")
             self.nero = None
 
-        self.gripper_target: Optional[float] = None
+        self.gripper_target: float | None = None
         self.q_offset = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
         self.dynamixel_gripper = dynamixel_gripper
@@ -201,7 +223,9 @@ class ArmNode:
                 dxl_id = DXL_ID_LEFT if is_left_arm else DXL_ID_RIGHT
                 self.gripper = Gripper(baudrate=BAUDRATE, dxl_id=dxl_id)
 
-                open_gripper_value, close_gripper_value = self.gripper.dxl.calibrate_motor()
+                open_gripper_value, close_gripper_value = (
+                    self.gripper.dxl.calibrate_motor()
+                )
                 self.open_gripper_value = open_gripper_value
                 self.close_gripper_value = close_gripper_value
                 self.gripper_range = open_gripper_value - close_gripper_value
@@ -209,30 +233,27 @@ class ArmNode:
                 print("[ArmNode] Dynamixel gripper enabled")
 
             except (FileNotFoundError, OSError) as e:
-                print(f"[ArmNode] Dynamixel gripper not found ({e}). Continuing without gripper.")
+                print(
+                    f"[ArmNode] Dynamixel gripper not found ({e}). Continuing without gripper."
+                )
                 self.dynamixel_gripper = False
                 self.gripper = None
-
-
-
-
-
-
 
     def init(self) -> bool:
         """Move all seven joints through nerolib's coordinated home trajectory."""
         if self.nero is None:
-            print("[ArmNode] Warning: Nero not initialized, init() skipping hardware calls.")
+            print(
+                "[ArmNode] Warning: Nero not initialized, init() skipping hardware calls."
+            )
             return False
 
         # Move to home position
-        print(f"[ArmNode] Moving to home position...")
+        print("[ArmNode] Moving to home position...")
         self.nero.reset_to_home()
-        
+
         q = self.get_joint_positions()
         print(f"q_reached: {np.round(q, 4)}")
         return True
-
 
     def home(self, gripper_target: float = 1.0):
         if self.nero:
@@ -240,25 +261,30 @@ class ArmNode:
                 self.nero.reset_to_home()
             except Exception as e:
                 print(f"[ArmNode] Home failed: {e}")
-        
+
         if self.dynamixel_gripper:
-            self.gripper.move_to_pos(int(gripper_target * self.gripper_range + self.close_gripper_value))
+            self.gripper.move_to_pos(
+                int(gripper_target * self.gripper_range + self.close_gripper_value)
+            )
         time.sleep(2.0)
 
     def tuck_arms(self):
         self.set_joint_target(np.zeros(7), gripper_target=1.00, preview_time=2.0)
 
     def set_joint_target(
-        self, joint_target: np.ndarray, gripper_target: float | None = None, preview_time: float = 0.01
+        self,
+        joint_target: np.ndarray,
+        gripper_target: float | None = None,
+        preview_time: float = 0.01,
     ):
         if self.nero:
             try:
                 # nerolib expects lists or std::vectors, typically python lists/arrays work with pybind11
                 # The API signature: set_target(new_target_pos, new_target_gripper_pos, minimum_duration, new_target_vel, new_target_acc)
                 # We map joint_target to new_target_pos.
-                
+
                 target_pos = (joint_target + self.q_offset).tolist()
-                
+
                 # Nerolib expects normalized gripper position (0 for close, 1 for fully open).
                 # With no native gripper fitted the field still has to be sent, but it is
                 # pinned open so a teleop gripper value can never command a missing
@@ -266,25 +292,29 @@ class ArmNode:
                 target_gripper = 1.0
                 if gripper_target is not None and self.native_gripper:
                     target_gripper = float(gripper_target)
-                
+
                 self.nero.set_target(
                     new_target_pos=target_pos,
-                    new_target_gripper_pos=target_gripper if not self.dynamixel_gripper else 0.0, # Don't conflict if dyn gripper used
-                    minimum_duration=preview_time
+                    new_target_gripper_pos=target_gripper
+                    if not self.dynamixel_gripper
+                    else 0.0,  # Don't conflict if dyn gripper used
+                    minimum_duration=preview_time,
                 )
-                
+
             except Exception as e:
-                 print(f"Set target failed: {e}")
+                print(f"Set target failed: {e}")
 
         if gripper_target is not None and self.dynamixel_gripper:
-            self.gripper.move_to_pos(int(gripper_target * self.gripper_range + self.close_gripper_value))
+            self.gripper.move_to_pos(
+                int(gripper_target * self.gripper_range + self.close_gripper_value)
+            )
 
     def open_gripper(self):
         if self.dynamixel_gripper:
             self.gripper.move_to_pos(self.open_gripper_value)
         elif self.native_gripper:
             q = self.get_joint_positions()
-            self.set_joint_target(q, gripper_target=1.0)  
+            self.set_joint_target(q, gripper_target=1.0)
             time.sleep(0.5)
 
     def close_gripper(self):
@@ -306,12 +336,12 @@ class ArmNode:
                 gain.kp = [float(kp)] * 7
             else:
                 gain.kp = [float(x) for x in kp]
-            
+
             if isinstance(kd, (int, float)):
                 gain.kd = [float(kd)] * 7
             else:
                 gain.kd = [float(x) for x in kd]
-            
+
             self.nero.set_gain(gain)
 
     def set_gravity_comp(self, enable: bool):
@@ -326,28 +356,44 @@ class ArmNode:
         if self.nero:
             self.nero.set_mode(control_mode, move_mode)
 
-    def set_compliant_mode(self, kp=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], kd=[0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]):
+    def set_compliant_mode(
+        self,
+        kp=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        kd=[0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+    ):
         """preset for manual guidance. Default: Stiffness=0, Damping=0.5."""
         self.sync_target()
         self.set_gain(kp, kd)
         self.set_gravity_comp(True)
         self.set_gravity_comp_scale(1.0)
 
-    def set_spring_mode(self, kp=[2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0], kd=[0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]):
+    def set_spring_mode(
+        self,
+        kp=[2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0],
+        kd=[0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+    ):
         """preset for springy behavior. Default: Stiffness=2, Damping=0.3."""
         self.sync_target()
         self.set_gain(kp, kd)
         self.set_gravity_comp(True)
         self.set_gravity_comp_scale(1.0)
 
-    def set_firm_mode(self, kp=[15.0, 15.0, 15.0, 15.0, 15.0, 15.0, 15.0], kd=[0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]):
+    def set_firm_mode(
+        self,
+        kp=[15.0, 15.0, 15.0, 15.0, 15.0, 15.0, 15.0],
+        kd=[0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8],
+    ):
         """preset for accurate tracking. Default: Stiffness=15, Damping=0.8."""
         self.sync_target()
         self.set_gain(kp, kd)
         self.set_gravity_comp(True)
-        self.set_gravity_comp_scale(1.0 )
+        self.set_gravity_comp_scale(1.0)
 
-    def set_admittance_mode(self, kp=[25.0, 25.0, 20.0, 20.0, 15.0, 15.0, 15.0], kd=[1.2, 1.2, 1.0, 1.0, 0.8, 0.8, 0.8]):
+    def set_admittance_mode(
+        self,
+        kp=[25.0, 25.0, 20.0, 20.0, 15.0, 15.0, 15.0],
+        kd=[1.2, 1.2, 1.0, 1.0, 0.8, 0.8, 0.8],
+    ):
         """
         High stiffness and damping, optimized for a high-level admittance loop.
         """
@@ -363,7 +409,7 @@ class ArmNode:
             self.nero.set_target(
                 new_target_pos=(q + self.q_offset).tolist(),
                 new_target_gripper_pos=self.get_gripper_pose(),
-                minimum_duration=0.0
+                minimum_duration=0.0,
             )
             # Give the 250 Hz C++ control loop a few cycles to ingest this
             # and 'snap' its internal trajectory state before we change gains.
@@ -371,8 +417,8 @@ class ArmNode:
 
     def get_joint_positions(self) -> np.ndarray:
         if self.nero is None:
-             return np.zeros(7)
-             
+            return np.zeros(7)
+
         try:
             state = self.nero.get_current_state()
             q = np.array(state.pos)
@@ -382,8 +428,8 @@ class ArmNode:
 
     def get_joint_velocities(self) -> np.ndarray:
         if self.nero is None:
-             return np.zeros(7)
-             
+            return np.zeros(7)
+
         try:
             state = self.nero.get_current_state()
             return np.array(state.vel)
@@ -392,8 +438,8 @@ class ArmNode:
 
     def get_joint_torques(self) -> np.ndarray:
         if self.nero is None:
-             return np.zeros(7)
-             
+            return np.zeros(7)
+
         try:
             state = self.nero.get_current_state()
             return np.array(state.torque)
@@ -405,12 +451,12 @@ class ArmNode:
             if self.nero:
                 state = self.nero.get_current_state()
                 return state.gripper_pos
-            return 0.0 
+            return 0.0
         else:
             unnormalized_pos = self.gripper.dxl.get_present_position()
             return float(unnormalized_pos - self.close_gripper_value) / float(
                 self.gripper_range
-            ) 
+            )
 
     def set_q_offset(self, q_offset: np.ndarray):
         self.q_offset = q_offset
@@ -418,7 +464,8 @@ class ArmNode:
     def stop(self):
         print("called stop")
         if self.nero:
-             self.nero.stop()
+            self.nero.stop()
+
 
 if __name__ == "__main__":
     left_arm = ArmNode(can_port="can_left", is_left_arm=True)

@@ -13,14 +13,23 @@ never queue behind arm targets on either node's single RPC socket -- a ZMQ REP
 socket serves one caller at a time. See robot/hand/hands.py.
 robot/teleop/aria/sim_viz.py renders the fingers in-process, without either.
 
-The lift is pinned once, on the first tick, to the height the server reports and
-never touched again. That single command is deliberate: both nodes start with
-`lift_target = None`, which the solver reads as "the lift is yours", so a client
-that simply never mentions the lift does not leave it where it is -- it hands
-the column to the solver, which then drives it to help the arms reach. Pinning
-once costs one RPC and makes "Aria moves the arms" true of the hardware as
-well. Pass `hold_lift=False` for the free-lift behaviour, which is what
-sim_viz.py runs.
+The lift is never commanded. Both nodes start with `lift_target = None`, which
+the solver reads as "the lift is yours", and leaving it there is the point: the
+column is most of the arms' vertical reach, so a hand asked for a height the
+shoulders alone cannot make is answered by raising the lift rather than by the
+arm stretching until the EE task goes unsatisfied.
+
+This backend used to send one `set_lift_target` on the first tick to claim the
+column back ("hold_lift"), and that is what this no longer does. The pin was a
+one-shot on a client-side latch, but the thing it pinned is per-controller
+state on the node: anything that rebuilds the whole-body controller --
+set_wholebody(), resume_wholebody(), the thumbs-up home_arms below -- resets
+`lift_target` to None, and the client could never re-pin. So the lift was
+frozen for a session that started before a rebuild and free for one that ran
+after it, from the same command line, with nothing on screen saying which.
+Never claiming it makes the two the same session. Nothing here needs the
+column held: no gesture drives the lift, so a pin only ever subtracted a DOF
+the solver was using.
 
 Engagement is the recording station's (Thor) `clutch_cmd`, latched: engage
 takes both arms, disengage releases them, and nothing else engages anything.
@@ -88,8 +97,6 @@ class AriaSource(InputSource):
             get_state RPC) rather than the client's local target, so wind-up
             banked while streaming into a constraint does not carry over.
         stale_s: release if the publisher goes quiet this long (0/None off).
-        hold_lift: pin the lift to its current height on the first tick, so the
-            solver cannot claim it. Off leaves the lift a free DOF.
         scene_xml: MJCF the flange->wrist offset and home orientation come from.
         hand_type: "wuji"/"aero"/None -- which hand (if any) that scene has
             mounted, so the flange->wrist offset can be read off the right
@@ -101,31 +108,41 @@ class AriaSource(InputSource):
             publisher setting (`stream_pub --home-dwell-s`).
     """
 
-    def __init__(self, host: str, port: int = 5555, hand: str = "both",
-                 position_scale: float = 1.0, follow_orientation: bool = True,
-                 clutch_reseed: bool = True, stale_s: float | None = 0.5,
-                 hold_lift: bool = True, scene_xml: str | None = None,
-                 hand_type: str | None = None,
-                 home_gesture: bool = True,
-                 translation_frame: str = "world", stats: bool = True,
-                 clock_port: int = 5556,
-                 cmd_sub: object | None = None):
+    def __init__(
+        self,
+        host: str,
+        port: int = 5555,
+        hand: str = "both",
+        position_scale: float = 1.0,
+        follow_orientation: bool = True,
+        clutch_reseed: bool = True,
+        stale_s: float | None = 0.5,
+        scene_xml: str | None = None,
+        hand_type: str | None = None,
+        home_gesture: bool = True,
+        translation_frame: str = "world",
+        stats: bool = True,
+        clock_port: int = 5556,
+        cmd_sub: object | None = None,
+    ):
         self._sides = ("left", "right") if hand == "both" else (hand,)
         self._hand_type = str(hand_type or "none").lower()
         self._position_scale = float(position_scale)
         self._follow_orientation = bool(follow_orientation)
         self._translation_frame = Clutch._checked_frame(str(translation_frame))
         self._clutch_reseed = bool(clutch_reseed)
-        self._hold_lift = bool(hold_lift)
-        self._lift_pinned = False
         self._scene_xml = Path(scene_xml) if scene_xml else DEFAULT_SCENE
         # Measured on the client's own subscription -- not the node's, which
         # reads the same publisher for the fingers on a link of its own.
-        self._stats = (StreamStats(AriaHandStream.TOPICS) if stats else None)
-        self._clock_sync = (ClockSync(host, int(clock_port), self._stats)
-                            if self._stats is not None and clock_port else None)
-        self._stream = AriaHandStream(host, port, sides=self._sides,
-                                      stale_s=stale_s, stats=self._stats)
+        self._stats = StreamStats(AriaHandStream.TOPICS) if stats else None
+        self._clock_sync = (
+            ClockSync(host, int(clock_port), self._stats)
+            if self._stats is not None and clock_port
+            else None
+        )
+        self._stream = AriaHandStream(
+            host, port, sides=self._sides, stale_s=stale_s, stats=self._stats
+        )
         self._clutches: dict[str, Clutch] = {}
         # Last tick's per-side row for the client's status table. Written by
         # update() rather than rebuilt on demand, so what the table shows is
@@ -134,8 +151,9 @@ class AriaSource(InputSource):
         # Two hands or nothing, same rule the publisher applies: homing is one
         # indivisible sequence on the robot, so one thumb must not reach it.
         self._home_wanted = bool(home_gesture)
-        self._home = (HomeSeqWatcher()
-                      if home_gesture and len(self._sides) == 2 else None)
+        self._home = (
+            HomeSeqWatcher() if home_gesture and len(self._sides) == 2 else None
+        )
         self._warned_no_home = False
         # Engage/disengage from the recording station (Thor), latched: it is
         # the authority, and the shaka is an emergency stop ANDed against it
@@ -159,22 +177,21 @@ class AriaSource(InputSource):
         # from the station. `_prev_paused` is what turns the publisher's shaka
         # *toggle* into a gesture edge -- see update().
         self._stopped: dict[str, bool] = {s: False for s in self._sides}
-        self._prev_paused: dict[str, bool | None] = {
-            s: None for s in self._sides}
+        self._prev_paused: dict[str, bool | None] = {s: None for s in self._sides}
 
     @classmethod
     def from_config(cls, cfg: AriaConfig, cmd_sub: object | None = None) -> AriaSource:
         """Build from config/aria_teleop.yaml — the way main() constructs one."""
         return cls(
             cmd_sub=cmd_sub,
-            host=cfg.publisher["host"], port=cfg.publisher["port"],
+            host=cfg.publisher["host"],
+            port=cfg.publisher["port"],
             hand=cfg.mapping["hand"],
             position_scale=cfg.mapping["position_scale"],
             follow_orientation=cfg.mapping["follow_orientation"],
             translation_frame=cfg.mapping["translation_frame"],
             clutch_reseed=cfg.clutch["reseed"],
             stale_s=cfg.publisher["stale_s"] or None,
-            hold_lift=cfg.clutch["hold_lift"],
             scene_xml=str(cfg.scene_path()),
             hand_type=cfg.hand["type"],
             home_gesture=cfg.home["gesture"],
@@ -198,13 +215,19 @@ class AriaSource(InputSource):
             )
             for side in self._sides
         }
-        log(f"sides={'+'.join(self._sides)} "
+        log(
+            f"sides={'+'.join(self._sides)} "
             f"scale={self._position_scale:.2f} "
             f"follow_orientation={self._follow_orientation} "
-            f"translation={self._translation_frame}", prefix="aria")
+            f"translation={self._translation_frame}",
+            prefix="aria",
+        )
         if self._home_wanted and self._home is None:
-            log("home gesture off: it needs both hands "
-                f"(hand={'+'.join(self._sides)})", style="yellow", prefix="aria")
+            log(
+                f"home gesture off: it needs both hands (hand={'+'.join(self._sides)})",
+                style="yellow",
+                prefix="aria",
+            )
         self._stream.start()
         if self._cmd_sub is not None:
             self._cmd_sub.start()
@@ -218,11 +241,17 @@ class AriaSource(InputSource):
     def _log_clock(sample: tuple[float, float] | None) -> None:
         """Report the first handshake, from the clock thread."""
         if sample is None:
-            log("clock handshake failed -- stream latency will read '--'",
-                style="yellow", prefix="aria")
+            log(
+                "clock handshake failed -- stream latency will read '--'",
+                style="yellow",
+                prefix="aria",
+            )
         else:
-            log(f"clock offset {sample[0] * 1e3:+.2f} ms "
-                f"(rtt {sample[1] * 1e3:.2f} ms)", prefix="aria")
+            log(
+                f"clock offset {sample[0] * 1e3:+.2f} ms "
+                f"(rtt {sample[1] * 1e3:.2f} ms)",
+                prefix="aria",
+            )
 
     def stop(self) -> None:
         if self._cmd_sub is not None:
@@ -233,12 +262,8 @@ class AriaSource(InputSource):
 
     def update(self, state: TeleopState, dt: float) -> TeleopCommand:
         cmd = TeleopCommand()
-        # Once, on the first tick: claim the lift so the solver does not. See
-        # the module docstring for why silence is not the same as holding.
-        if self._hold_lift and not self._lift_pinned:
-            self._lift_pinned = True
-            cmd.lift_target = float(state.lift_target)
-            log(f"lift pinned at {cmd.lift_target:.3f} m", prefix="aria")
+        # `cmd.lift_target` is left None on every tick: the lift is the
+        # solver's, see the module docstring.
         snap = self._stream.snapshot()
         ext = self._poll_ext_cmd()
         if ext is not None:
@@ -249,8 +274,11 @@ class AriaSource(InputSource):
                 # rather than a pause.
                 for s_ in self._sides:
                     self._stopped[s_] = False
-            log(f"thor: {'engage' if ext else 'disengage'}",
-                style="green" if ext else "yellow", prefix="aria")
+            log(
+                f"thor: {'engage' if ext else 'disengage'}",
+                style="green" if ext else "yellow",
+                prefix="aria",
+            )
         # Any change to `paused` is a stop, whichever way it lands. It is a
         # toggle the operator flips by shaka, and nothing else here reads its
         # level -- the publisher keeps streaming poses while paused, so a
@@ -266,12 +294,16 @@ class AriaSource(InputSource):
                 prev, now = self._prev_paused[side], snap[side].paused
                 self._prev_paused[side] = now
                 shaka = shaka or (prev is not None and now != prev)
-            if shaka and self._thor_engaged and not all(
-                    self._stopped[s_] for s_ in self._sides):
+            if (
+                shaka
+                and self._thor_engaged
+                and not all(self._stopped[s_] for s_ in self._sides)
+            ):
                 for s_ in self._sides:
                     self._stopped[s_] = True
-                log("STOP (shaka) -- station must re-engage",
-                    style="red", prefix="aria")
+                log(
+                    "STOP (shaka) -- station must re-engage", style="red", prefix="aria"
+                )
 
         for side in self._sides:
             clutch, s = self._clutches[side], snap[side]
@@ -280,8 +312,11 @@ class AriaSource(InputSource):
             # tracked is what stops a hand held out of view from latching a
             # stale pose -- an arm whose hand is not in view engages as soon
             # as it is, without the station saying anything again.
-            want = (self._thor_engaged and not self._stopped[side]
-                    and s.T_odom_wrist is not None)
+            want = (
+                self._thor_engaged
+                and not self._stopped[side]
+                and s.T_odom_wrist is not None
+            )
             if self._shaka_is_clutch:
                 # No station: the shaka is the clutch, read as a level, the
                 # way this backend behaved before Thor had a say.
@@ -322,8 +357,7 @@ class AriaSource(InputSource):
         streams: tuple[StreamRow, ...] = ()
         if self._stats is not None:
             snap = self._stats.snapshot()
-            streams = tuple(
-                StreamRow(t, *snap[t]) for t in self._stats.topics)
+            streams = tuple(StreamRow(t, *snap[t]) for t in self._stats.topics)
         return SourceStatus(sides=dict(self._status), streams=streams)
 
     def _poll_ext_cmd(self):
@@ -352,8 +386,7 @@ class AriaSource(InputSource):
         # safety argument for homing without a confirmation, and it is worth
         # asserting locally rather than trusting a remote definition of paused.
         if any(self._clutches[s].engaged for s in self._sides):
-            log("ignoring home: a hand is still engaged", style="yellow",
-                prefix="aria")
+            log("ignoring home: a hand is still engaged", style="yellow", prefix="aria")
             return
         # home_arms is the node's own sequence -- base lock, lift to 450 mm,
         # then both arms. home_left_arm / home_right_arm run that same
@@ -374,9 +407,12 @@ class AriaSource(InputSource):
             return
         self._warned_no_home = True
         if meta.get("home") is False:
-            log(f"publisher runs hand={'+'.join(meta.get('sides') or ['?'])}; "
+            log(
+                f"publisher runs hand={'+'.join(meta.get('sides') or ['?'])}; "
                 "the home gesture needs both -- homing is off this session",
-                style="yellow", prefix="aria")
+                style="yellow",
+                prefix="aria",
+            )
 
     def _engage_pose(self, side: str, state: TeleopState) -> mink.SE3:
         """Where to anchor the clutch: the robot's actual EE, or the local target."""
@@ -385,8 +421,11 @@ class AriaSource(InputSource):
             key = f"{side}_ee_wxyz_xyz"
             if srv and srv.get(key) is not None:
                 return mink.SE3(np.array(srv[key]))
-            log(f"{side} engage reseed failed -- using local target",
-                style="yellow", prefix="aria")
+            log(
+                f"{side} engage reseed failed -- using local target",
+                style="yellow",
+                prefix="aria",
+            )
         return getattr(state, f"{side}_target")
 
     def _model_anchors(self) -> tuple[dict[str, np.ndarray], dict[str, mink.SO3]]:
